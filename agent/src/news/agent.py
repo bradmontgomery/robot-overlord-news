@@ -1,5 +1,5 @@
 """
-news_agent.py — self-contained LangGraph news research agent.
+news/agent.py — self-contained LangGraph news research agent.
 
 Builds a ReAct-style loop from raw LangGraph primitives:
   StateGraph + MessagesState + ToolNode + hand-written conditional routing.
