@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>News Feed{{ if .FilterTopic }} — {{ .FilterTopic }}{{ end }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="layout">
+  <header>
+    <h1>News <span>Feed</span></h1>
+    <span class="header-meta">{{ .TotalCount }} articles</span>
+  </header>
+
+  <aside>
+    <h2>Topics</h2>
+    <ul class="topic-list">
+      <li>
+        <a href="/" {{ if eq .FilterTopic "" }}class="active"{{ end }}>
+          <span class="topic-dot" style="background:#8892b0"></span>All topics
+        </a>
+      </li>
+      {{ range .Topics }}
+      <li>
+        <a href="/?topic={{ . }}" {{ if eq . $.FilterTopic }}class="active"{{ end }} title="{{ . }}">
+          <span class="topic-dot" style="background:{{ topicColor . }}"></span>{{ . }}
+        </a>
+      </li>
+      {{ end }}
+    </ul>
+  </aside>
+
+  <main>
+    {{ template "content" . }}
+  </main>
+</div>
+</body>
+</html>

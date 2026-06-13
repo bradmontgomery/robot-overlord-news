@@ -1,0 +1,74 @@
+{{ define "content" }}
+<div class="filter-bar">
+  {{ if .FilterTopic }}
+  <div class="active-filter">
+    <span class="topic-dot" style="background:{{ topicColor .FilterTopic }}"></span>
+    <strong>{{ .FilterTopic }}</strong>
+    <a href="/" title="Clear filter">✕</a>
+  </div>
+  {{ end }}
+  <span class="results-count">
+    {{ .TotalCount }} articles &middot; page {{ .CurrentPage }} of {{ .TotalPages }}
+  </span>
+</div>
+
+{{ if .Articles }}
+<div class="articles">
+  {{ range .Articles }}
+  <div class="article">
+    <div class="article-meta">
+      <a class="topic-pill" href="/?topic={{ .Topic }}" style="background:{{ topicColor .Topic }}">
+        {{ .Topic }}
+      </a>
+      <span class="fetched-at">{{ formatTime .FetchedAt }}</span>
+    </div>
+    <h3>
+      {{ if .URL }}
+      <a href="{{ .URL }}" target="_blank" rel="noopener noreferrer">{{ if .Title }}{{ .Title }}{{ else }}(no title){{ end }}</a>
+      {{ else }}
+      {{ if .Title }}{{ .Title }}{{ else }}(no title){{ end }}
+      {{ end }}
+    </h3>
+    {{ if .Summary }}<p>{{ .Summary }}</p>{{ end }}
+  </div>
+  {{ end }}
+</div>
+
+{{ template "pagination" . }}
+{{ else }}
+<div class="no-articles">
+  <p>No articles found{{ if .FilterTopic }} for topic "{{ .FilterTopic }}"{{ end }}.</p>
+</div>
+{{ end }}
+{{ end }}
+
+{{ define "pagination" }}
+{{ if gt .TotalPages 1 }}
+<nav class="pagination" aria-label="Pagination">
+  {{ if gt .CurrentPage 1 }}
+  <a href="?{{ if .FilterTopic }}topic={{ .FilterTopic }}&{{ end }}page={{ sub .CurrentPage 1 }}">&larr;</a>
+  {{ end }}
+
+  {{ $cur := .CurrentPage }}
+  {{ $total := .TotalPages }}
+  {{ $topic := .FilterTopic }}
+
+  {{ range seq $total }}
+  {{ $p := . }}
+  {{ if or (le $p 2) (ge $p (sub $total 1)) (and (ge $p (sub $cur 2)) (le $p (add $cur 2))) }}
+    {{ if eq $p $cur }}
+    <span class="current">{{ $p }}</span>
+    {{ else }}
+    <a href="?{{ if $topic }}topic={{ $topic }}&{{ end }}page={{ $p }}">{{ $p }}</a>
+    {{ end }}
+  {{ else if or (eq $p 3) (eq $p (sub $total 2)) }}
+  <span class="ellipsis">…</span>
+  {{ end }}
+  {{ end }}
+
+  {{ if lt .CurrentPage .TotalPages }}
+  <a href="?{{ if .FilterTopic }}topic={{ .FilterTopic }}&{{ end }}page={{ add .CurrentPage 1 }}">&rarr;</a>
+  {{ end }}
+</nav>
+{{ end }}
+{{ end }}

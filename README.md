@@ -1,0 +1,42 @@
+# news_site
+
+A fast, minimal web app for browsing news articles fetched by a LangChain agent and stored in SQLite.
+
+## Features
+
+- Browse articles with title, summary, and source link
+- Filter by topic using the sidebar
+- Paginated by fetch date (newest first)
+- Single binary — no runtime dependencies
+
+## Setup
+
+```bash
+go build -o news_site .
+NEWS_DB=/path/to/news_data.db ./news_site
+```
+
+The server listens on `http://localhost:8080`.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `NEWS_DB` | `../langchain_simple_demo/news_data.db` | Path to the SQLite database |
+
+## Database Schema
+
+```sql
+CREATE TABLE news_results (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic      TEXT NOT NULL,
+    title      TEXT,
+    url        TEXT,
+    summary    TEXT,
+    fetched_at TEXT NOT NULL
+);
+```
+
+## License
+
+MIT
