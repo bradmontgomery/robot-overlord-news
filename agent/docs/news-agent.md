@@ -31,11 +31,22 @@ make news                                                  # defaults: AI, clima
 PYTHONPATH=src uv run python src/news/agent.py "rust lang" "webassembly"
 ```
 
+## Polling mode
+
+Set `NEWS_INTERVAL` to a number of seconds to run on a fixed interval instead of once:
+
+```bash
+NEWS_INTERVAL=300 make news   # re-run every 5 minutes
+```
+
+The loop runs → prints → sleeps → repeats until interrupted (`Ctrl-C`). Unset or `0` runs once and exits.
+
 ## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
 | `NEWS_DB_PATH` | `news_results.db` | Path to the SQLite database for storing results. |
+| `NEWS_INTERVAL` | `0` | Polling interval in seconds. `0` (or unset) runs once and exits. |
 
 Search tool follows the same Tavily / DuckDuckGo logic as the other agents: set
 `TAVILY_API_KEY` to use Tavily; otherwise falls back to DuckDuckGo's news backend.

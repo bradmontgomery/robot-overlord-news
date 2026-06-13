@@ -270,3 +270,47 @@ def test_run_cli_default_topics():
         news_agent.run_cli()
 
     mock_run.assert_called_once_with(["AI", "climate"])
+
+
+def test_run_cli_polls_on_interval(capsys):
+    from news import agent as news_agent
+
+    # sleep returns None on first call, then raises to exit the loop
+    with patch("news.agent.run", return_value=[]) as mock_run, \
+         patch("news.agent.time.sleep", side_effect=[None, KeyboardInterrupt]) as mock_sleep, \
+         patch("sys.argv", ["news_agent", "AI"]), \
+         patch.dict(os.environ, {"NEWS_INTERVAL": "60"}):
+        try:
+            news_agent.run_cli()
+        except KeyboardInterrupt:
+            pass
+
+    assert mock_run.call_count == 2
+    mock_sleep.assert_called_with(60)
+
+
+def test_run_cli_interval_zero_runs_once():
+    from news import agent as news_agent
+
+    with patch("news.agent.run", return_value=[]) as mock_run, \
+         patch("news.agent.time.sleep") as mock_sleep, \
+         patch("sys.argv", ["news_agent", "AI"]), \
+         patch.dict(os.environ, {"NEWS_INTERVAL": "0"}):
+        news_agent.run_cli()
+
+    mock_run.assert_called_once()
+    mock_sleep.assert_not_called()
+
+
+def test_run_cli_interval_unset_runs_once():
+    from news import agent as news_agent
+
+    env = {k: v for k, v in os.environ.items() if k != "NEWS_INTERVAL"}
+    with patch("news.agent.run", return_value=[]) as mock_run, \
+         patch("news.agent.time.sleep") as mock_sleep, \
+         patch("sys.argv", ["news_agent"]), \
+         patch.dict(os.environ, env, clear=True):
+        news_agent.run_cli()
+
+    mock_run.assert_called_once()
+    mock_sleep.assert_not_called()

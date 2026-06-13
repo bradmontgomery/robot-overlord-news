@@ -15,6 +15,7 @@ Graph:
 import os
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -140,10 +141,7 @@ def run(topics: list[str]) -> list[dict]:
     ]
 
 
-def run_cli() -> None:
-    """CLI entry point: read topics from argv and print results."""
-    topics = sys.argv[1:] or ["AI", "climate"]
-    results = run(topics)
+def _print_results(results: list[dict]) -> None:
     if not results:
         print("No results stored.")
         return
@@ -156,6 +154,22 @@ def run_cli() -> None:
         print(f"  {r['url']}")
         print(f"  {r['summary']}")
         print()
+
+
+def run_cli() -> None:
+    """CLI entry point: read topics from argv and poll on a fixed interval.
+
+    Set NEWS_INTERVAL (seconds) to run repeatedly; unset or 0 runs once.
+    """
+    topics = sys.argv[1:] or ["AI", "climate"]
+    interval = int(os.getenv("NEWS_INTERVAL", "0"))
+    while True:
+        results = run(topics)
+        _print_results(results)
+        if not interval:
+            break
+        print(f"Sleeping {interval}s...")
+        time.sleep(interval)
 
 
 if __name__ == "__main__":  # pragma: no cover
