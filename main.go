@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +23,7 @@ const pageSize = 20
 
 type Article struct {
 	ID        int
-	Topic     string
+	Topics    []string
 	Title     string
 	URL       string
 	Summary   string
@@ -148,22 +149,57 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func getTopics() ([]string, error) {
-	rows, err := db.Query(`SELECT topic, COUNT(*) as cnt FROM news_results GROUP BY topic ORDER BY cnt DESC`)
+	rows, err := db.Query(`SELECT topic FROM news_results`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var topics []string
+	counts := map[string]int{}
 	for rows.Next() {
-		var t string
-		var cnt int
-		if err := rows.Scan(&t, &cnt); err != nil {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
 			return nil, err
 		}
-		topics = append(topics, t)
+		for _, t := range splitTopics(raw) {
+			counts[t]++
+		}
 	}
-	return topics, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	type topicCount struct {
+		name  string
+		count int
+	}
+	tc := make([]topicCount, 0, len(counts))
+	for name, cnt := range counts {
+		tc = append(tc, topicCount{name, cnt})
+	}
+	sort.Slice(tc, func(i, j int) bool {
+		if tc[i].count != tc[j].count {
+			return tc[i].count > tc[j].count
+		}
+		return tc[i].name < tc[j].name
+	})
+
+	topics := make([]string, len(tc))
+	for i, t := range tc {
+		topics[i] = t.name
+	}
+	return topics, nil
+}
+
+func splitTopics(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func getArticles(topic string, page int) (int, []Article, error) {
@@ -173,8 +209,10 @@ func getArticles(topic string, page int) (int, []Article, error) {
 	var rows *sql.Rows
 	var err error
 
+	const topicFilter = `',' || topic || ',' LIKE '%,' || ? || ',%'`
+
 	if topic != "" {
-		countRow = db.QueryRow(`SELECT COUNT(*) FROM news_results WHERE topic = ?`, topic)
+		countRow = db.QueryRow(`SELECT COUNT(*) FROM news_results WHERE `+topicFilter, topic)
 	} else {
 		countRow = db.QueryRow(`SELECT COUNT(*) FROM news_results`)
 	}
@@ -187,7 +225,7 @@ func getArticles(topic string, page int) (int, []Article, error) {
 	if topic != "" {
 		rows, err = db.Query(
 			`SELECT id, topic, COALESCE(title,''), COALESCE(url,''), COALESCE(summary,''), fetched_at
-			 FROM news_results WHERE topic = ?
+			 FROM news_results WHERE `+topicFilter+`
 			 ORDER BY fetched_at DESC LIMIT ? OFFSET ?`,
 			topic, pageSize, offset,
 		)
@@ -207,9 +245,11 @@ func getArticles(topic string, page int) (int, []Article, error) {
 	var articles []Article
 	for rows.Next() {
 		var a Article
-		if err := rows.Scan(&a.ID, &a.Topic, &a.Title, &a.URL, &a.Summary, &a.FetchedAt); err != nil {
+		var rawTopic string
+		if err := rows.Scan(&a.ID, &rawTopic, &a.Title, &a.URL, &a.Summary, &a.FetchedAt); err != nil {
 			return 0, nil, err
 		}
+		a.Topics = splitTopics(rawTopic)
 		articles = append(articles, a)
 	}
 	return total, articles, rows.Err()

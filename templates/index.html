@@ -17,9 +17,9 @@
   {{ range .Articles }}
   <div class="article">
     <div class="article-meta">
-      <a class="topic-pill" href="/?topic={{ .Topic }}" style="background:{{ topicColor .Topic }}">
-        {{ .Topic }}
-      </a>
+      {{ range .Topics }}
+      <a class="topic-pill" href="/?topic={{ . }}" style="background:{{ topicColor . }}">{{ . }}</a>
+      {{ end }}
       <span class="fetched-at">{{ formatTime .FetchedAt }}</span>
     </div>
     <h3>
