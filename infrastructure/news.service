@@ -1,0 +1,14 @@
+[Unit]
+Description=Robot Overlord News
+After=network.target
+
+[Service]
+ExecStart=/opt/news/news_site
+Environment=NEWS_DB=/opt/news/data/news.db
+WorkingDirectory=/opt/news
+Restart=always
+RestartSec=5
+User=news
+
+[Install]
+WantedBy=multi-user.target
