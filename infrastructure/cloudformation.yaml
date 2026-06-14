@@ -61,7 +61,7 @@ Resources:
       # Find yours: aws ec2 describe-images --owners amazon \
       #   --filters "Name=name,Values=al2023-ami-*-x86_64" \
       #   --query 'sort_by(Images,&CreationDate)[-1].ImageId'
-      ImageId: ami-0453ec754f44f9a4a
+      ImageId: ami-083eb03ee8ae87bb1
       SecurityGroups:
         - !Ref SecurityGroup
       BlockDeviceMappings:

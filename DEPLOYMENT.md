@@ -39,9 +39,9 @@ Update `ImageId` in `infrastructure/cloudformation.yaml` if needed.
 
 ```bash
 make infra-deploy \
-  KEY_PAIR=your-key-pair-name \
+  KEY_PAIR=$KEY_PAIR \
   SSH_CIDR=$(curl -s https://checkip.amazonaws.com)/32 \
-  DOMAIN=news.yourdomain.com
+  DOMAIN=$DOMAIN
 ```
 
 Note the `PublicIP` from the stack outputs:
@@ -54,7 +54,7 @@ aws cloudformation describe-stacks \
 
 ### 3. Point your domain at the Elastic IP
 
-Add an A record: `news.yourdomain.com → <PublicIP from step 2>`
+Add an A record: `robot-overlord.news → <PublicIP from step 2>`
 
 DNS propagation takes a few minutes to hours depending on your provider.
 
@@ -76,7 +76,7 @@ Wait for DNS to propagate first, then:
 
 ```bash
 ssh ec2-user@<PublicIP>
-sudo certbot --nginx -d news.yourdomain.com
+sudo certbot --nginx -d robot-overlord.news
 ```
 
 Certbot will modify `/etc/nginx/conf.d/news.conf` to add HTTPS and an HTTP→HTTPS redirect.
@@ -85,7 +85,7 @@ It sets up auto-renewal via a systemd timer — no action needed to keep the cer
 Verify HTTPS is working:
 
 ```bash
-curl https://news.yourdomain.com
+curl https://robot-overlord.news
 ```
 
 ## Deploying Updates
@@ -93,7 +93,7 @@ curl https://news.yourdomain.com
 After making code changes:
 
 ```bash
-make deploy DEPLOY_HOST=news.yourdomain.com
+make deploy DEPLOY_HOST=robot-overlord.news
 ```
 
 This builds the binary locally, rsyncs it (plus templates and static files) to the
@@ -117,7 +117,7 @@ Example cron entry to run the agent hourly (edit with `crontab -e` as the `ec2-u
 
 ```bash
 # SSH into the instance
-ssh ec2-user@news.yourdomain.com
+ssh ec2-user@robot-overlord.news
 
 # View web app logs (live)
 sudo journalctl -u news -f
