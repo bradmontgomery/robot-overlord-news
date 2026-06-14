@@ -1,0 +1,29 @@
+# Binary output
+news_site
+
+# Go build cache
+*.test
+*.out
+*.prof
+
+# Go coverage
+coverage.html
+coverage.out
+
+# SQLite database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment / secrets
+.env
+.env.*
+
+# Editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
