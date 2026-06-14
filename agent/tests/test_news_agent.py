@@ -31,6 +31,32 @@ def test_init_db_idempotent(tmp_path):
     init_db(db_file)  # second call must not raise
 
 
+def test_init_db_deduplicates_existing_rows(tmp_path):
+    from news.agent import init_db
+
+    db_file = str(tmp_path / "test.db")
+    # Simulate a pre-existing DB without the unique index (plain inserts, duplicates allowed)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("""
+            CREATE TABLE news_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL, title TEXT, url TEXT, summary TEXT, fetched_at TEXT NOT NULL
+            )
+        """)
+        conn.executemany(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            [
+                ("AI", "Article", "http://dup.com", "s", "2026-01-01T00:00:00"),
+                ("AI", "Article", "http://dup.com", "s", "2026-01-02T00:00:00"),  # duplicate
+                ("AI", "Unique", "http://unique.com", "s", "2026-01-01T00:00:00"),
+            ],
+        )
+    init_db(db_file)  # must not raise
+    with sqlite3.connect(db_file) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM news_results").fetchone()[0]
+    assert count == 2  # duplicate removed, unique row kept
+
+
 def test_init_db_creates_unique_index(tmp_path):
     from news.agent import init_db
 

@@ -57,6 +57,14 @@ def init_db(path: str) -> None:
                 fetched_at TEXT NOT NULL
             )
         """)
+        # Remove duplicate URLs before enforcing the unique index, keeping the
+        # earliest row (lowest id) for each URL so existing databases migrate cleanly.
+        conn.execute("""
+            DELETE FROM news_results
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM news_results GROUP BY url
+            )
+        """)
         conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_news_url
             ON news_results (url)
