@@ -45,7 +45,7 @@ After you have searched and stored results for ALL topics, stop.
 
 
 def init_db(path: str) -> None:
-    """Create the news_results table if it does not exist."""
+    """Create the news_results table and unique URL index if they do not exist."""
     with sqlite3.connect(path) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS news_results (
@@ -56,6 +56,10 @@ def init_db(path: str) -> None:
                 summary    TEXT,
                 fetched_at TEXT NOT NULL
             )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_news_url
+            ON news_results (url)
         """)
 
 
@@ -71,12 +75,14 @@ def store_result(topic: str, title: str, url: str, summary: str) -> str:
     """
     fetched_at = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "INSERT INTO news_results (topic, title, url, summary, fetched_at)"
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO news_results (topic, title, url, summary, fetched_at)"
             " VALUES (?, ?, ?, ?, ?)",
             (topic, title, url, summary, fetched_at),
         )
-    return f"Stored: {title}"
+    if cursor.rowcount:
+        return f"Stored: {title}"
+    return f"Skipped (duplicate URL): {title}"
 
 
 def _make_search_tool():

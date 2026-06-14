@@ -31,6 +31,18 @@ def test_init_db_idempotent(tmp_path):
     init_db(db_file)  # second call must not raise
 
 
+def test_init_db_creates_unique_index(tmp_path):
+    from news.agent import init_db
+
+    db_file = str(tmp_path / "test.db")
+    init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        indexes = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_news_url'"
+        ).fetchall()
+    assert indexes == [("idx_news_url",)]
+
+
 # ---------------------------------------------------------------------------
 # store_result tool
 # ---------------------------------------------------------------------------
@@ -49,6 +61,41 @@ def test_store_result_inserts_row(tmp_path):
     with sqlite3.connect(db_file) as conn:
         rows = conn.execute("SELECT topic, title, url, summary FROM news_results").fetchall()
     assert rows == [("AI", "Test Article", "http://example.com", "Short summary.")]
+
+
+def test_store_result_deduplicates_by_url(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "test.db")
+    news_agent.init_db(db_file)
+    with patch.object(news_agent, "DB_PATH", db_file):
+        news_agent.store_result.invoke(
+            {"topic": "AI", "title": "Article", "url": "http://example.com", "summary": "s"}
+        )
+        result = news_agent.store_result.invoke(
+            {"topic": "AI", "title": "Article", "url": "http://example.com", "summary": "s"}
+        )
+    assert "Skipped" in result
+    with sqlite3.connect(db_file) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM news_results").fetchone()[0]
+    assert count == 1
+
+
+def test_store_result_allows_different_urls(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "test.db")
+    news_agent.init_db(db_file)
+    with patch.object(news_agent, "DB_PATH", db_file):
+        news_agent.store_result.invoke(
+            {"topic": "AI", "title": "Article A", "url": "http://a.com", "summary": "s"}
+        )
+        news_agent.store_result.invoke(
+            {"topic": "AI", "title": "Article B", "url": "http://b.com", "summary": "s"}
+        )
+    with sqlite3.connect(db_file) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM news_results").fetchone()[0]
+    assert count == 2
 
 
 def test_store_result_sets_fetched_at(tmp_path):
