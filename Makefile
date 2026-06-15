@@ -37,7 +37,7 @@ clean:
 # Usage: make deploy DEPLOY_HOST=news.yourdomain.com
 deploy: build
 	rsync -avz --progress -e "ssh -i $(SSH_KEY)" \
-	  $(BINARY) templates/ static/ \
+	  $(BINARY) \
 	  $(DEPLOY_USER)@$(DEPLOY_HOST):/opt/news/
 	ssh -i $(SSH_KEY) $(DEPLOY_USER)@$(DEPLOY_HOST) 'sudo systemctl restart news && sudo systemctl status news --no-pager'
 
