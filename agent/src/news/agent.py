@@ -28,6 +28,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "gemma4:latest")
+SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL", "gemma4:26b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 DB_PATH = os.getenv("NEWS_DB_PATH", "news_results.db")
 
@@ -206,11 +207,16 @@ def summarize_day(date: str) -> str | None:
     if not rows:
         return None
     digest = "\n\n".join(f"- {title}: {summary}" for title, summary in rows)
-    model = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
-    response = model.invoke([
+    messages = [
         SystemMessage(_SUMMARIZE_SYSTEM_PROMPT),
         HumanMessage(f"Summarize the news for {date}:\n\n{digest}"),
-    ])
+    ]
+    try:
+        response = ChatOllama(model=SUMMARY_MODEL_NAME, base_url=OLLAMA_BASE_URL).invoke(messages)
+    except Exception:
+        if SUMMARY_MODEL_NAME == MODEL_NAME:
+            raise
+        response = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL).invoke(messages)
     summary_text = response.content
     created_at = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
