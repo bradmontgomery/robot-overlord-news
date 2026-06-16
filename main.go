@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"embed"
 	"html/template"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yuin/goldmark"
 	_ "modernc.org/sqlite"
 )
 
@@ -22,23 +24,25 @@ var content embed.FS
 const pageSize = 20
 
 type Article struct {
-	ID        int
-	Topics    []string
-	Title     string
-	URL       string
-	Summary   string
-	FetchedAt string
+	ID          int
+	Topics      []string
+	Title       string
+	URL         string
+	Summary     string
+	FetchedAt   string
+	PublishedOn string
 }
 
 type PageData struct {
-	Articles    []Article
-	Topics      []string
-	CurrentPage int
-	TotalPages  int
-	FilterTopic string
-	FilterDate  string
-	RecentDates []string
-	TotalCount  int
+	Articles     []Article
+	Topics       []string
+	CurrentPage  int
+	TotalPages   int
+	FilterTopic  string
+	FilterDate   string
+	RecentDates  []string
+	TotalCount   int
+	DailySummary string
 }
 
 var db *sql.DB
@@ -64,6 +68,13 @@ func main() {
 	}
 
 	funcMap := template.FuncMap{
+		"markdown": func(s string) template.HTML {
+			var buf bytes.Buffer
+			if err := goldmark.Convert([]byte(s), &buf); err != nil {
+				return template.HTML(template.HTMLEscapeString(s))
+			}
+			return template.HTML(buf.String())
+		},
 		"add": func(a, b int) int { return a + b },
 		"sub": func(a, b int) int { return a - b },
 		"seq": func(n int) []int {
@@ -138,6 +149,16 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		recentDates[i] = time.Now().AddDate(0, 0, -i).Format("2006-01-02")
 	}
 
+	summaryDate := dateFilter
+	if summaryDate == "" {
+		summaryDate = time.Now().Format("2006-01-02")
+	}
+	dailySummary, err := getDailySummary(summaryDate)
+	if err != nil {
+		log.Println("getDailySummary:", err)
+		dailySummary = ""
+	}
+
 	topics, err := getTopics()
 	if err != nil {
 		http.Error(w, "db error", 500)
@@ -158,14 +179,15 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := PageData{
-		Articles:    articles,
-		Topics:      topics,
-		CurrentPage: page,
-		TotalPages:  totalPages,
-		FilterTopic: topic,
-		FilterDate:  dateFilter,
-		RecentDates: recentDates,
-		TotalCount:  total,
+		Articles:     articles,
+		Topics:       topics,
+		CurrentPage:  page,
+		TotalPages:   totalPages,
+		FilterTopic:  topic,
+		FilterDate:   dateFilter,
+		RecentDates:  recentDates,
+		TotalCount:   total,
+		DailySummary: dailySummary,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -254,7 +276,7 @@ func getArticles(topic, date string, page int) (int, []Article, error) {
 		return 0, nil, err
 	}
 
-	const cols = `SELECT id, topic, COALESCE(title,''), COALESCE(url,''), COALESCE(summary,''), fetched_at FROM news_results`
+	const cols = `SELECT id, topic, COALESCE(title,''), COALESCE(url,''), COALESCE(summary,''), fetched_at, COALESCE(published_on,'') FROM news_results`
 	const tail = `ORDER BY fetched_at DESC LIMIT ? OFFSET ?`
 
 	switch {
@@ -276,13 +298,22 @@ func getArticles(topic, date string, page int) (int, []Article, error) {
 	for rows.Next() {
 		var a Article
 		var rawTopic string
-		if err := rows.Scan(&a.ID, &rawTopic, &a.Title, &a.URL, &a.Summary, &a.FetchedAt); err != nil {
+		if err := rows.Scan(&a.ID, &rawTopic, &a.Title, &a.URL, &a.Summary, &a.FetchedAt, &a.PublishedOn); err != nil {
 			return 0, nil, err
 		}
 		a.Topics = splitTopics(rawTopic)
 		articles = append(articles, a)
 	}
 	return total, articles, rows.Err()
+}
+
+func getDailySummary(date string) (string, error) {
+	var s string
+	err := db.QueryRow(`SELECT summary FROM news_summaries WHERE date = ?`, date).Scan(&s)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return s, err
 }
 
 var topicColors = []string{
