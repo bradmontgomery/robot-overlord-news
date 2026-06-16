@@ -41,24 +41,35 @@ For each topic the user provides:
    - title: article headline
    - url: article URL
    - summary: 1-2 sentence summary of the article
+   - published_on: publication date if visible in results (ISO format YYYY-MM-DD), else omit
 
 After you have searched and stored results for ALL topics, stop.
 """
 
+_SUMMARIZE_SYSTEM_PROMPT = """\
+You are a news summarization assistant. Given a list of news articles for a specific date, \
+write a concise high-level summary (2-4 paragraphs) covering the major themes and notable events.
+"""
+
 
 def init_db(path: str) -> None:
-    """Create the news_results table and unique URL index if they do not exist."""
+    """Create tables and indexes if they do not exist; migrate existing DBs."""
     with sqlite3.connect(path) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS news_results (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                topic      TEXT NOT NULL,
-                title      TEXT,
-                url        TEXT,
-                summary    TEXT,
-                fetched_at TEXT NOT NULL
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic        TEXT NOT NULL,
+                title        TEXT,
+                url          TEXT,
+                summary      TEXT,
+                fetched_at   TEXT NOT NULL,
+                published_on TEXT
             )
         """)
+        # Migrate existing DBs that lack the published_on column.
+        existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(news_results)").fetchall()]
+        if "published_on" not in existing_cols:
+            conn.execute("ALTER TABLE news_results ADD COLUMN published_on TEXT")
         # Remove duplicate URLs before enforcing the unique index, keeping the
         # earliest row (lowest id) for each URL so existing databases migrate cleanly.
         conn.execute("""
@@ -71,10 +82,18 @@ def init_db(path: str) -> None:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_news_url
             ON news_results (url)
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS news_summaries (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                date       TEXT NOT NULL UNIQUE,
+                summary    TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
 
 
 @tool
-def store_result(topic: str, title: str, url: str, summary: str) -> str:
+def store_result(topic: str, title: str, url: str, summary: str, published_on: str = "") -> str:
     """Store a single news article to the database.
 
     Args:
@@ -82,13 +101,15 @@ def store_result(topic: str, title: str, url: str, summary: str) -> str:
         title: article headline
         url: article URL
         summary: brief 1-2 sentence summary
+        published_on: publication date in YYYY-MM-DD format if known, else omit
     """
     fetched_at = datetime.now(timezone.utc).isoformat()
+    pub_date = published_on.strip() or None
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute(
-            "INSERT OR IGNORE INTO news_results (topic, title, url, summary, fetched_at)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (topic, title, url, summary, fetched_at),
+            "INSERT OR IGNORE INTO news_results (topic, title, url, summary, fetched_at, published_on)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (topic, title, url, summary, fetched_at, pub_date),
         )
     if cursor.rowcount:
         return f"Stored: {title}"
@@ -137,10 +158,39 @@ def build_graph():
     return graph.compile()
 
 
+def summarize_day(date: str) -> str | None:
+    """Summarize all news articles stored for *date* (YYYY-MM-DD) and upsert into news_summaries.
+
+    Returns the summary text, or None if no articles exist for that date.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT title, summary FROM news_results WHERE fetched_at LIKE ?",
+            (f"{date}%",),
+        ).fetchall()
+    if not rows:
+        return None
+    digest = "\n\n".join(f"- {title}: {summary}" for title, summary in rows)
+    model = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
+    response = model.invoke([
+        SystemMessage(_SUMMARIZE_SYSTEM_PROMPT),
+        HumanMessage(f"Summarize the news for {date}:\n\n{digest}"),
+    ])
+    summary_text = response.content
+    created_at = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO news_summaries (date, summary, created_at) VALUES (?, ?, ?)",
+            (date, summary_text, created_at),
+        )
+    return summary_text
+
+
 def run(topics: list[str]) -> int:
     """Research news for each topic, store to SQLite, and return count of new articles."""
     init_db(DB_PATH)
     run_start = datetime.now(timezone.utc).isoformat()
+    today = run_start[:10]
     app = build_graph()
     topic_list = ", ".join(topics)
     app.invoke(
@@ -151,6 +201,7 @@ def run(topics: list[str]) -> int:
         (new_count,) = conn.execute(
             "SELECT COUNT(*) FROM news_results WHERE fetched_at >= ?", (run_start,)
         ).fetchone()
+    summarize_day(today)
     return new_count
 
 
