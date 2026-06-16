@@ -12,6 +12,13 @@
   </span>
 </div>
 
+{{ if .DailySummary }}
+<div class="daily-summary">
+  <h2>Daily Briefing</h2>
+  <div class="daily-summary-body">{{ markdown .DailySummary }}</div>
+</div>
+{{ end }}
+
 {{ if .Articles }}
 <div class="articles">
   {{ range .Articles }}
@@ -20,6 +27,7 @@
       {{ range .Topics }}
       <a class="topic-pill" href="/?topic={{ . }}{{ if $.FilterDate }}&date={{ $.FilterDate }}{{ end }}" style="background:{{ topicColor . }}">{{ . }}</a>
       {{ end }}
+      {{ if .PublishedOn }}<span class="published-on" title="Published on {{ .PublishedOn }}">{{ .PublishedOn }}</span>{{ end }}
       <span class="fetched-at" title="Article fetched on {{ formatTime .FetchedAt }}">{{ formatTime .FetchedAt }}</span>
     </div>
     <h3>
