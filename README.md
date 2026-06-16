@@ -5,9 +5,13 @@ A fast, minimal web app for browsing news articles fetched by a LangChain agent 
 ## Features
 
 - Browse articles with title, summary, and source link
-- Filter by topic using the sidebar
+- Filter by topic or date using the sidebar
 - Paginated by fetch date (newest first)
 - Single binary — no runtime dependencies
+
+## Deployment
+
+Pushes to `main` are automatically built, tested, and deployed to EC2 via GitHub Actions. See [DEPLOYMENT.md](DEPLOYMENT.md) for infrastructure details and the secrets required by the pipeline.
 
 ## Setup
 
