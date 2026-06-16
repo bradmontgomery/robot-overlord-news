@@ -19,6 +19,8 @@ import time
 from datetime import datetime, timezone
 from typing import Literal
 
+from rich import print as rprint
+
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
@@ -135,9 +137,10 @@ def build_graph():
     return graph.compile()
 
 
-def run(topics: list[str]) -> list[dict]:
-    """Research news for each topic, store to SQLite, and return stored rows."""
+def run(topics: list[str]) -> int:
+    """Research news for each topic, store to SQLite, and return count of new articles."""
     init_db(DB_PATH)
+    run_start = datetime.now(timezone.utc).isoformat()
     app = build_graph()
     topic_list = ", ".join(topics)
     app.invoke(
@@ -145,29 +148,20 @@ def run(topics: list[str]) -> list[dict]:
         config={"recursion_limit": 50},
     )
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT topic, title, url, summary, fetched_at"
-            " FROM news_results ORDER BY fetched_at DESC LIMIT 100"
-        ).fetchall()
-    return [
-        {"topic": r[0], "title": r[1], "url": r[2], "summary": r[3], "fetched_at": r[4]}
-        for r in rows
-    ]
+        (new_count,) = conn.execute(
+            "SELECT COUNT(*) FROM news_results WHERE fetched_at >= ?", (run_start,)
+        ).fetchone()
+    return new_count
 
 
-def _print_results(results: list[dict]) -> None:
-    if not results:
-        print("No results stored.")
-        return
-    current_topic = None
-    for r in reversed(results):
-        if r["topic"] != current_topic:
-            current_topic = r["topic"]
-            print(f"\n## {current_topic}")
-        print(f"  {r['title']}")
-        print(f"  {r['url']}")
-        print(f"  {r['summary']}")
-        print()
+def _print_summary(new_count: int, topics: list[str]) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    topic_str = ", ".join(topics)
+    if new_count:
+        noun = "article" if new_count == 1 else "articles"
+        rprint(f"[dim][{now}][/dim] [bold green]{new_count} new {noun} found[/bold green] for: {topic_str}")
+    else:
+        rprint(f"[dim][{now}][/dim] [yellow]No new articles[/yellow] for: {topic_str}")
 
 
 def run_cli() -> None:
@@ -178,11 +172,11 @@ def run_cli() -> None:
     topics = sys.argv[1:] or ["AI", "climate"]
     interval = int(os.getenv("NEWS_INTERVAL", "0"))
     while True:
-        results = run(topics)
-        _print_results(results)
+        new_count = run(topics)
+        _print_summary(new_count, topics)
         if not interval:
             break
-        print(f"Sleeping {interval}s...")
+        rprint(f"[dim]Sleeping {interval}s...[/dim]")
         time.sleep(interval)
 
 

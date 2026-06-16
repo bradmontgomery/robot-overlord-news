@@ -261,7 +261,7 @@ def test_build_graph_agent_node_invokes_model():
 # ---------------------------------------------------------------------------
 
 
-def test_run_calls_init_db_and_returns_rows(tmp_path):
+def test_run_returns_zero_when_no_articles_stored(tmp_path):
     from news import agent as news_agent
 
     db_file = str(tmp_path / "run_test.db")
@@ -271,35 +271,38 @@ def test_run_calls_init_db_and_returns_rows(tmp_path):
 
     with patch.object(news_agent, "DB_PATH", db_file), \
          patch("news.agent.build_graph", return_value=mock_app):
-        results = news_agent.run(["topic1"])
+        count = news_agent.run(["topic1"])
 
     mock_app.invoke.assert_called_once()
-    # DB was initialised (table exists) but no rows stored by mocked app
-    assert results == []
+    assert count == 0
 
 
-def test_run_returns_stored_rows(tmp_path):
+def test_run_returns_count_of_new_articles(tmp_path):
     from news import agent as news_agent
 
     db_file = str(tmp_path / "run_rows.db")
     news_agent.init_db(db_file)
-    with sqlite3.connect(db_file) as conn:
-        conn.execute(
-            "INSERT INTO news_results (topic, title, url, summary, fetched_at)"
-            " VALUES (?, ?, ?, ?, ?)",
-            ("AI", "Headline", "http://x.com", "Summary text.", "2026-01-01T00:00:00"),
-        )
+
+    def fake_invoke(messages, config=None):
+        # Simulate the agent storing a row during the run (current timestamp)
+        from datetime import datetime, timezone
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(db_file) as conn:
+            conn.execute(
+                "INSERT INTO news_results (topic, title, url, summary, fetched_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                ("AI", "Headline", "http://x.com", "Summary.", fetched_at),
+            )
+        return {}
 
     mock_app = MagicMock()
-    mock_app.invoke.return_value = {}
+    mock_app.invoke.side_effect = fake_invoke
 
     with patch.object(news_agent, "DB_PATH", db_file), \
          patch("news.agent.build_graph", return_value=mock_app):
-        results = news_agent.run(["AI"])
+        count = news_agent.run(["AI"])
 
-    assert len(results) == 1
-    assert results[0]["topic"] == "AI"
-    assert results[0]["title"] == "Headline"
+    assert count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -307,49 +310,85 @@ def test_run_returns_stored_rows(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_run_cli_prints_results(capsys):
+def test_run_cli_calls_print_summary():
     from news import agent as news_agent
 
-    fake_results = [
-        {"topic": "AI", "title": "Title A", "url": "http://a.com", "summary": "Summary A.", "fetched_at": "2026-01-01"},
-        {"topic": "AI", "title": "Title B", "url": "http://b.com", "summary": "Summary B.", "fetched_at": "2026-01-02"},
-    ]
-    with patch("news.agent.run", return_value=fake_results), \
-         patch("sys.argv", ["news_agent", "AI"]):
+    with patch("news.agent.run", return_value=3), \
+         patch("news.agent._print_summary") as mock_summary, \
+         patch("news.agent.rprint"), \
+         patch("sys.argv", ["news_agent", "AI"]), \
+         patch.dict(os.environ, {"NEWS_INTERVAL": "0"}):
         news_agent.run_cli()
 
-    out = capsys.readouterr().out
-    assert "## AI" in out
-    assert "Title A" in out
-    assert "Title B" in out
+    mock_summary.assert_called_once_with(3, ["AI"])
 
 
-def test_run_cli_no_results(capsys):
+def test_run_cli_no_results():
     from news import agent as news_agent
 
-    with patch("news.agent.run", return_value=[]), \
-         patch("sys.argv", ["news_agent", "AI"]):
+    with patch("news.agent.run", return_value=0), \
+         patch("news.agent._print_summary") as mock_summary, \
+         patch("news.agent.rprint"), \
+         patch("sys.argv", ["news_agent", "AI"]), \
+         patch.dict(os.environ, {"NEWS_INTERVAL": "0"}):
         news_agent.run_cli()
 
-    out = capsys.readouterr().out
-    assert "No results stored." in out
+    mock_summary.assert_called_once_with(0, ["AI"])
+
+
+def test_print_summary_new_articles():
+    from news import agent as news_agent
+
+    with patch("news.agent.rprint") as mock_print:
+        news_agent._print_summary(3, ["AI", "climate"])
+
+    mock_print.assert_called_once()
+    output = mock_print.call_args[0][0]
+    assert "3 new articles found" in output
+    assert "AI, climate" in output
+
+
+def test_print_summary_singular():
+    from news import agent as news_agent
+
+    with patch("news.agent.rprint") as mock_print:
+        news_agent._print_summary(1, ["AI"])
+
+    output = mock_print.call_args[0][0]
+    assert "1 new article found" in output
+    assert "articles" not in output
+
+
+def test_print_summary_no_results():
+    from news import agent as news_agent
+
+    with patch("news.agent.rprint") as mock_print:
+        news_agent._print_summary(0, ["AI"])
+
+    output = mock_print.call_args[0][0]
+    assert "No new articles" in output
 
 
 def test_run_cli_default_topics():
     from news import agent as news_agent
 
-    with patch("news.agent.run", return_value=[]) as mock_run, \
-         patch("sys.argv", ["news_agent"]):
+    with patch("news.agent.run", return_value=0) as mock_run, \
+         patch("news.agent._print_summary"), \
+         patch("news.agent.rprint"), \
+         patch("sys.argv", ["news_agent"]), \
+         patch.dict(os.environ, {"NEWS_INTERVAL": "0"}):
         news_agent.run_cli()
 
     mock_run.assert_called_once_with(["AI", "climate"])
 
 
-def test_run_cli_polls_on_interval(capsys):
+def test_run_cli_polls_on_interval():
     from news import agent as news_agent
 
     # sleep returns None on first call, then raises to exit the loop
-    with patch("news.agent.run", return_value=[]) as mock_run, \
+    with patch("news.agent.run", return_value=0) as mock_run, \
+         patch("news.agent._print_summary"), \
+         patch("news.agent.rprint"), \
          patch("news.agent.time.sleep", side_effect=[None, KeyboardInterrupt]) as mock_sleep, \
          patch("sys.argv", ["news_agent", "AI"]), \
          patch.dict(os.environ, {"NEWS_INTERVAL": "60"}):
@@ -365,7 +404,9 @@ def test_run_cli_polls_on_interval(capsys):
 def test_run_cli_interval_zero_runs_once():
     from news import agent as news_agent
 
-    with patch("news.agent.run", return_value=[]) as mock_run, \
+    with patch("news.agent.run", return_value=0) as mock_run, \
+         patch("news.agent._print_summary"), \
+         patch("news.agent.rprint"), \
          patch("news.agent.time.sleep") as mock_sleep, \
          patch("sys.argv", ["news_agent", "AI"]), \
          patch.dict(os.environ, {"NEWS_INTERVAL": "0"}):
@@ -379,7 +420,9 @@ def test_run_cli_interval_unset_runs_once():
     from news import agent as news_agent
 
     env = {k: v for k, v in os.environ.items() if k != "NEWS_INTERVAL"}
-    with patch("news.agent.run", return_value=[]) as mock_run, \
+    with patch("news.agent.run", return_value=0) as mock_run, \
+         patch("news.agent._print_summary"), \
+         patch("news.agent.rprint"), \
          patch("news.agent.time.sleep") as mock_sleep, \
          patch("sys.argv", ["news_agent"]), \
          patch.dict(os.environ, env, clear=True):
@@ -387,3 +430,5 @@ def test_run_cli_interval_unset_runs_once():
 
     mock_run.assert_called_once()
     mock_sleep.assert_not_called()
+
+
