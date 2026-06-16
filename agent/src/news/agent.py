@@ -51,6 +51,8 @@ You are a news summarization assistant. Given a list of news articles for a spec
 write a concise high-level summary (2-4 paragraphs) covering the major themes and notable events.
 """
 
+_JUDGE_SYSTEM_PROMPT = "You are a relevance judge. Answer only YES or NO — no explanation."
+
 
 def init_db(path: str) -> None:
     """Create tables and indexes if they do not exist; migrate existing DBs."""
@@ -158,6 +160,39 @@ def build_graph():
     return graph.compile()
 
 
+def judge_articles(topics: list[str], run_start: str) -> int:
+    """Delete articles fetched since run_start that are irrelevant to topics.
+
+    Returns the count of removed rows.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT id, title, summary FROM news_results WHERE fetched_at >= ?",
+            (run_start,),
+        ).fetchall()
+    if not rows:
+        return 0
+
+    topic_str = ", ".join(topics)
+    model = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
+    removed = 0
+    for row_id, title, summary in rows:
+        response = model.invoke([
+            SystemMessage(_JUDGE_SYSTEM_PROMPT),
+            HumanMessage(
+                f"Topics: {topic_str}\n\n"
+                f"Article title: {title}\n"
+                f"Article summary: {summary}\n\n"
+                f"Is this article genuinely relevant to at least one of the topics?"
+            ),
+        ])
+        if "yes" not in response.content.lower():
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("DELETE FROM news_results WHERE id = ?", (row_id,))
+            removed += 1
+    return removed
+
+
 def summarize_day(date: str) -> str | None:
     """Summarize all news articles stored for *date* (YYYY-MM-DD) and upsert into news_summaries.
 
@@ -201,6 +236,7 @@ def run(topics: list[str]) -> int:
         (new_count,) = conn.execute(
             "SELECT COUNT(*) FROM news_results WHERE fetched_at >= ?", (run_start,)
         ).fetchone()
+    judge_articles(topics, run_start)
     summarize_day(today)
     return new_count
 
