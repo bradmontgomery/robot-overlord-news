@@ -19,7 +19,7 @@
     <ul class="topic-list">
       {{ range .RecentDates }}
       <li>
-        <a href="/?date={{ . }}" {{ if eq . $.FilterDate }}class="active"{{ end }}>
+        <a href="/?date={{ . }}{{ if $.FilterTopic }}&topic={{ $.FilterTopic }}{{ end }}" {{ if eq . $.FilterDate }}class="active"{{ end }}>
           {{ formatDate . }}
         </a>
       </li>
@@ -35,7 +35,7 @@
       </li>
       {{ range .Topics }}
       <li>
-        <a href="/?topic={{ . }}" {{ if eq . $.FilterTopic }}class="active"{{ end }} title="{{ . }}">
+        <a href="/?topic={{ . }}{{ if $.FilterDate }}&date={{ $.FilterDate }}{{ end }}" {{ if eq . $.FilterTopic }}class="active"{{ end }} title="{{ . }}">
           <span class="topic-dot" style="background:{{ topicColor . }}"></span>{{ . }}
         </a>
       </li>
