@@ -36,6 +36,8 @@ type PageData struct {
 	CurrentPage int
 	TotalPages  int
 	FilterTopic string
+	FilterDate  string
+	RecentDates []string
 	TotalCount  int
 }
 
@@ -72,6 +74,22 @@ func main() {
 			return s
 		},
 		"topicColor": topicColor,
+		"formatDate": func(dateStr string) string {
+			t, err := time.Parse("2006-01-02", dateStr)
+			if err != nil {
+				return dateStr
+			}
+			today := time.Now().Format("2006-01-02")
+			yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+			switch dateStr {
+			case today:
+				return "Today (" + t.Format("Jan 2") + ")"
+			case yesterday:
+				return "Yesterday (" + t.Format("Jan 2") + ")"
+			default:
+				return t.Format("Jan 2")
+			}
+		},
 		"truncate": func(s string, n int) string {
 			if len(s) <= n {
 				return s
@@ -108,10 +126,16 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	topic := r.URL.Query().Get("topic")
+	dateFilter := r.URL.Query().Get("date")
 	pageStr := r.URL.Query().Get("page")
 	page := 1
 	if p, err := strconv.Atoi(pageStr); err == nil && p > 1 {
 		page = p
+	}
+
+	recentDates := make([]string, 5)
+	for i := 0; i < 5; i++ {
+		recentDates[i] = time.Now().AddDate(0, 0, -i).Format("2006-01-02")
 	}
 
 	topics, err := getTopics()
@@ -121,7 +145,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	total, articles, err := getArticles(topic, page)
+	total, articles, err := getArticles(topic, dateFilter, page)
 	if err != nil {
 		http.Error(w, "db error", 500)
 		log.Println("getArticles:", err)
@@ -139,6 +163,8 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		CurrentPage: page,
 		TotalPages:  totalPages,
 		FilterTopic: topic,
+		FilterDate:  dateFilter,
+		RecentDates: recentDates,
 		TotalCount:  total,
 	}
 
@@ -202,7 +228,7 @@ func splitTopics(raw string) []string {
 	return out
 }
 
-func getArticles(topic string, page int) (int, []Article, error) {
+func getArticles(topic, date string, page int) (int, []Article, error) {
 	offset := (page - 1) * pageSize
 
 	var countRow *sql.Row
@@ -210,10 +236,16 @@ func getArticles(topic string, page int) (int, []Article, error) {
 	var err error
 
 	const topicFilter = `',' || topic || ',' LIKE '%,' || ? || ',%'`
+	const dateFilter = `DATE(fetched_at) = ?`
 
-	if topic != "" {
+	switch {
+	case topic != "" && date != "":
+		countRow = db.QueryRow(`SELECT COUNT(*) FROM news_results WHERE `+topicFilter+` AND `+dateFilter, topic, date)
+	case topic != "":
 		countRow = db.QueryRow(`SELECT COUNT(*) FROM news_results WHERE `+topicFilter, topic)
-	} else {
+	case date != "":
+		countRow = db.QueryRow(`SELECT COUNT(*) FROM news_results WHERE `+dateFilter, date)
+	default:
 		countRow = db.QueryRow(`SELECT COUNT(*) FROM news_results`)
 	}
 
@@ -222,20 +254,18 @@ func getArticles(topic string, page int) (int, []Article, error) {
 		return 0, nil, err
 	}
 
-	if topic != "" {
-		rows, err = db.Query(
-			`SELECT id, topic, COALESCE(title,''), COALESCE(url,''), COALESCE(summary,''), fetched_at
-			 FROM news_results WHERE `+topicFilter+`
-			 ORDER BY fetched_at DESC LIMIT ? OFFSET ?`,
-			topic, pageSize, offset,
-		)
-	} else {
-		rows, err = db.Query(
-			`SELECT id, topic, COALESCE(title,''), COALESCE(url,''), COALESCE(summary,''), fetched_at
-			 FROM news_results
-			 ORDER BY fetched_at DESC LIMIT ? OFFSET ?`,
-			pageSize, offset,
-		)
+	const cols = `SELECT id, topic, COALESCE(title,''), COALESCE(url,''), COALESCE(summary,''), fetched_at FROM news_results`
+	const tail = `ORDER BY fetched_at DESC LIMIT ? OFFSET ?`
+
+	switch {
+	case topic != "" && date != "":
+		rows, err = db.Query(cols+` WHERE `+topicFilter+` AND `+dateFilter+` `+tail, topic, date, pageSize, offset)
+	case topic != "":
+		rows, err = db.Query(cols+` WHERE `+topicFilter+` `+tail, topic, pageSize, offset)
+	case date != "":
+		rows, err = db.Query(cols+` WHERE `+dateFilter+` `+tail, date, pageSize, offset)
+	default:
+		rows, err = db.Query(cols+` `+tail, pageSize, offset)
 	}
 	if err != nil {
 		return 0, nil, err

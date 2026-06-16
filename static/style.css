@@ -82,6 +82,10 @@ aside h2 {
   margin-bottom: 0.75rem;
 }
 
+aside h2.sidebar-section-gap {
+  margin-top: 1.5rem;
+}
+
 .topic-list { list-style: none; }
 
 .topic-list li { margin-bottom: 2px; }

@@ -90,14 +90,31 @@ curl https://robot-overlord.news
 
 ## Deploying Updates
 
-After making code changes:
+Deployment is automated via GitHub Actions. Any push to `main` (including a merged PR)
+triggers the CI/CD pipeline defined in `.github/workflows/deploy.yml`, which:
+
+1. Runs `go test ./...`
+2. Builds the binary with `go build`
+3. Rsyncs the binary to `/opt/news/` on the EC2 instance
+4. Restarts the `news` systemd service
+
+### Required GitHub Secrets
+
+Add these under **Settings → Secrets and variables → Actions** in the GitHub repo:
+
+| Secret | Value |
+|--------|-------|
+| `SSH_PRIVATE_KEY` | Full contents of `~/.ssh/robot-overlord.pem` |
+| `DEPLOY_HOST` | `robot-overlord.news` |
+| `DEPLOY_USER` | `ec2-user` |
+
+### Manual Deploy
+
+If you need to deploy outside of CI (e.g., for a hotfix without a PR):
 
 ```bash
 make deploy DEPLOY_HOST=robot-overlord.news
 ```
-
-This builds the binary locally, rsyncs it (plus templates and static files) to the
-server, and restarts the systemd service. Downtime is a few seconds while the service restarts.
 
 ## Deploying the News-Fetching Agent
 

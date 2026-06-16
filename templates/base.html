@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Robot Overlord News{{ if .FilterTopic }} — {{ .FilterTopic }}{{ end }}</title>
+  <title>Robot Overlord News{{ if .FilterTopic }} — {{ .FilterTopic }}{{ else if .FilterDate }} — {{ formatDate .FilterDate }}{{ end }}</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -15,16 +15,27 @@
   </header>
 
   <aside>
-    <h2>Topics</h2>
+    <h2>Recent News</h2>
+    <ul class="topic-list">
+      {{ range .RecentDates }}
+      <li>
+        <a href="/?date={{ . }}{{ if $.FilterTopic }}&topic={{ $.FilterTopic }}{{ end }}" {{ if eq . $.FilterDate }}class="active"{{ end }}>
+          {{ formatDate . }}
+        </a>
+      </li>
+      {{ end }}
+    </ul>
+
+    <h2 class="sidebar-section-gap">Topics</h2>
     <ul class="topic-list">
       <li>
-        <a href="/" {{ if eq .FilterTopic "" }}class="active"{{ end }}>
+        <a href="/" {{ if and (eq .FilterTopic "") (eq .FilterDate "") }}class="active"{{ end }}>
           <span class="topic-dot" style="background:#8892b0"></span>All topics
         </a>
       </li>
       {{ range .Topics }}
       <li>
-        <a href="/?topic={{ . }}" {{ if eq . $.FilterTopic }}class="active"{{ end }} title="{{ . }}">
+        <a href="/?topic={{ . }}{{ if $.FilterDate }}&date={{ $.FilterDate }}{{ end }}" {{ if eq . $.FilterTopic }}class="active"{{ end }} title="{{ . }}">
           <span class="topic-dot" style="background:{{ topicColor . }}"></span>{{ . }}
         </a>
       </li>
