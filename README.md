@@ -1,4 +1,4 @@
-# news_site
+# 🤖 Robot Overlord News
 
 A fast, minimal web app for browsing news articles fetched by a LangChain agent and stored in SQLite.
 
