@@ -4,7 +4,7 @@
   <div class="active-filter">
     <span class="topic-dot" style="background:{{ topicColor .FilterTopic }}"></span>
     <strong>{{ .FilterTopic }}</strong>
-    <a href="/" title="Clear filter">✕</a>
+    <a href="/{{ if .FilterDate }}?date={{ .FilterDate }}{{ end }}" title="Clear filter">✕</a>
   </div>
   {{ end }}
   <span class="results-count">
@@ -18,9 +18,9 @@
   <div class="article">
     <div class="article-meta">
       {{ range .Topics }}
-      <a class="topic-pill" href="/?topic={{ . }}" style="background:{{ topicColor . }}">{{ . }}</a>
+      <a class="topic-pill" href="/?topic={{ . }}{{ if $.FilterDate }}&date={{ $.FilterDate }}{{ end }}" style="background:{{ topicColor . }}">{{ . }}</a>
       {{ end }}
-      <span class="fetched-at">{{ formatTime .FetchedAt }}</span>
+      <span class="fetched-at" title="Article fetched on {{ formatTime .FetchedAt }}">{{ formatTime .FetchedAt }}</span>
     </div>
     <h3>
       {{ if .URL }}
@@ -45,13 +45,14 @@
 {{ define "pagination" }}
 {{ if gt .TotalPages 1 }}
 <nav class="pagination" aria-label="Pagination">
-  {{ if gt .CurrentPage 1 }}
-  <a href="?{{ if .FilterTopic }}topic={{ .FilterTopic }}&{{ end }}page={{ sub .CurrentPage 1 }}">&larr;</a>
-  {{ end }}
-
   {{ $cur := .CurrentPage }}
   {{ $total := .TotalPages }}
   {{ $topic := .FilterTopic }}
+  {{ $date := .FilterDate }}
+
+  {{ if gt .CurrentPage 1 }}
+  <a href="?{{ if $topic }}topic={{ $topic }}&{{ end }}{{ if $date }}date={{ $date }}&{{ end }}page={{ sub $cur 1 }}">&larr;</a>
+  {{ end }}
 
   {{ range seq $total }}
   {{ $p := . }}
@@ -59,15 +60,15 @@
     {{ if eq $p $cur }}
     <span class="current">{{ $p }}</span>
     {{ else }}
-    <a href="?{{ if $topic }}topic={{ $topic }}&{{ end }}page={{ $p }}">{{ $p }}</a>
+    <a href="?{{ if $topic }}topic={{ $topic }}&{{ end }}{{ if $date }}date={{ $date }}&{{ end }}page={{ $p }}">{{ $p }}</a>
     {{ end }}
   {{ else if or (eq $p 3) (eq $p (sub $total 2)) }}
   <span class="ellipsis">…</span>
   {{ end }}
   {{ end }}
 
-  {{ if lt .CurrentPage .TotalPages }}
-  <a href="?{{ if .FilterTopic }}topic={{ .FilterTopic }}&{{ end }}page={{ add .CurrentPage 1 }}">&rarr;</a>
+  {{ if lt $cur $total }}
+  <a href="?{{ if $topic }}topic={{ $topic }}&{{ end }}{{ if $date }}date={{ $date }}&{{ end }}page={{ add $cur 1 }}">&rarr;</a>
   {{ end }}
 </nav>
 {{ end }}
