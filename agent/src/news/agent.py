@@ -19,13 +19,12 @@ import time
 from datetime import datetime, timezone
 from typing import Literal
 
-from rich import print as rprint
-
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
+from rich import print as rprint
 
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "gemma4:latest")
 SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL", "gemma4:26b")
@@ -50,9 +49,14 @@ After you have searched and stored results for ALL topics, stop.
 _SUMMARIZE_SYSTEM_PROMPT = """\
 You are a news summarization assistant. Given a list of news articles for a specific date, \
 write a concise high-level summary (2-4 paragraphs) covering the major themes and notable events.
+
+Format content in markdown and prioritize readability; e.g. use bold, italic, and bulleted lists \
+to enable easily skimming content.
 """
 
-_JUDGE_SYSTEM_PROMPT = "You are a relevance judge. Answer only YES or NO — no explanation."
+_JUDGE_SYSTEM_PROMPT = (
+    "You are a relevance judge. Answer only YES or NO — no explanation."
+)
 
 
 def init_db(path: str) -> None:
@@ -70,7 +74,9 @@ def init_db(path: str) -> None:
             )
         """)
         # Migrate existing DBs that lack the published_on column.
-        existing_cols = [r[1] for r in conn.execute("PRAGMA table_info(news_results)").fetchall()]
+        existing_cols = [
+            r[1] for r in conn.execute("PRAGMA table_info(news_results)").fetchall()
+        ]
         if "published_on" not in existing_cols:
             conn.execute("ALTER TABLE news_results ADD COLUMN published_on TEXT")
         # Remove duplicate URLs before enforcing the unique index, keeping the
@@ -96,7 +102,9 @@ def init_db(path: str) -> None:
 
 
 @tool
-def store_result(topic: str, title: str, url: str, summary: str, published_on: str = "") -> str:
+def store_result(
+    topic: str, title: str, url: str, summary: str, published_on: str = ""
+) -> str:
     """Store a single news article to the database.
 
     Args:
@@ -178,15 +186,17 @@ def judge_articles(topics: list[str], run_start: str) -> int:
     model = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
     removed = 0
     for row_id, title, summary in rows:
-        response = model.invoke([
-            SystemMessage(_JUDGE_SYSTEM_PROMPT),
-            HumanMessage(
-                f"Topics: {topic_str}\n\n"
-                f"Article title: {title}\n"
-                f"Article summary: {summary}\n\n"
-                f"Is this article genuinely relevant to at least one of the topics?"
-            ),
-        ])
+        response = model.invoke(
+            [
+                SystemMessage(_JUDGE_SYSTEM_PROMPT),
+                HumanMessage(
+                    f"Topics: {topic_str}\n\n"
+                    f"Article title: {title}\n"
+                    f"Article summary: {summary}\n\n"
+                    f"Is this article genuinely relevant to at least one of the topics?"
+                ),
+            ]
+        )
         if "yes" not in response.content.lower():
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute("DELETE FROM news_results WHERE id = ?", (row_id,))
@@ -212,11 +222,15 @@ def summarize_day(date: str) -> str | None:
         HumanMessage(f"Summarize the news for {date}:\n\n{digest}"),
     ]
     try:
-        response = ChatOllama(model=SUMMARY_MODEL_NAME, base_url=OLLAMA_BASE_URL).invoke(messages)
+        response = ChatOllama(
+            model=SUMMARY_MODEL_NAME, base_url=OLLAMA_BASE_URL
+        ).invoke(messages)
     except Exception:
         if SUMMARY_MODEL_NAME == MODEL_NAME:
             raise
-        response = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL).invoke(messages)
+        response = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL).invoke(
+            messages
+        )
     summary_text = response.content
     created_at = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
@@ -252,7 +266,9 @@ def _print_summary(new_count: int, topics: list[str]) -> None:
     topic_str = ", ".join(topics)
     if new_count:
         noun = "article" if new_count == 1 else "articles"
-        rprint(f"[dim][{now}][/dim] [bold green]{new_count} new {noun} found[/bold green] for: {topic_str}")
+        rprint(
+            f"[dim][{now}][/dim] [bold green]{new_count} new {noun} found[/bold green] for: {topic_str}"
+        )
     else:
         rprint(f"[dim][{now}][/dim] [yellow]No new articles[/yellow] for: {topic_str}")
 
