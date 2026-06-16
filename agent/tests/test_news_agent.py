@@ -628,6 +628,53 @@ def test_summarize_day_passes_articles_to_model(tmp_path):
     assert "Details here." in human_msg.content
 
 
+def test_summarize_day_falls_back_to_model_name(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "Story", "http://s.com", "Summary.", "2026-06-16T10:00:00+00:00"),
+        )
+
+    failing_model = MagicMock()
+    failing_model.invoke.side_effect = Exception("model not found")
+    working_model = MagicMock()
+    working_model.invoke.return_value = MagicMock(content="Fallback summary.")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "SUMMARY_MODEL_NAME", "missing-model"), \
+         patch.object(news_agent, "MODEL_NAME", "fallback-model"), \
+         patch("news.agent.ChatOllama", side_effect=[failing_model, working_model]):
+        result = news_agent.summarize_day("2026-06-16")
+
+    assert result == "Fallback summary."
+
+
+def test_summarize_day_raises_when_only_model_fails(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "Story", "http://s2.com", "Summary.", "2026-06-16T10:00:00+00:00"),
+        )
+
+    failing_model = MagicMock()
+    failing_model.invoke.side_effect = Exception("model not found")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "SUMMARY_MODEL_NAME", "only-model"), \
+         patch.object(news_agent, "MODEL_NAME", "only-model"), \
+         patch("news.agent.ChatOllama", return_value=failing_model):
+        with pytest.raises(Exception, match="model not found"):
+            news_agent.summarize_day("2026-06-16")
+
+
 # ---------------------------------------------------------------------------
 # judge_articles()
 # ---------------------------------------------------------------------------
