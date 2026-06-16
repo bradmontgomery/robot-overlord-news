@@ -5,7 +5,7 @@ DEPLOY_USER ?= ec2-user
 DEPLOY_HOST ?= $(error Set DEPLOY_HOST=<host-or-ip>)
 SSH_KEY     ?= ~/.ssh/robot-overlord.pem
 INSTANCE_TYPE ?= t3.micro
-SSH_CIDR    ?= $(error Set SSH_CIDR=<your-ip>/32)
+SSH_CIDR    ?= $(shell curl -s https://checkip.amazonaws.com)/32
 DOMAIN      ?= ""
 
 .PHONY: all build run clean test fmt vet lint tidy deploy infra-deploy
