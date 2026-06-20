@@ -479,7 +479,7 @@ def test_run_cli_default_topics():
          patch.dict(os.environ, {"NEWS_INTERVAL": "0"}):
         news_agent.run_cli()
 
-    mock_run.assert_called_once_with(["AI", "climate"])
+    mock_run.assert_called_once_with(list(news_agent.DEFAULT_TOPICS))
 
 
 def test_run_cli_polls_on_interval():

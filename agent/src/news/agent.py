@@ -26,10 +26,77 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from rich import print as rprint
 
-MODEL_NAME = os.getenv("OLLAMA_MODEL", "gemma4:latest")
+MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen3.5:latest")
 SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL", "gemma4:26b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 DB_PATH = os.getenv("NEWS_DB_PATH", "news_results.db")
+DEFAULT_TOPICS = (
+    "anthropic",  # AI companies
+    "openai",
+    "ollama",
+    "Google",
+    "xai",
+    "SpaceX",
+    "Z.ai",
+    "Nvidia",
+    "Microsoft",
+    "perplexity",
+    "Moonshot",
+    "hugging face",
+    "Groq",
+    "claude",  # Models
+    "Gemini",
+    "chatgpt",
+    "GPT-5",
+    "nova",
+    "Phi",
+    "Sora",
+    "veo",
+    "Midjourney",
+    "Stable Diffusion",
+    "grok",
+    "deepseek",
+    "meta llama",
+    "GLM",
+    "Kimi",
+    "Qwen",
+    "Minimax",
+    "LFM",
+    "gemma",
+    "nemotron",
+    "mistral",
+    "Cohere",
+    "claude code",  # tools, harnesses
+    "codex",
+    "opencode",
+    "Cursor",
+    "LangChain",
+    "copilot",
+    "kiro",
+    "openclaw",
+    "cline",
+    "windsurf",
+    "replit",
+    "zed",
+    "local llm",  # broader topics
+    "vllm",
+    "MCP",
+    "model context protocol",
+    "A2A",
+    "coding agents",
+    "ai harness",
+    "artificial intelligence",
+    "llm",
+    "large language model",
+    "foundation model",
+    "ai safety",
+    "ai policy",
+    "reasoning models",
+    "open weights",
+    "AGI",
+    "vibe coding",
+    "RAG",
+)
 
 _SYSTEM_PROMPT = """\
 You are a news research agent. Today's date is {today}.
@@ -46,8 +113,8 @@ For each topic:
    - published_on: publication date if visible in results (ISO format YYYY-MM-DD), else omit
 
 Rules for the `topic` field — keep topics tight so they stay easy to group:
-- Reuse the SAME short label the user gave you. Do NOT invent new or longer wording,
-  and do NOT turn the label into a descriptive phrase.
+- Reuse the SAME short label the user gave you. Do not expand the label or invent longer wording,
+  and do NOT turn the label into a descriptive phrase. You may shorten or make the label more succint.
 - Labels are lowercase and one or two words each (e.g. "anthropic", "local llm", "ai coding").
 - Multiple topics are allowed: if one article is genuinely relevant to several of the
   provided topics, set topic to a comma-separated list of those labels
@@ -67,6 +134,18 @@ to enable easily skimming content.
 _JUDGE_SYSTEM_PROMPT = (
     "You are a relevance judge. Answer only YES or NO — no explanation."
 )
+
+SEARCH_PROMPT = """Research recent news for: {topic_list}.
+
+Prioritize a few websites like:
+
+* https://steve-yegge.medium.com
+* https://simonwillison.net
+* https://github.blog/ai-and-ml/llms/
+* https://huggingface.co/blog
+
+But otherwise cast a very broad net to find relevant, recent news matching these topics.
+"""
 
 
 def init_db(path: str) -> None:
@@ -261,7 +340,7 @@ def run(topics: list[str]) -> int:
     app = build_graph()
     topic_list = ", ".join(topics)
     app.invoke(
-        {"messages": [HumanMessage(f"Research recent news for: {topic_list}")]},
+        {"messages": [HumanMessage(SEARCH_PROMPT.format(topic_list=topic_list))]},
         config={"recursion_limit": 50},
     )
     with sqlite3.connect(DB_PATH) as conn:
@@ -290,7 +369,7 @@ def run_cli() -> None:
 
     Set NEWS_INTERVAL (seconds) to run repeatedly; unset or 0 runs once.
     """
-    topics = sys.argv[1:] or ["AI", "climate"]
+    topics = sys.argv[1:] or list(DEFAULT_TOPICS)
     interval = int(os.getenv("NEWS_INTERVAL", "0"))
     while True:
         new_count = run(topics)
