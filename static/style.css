@@ -256,6 +256,13 @@ main {
 .article h3 a { color: var(--text); }
 .article h3 a:hover { color: var(--link-hover); text-decoration: none; }
 
+.article-domain {
+  display: inline-block;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-bottom: 0.35rem;
+}
+
 .article p {
   font-size: 0.85rem;
   color: var(--text-muted);

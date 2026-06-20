@@ -8,6 +8,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -85,6 +86,14 @@ func main() {
 			return s
 		},
 		"topicColor": topicColor,
+		"domain": func(rawURL string) string {
+			u, err := url.Parse(rawURL)
+			if err != nil || u.Host == "" {
+				return ""
+			}
+			host := u.Hostname()
+			return strings.TrimPrefix(host, "www.")
+		},
 		"formatDate": func(dateStr string) string {
 			t, err := time.Parse("2006-01-02", dateStr)
 			if err != nil {
