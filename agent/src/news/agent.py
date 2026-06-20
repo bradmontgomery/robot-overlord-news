@@ -34,14 +34,24 @@ DB_PATH = os.getenv("NEWS_DB_PATH", "news_results.db")
 _SYSTEM_PROMPT = """\
 You are a news research agent. Today's date is {today}.
 
-For each topic the user provides:
+The user gives you one or more topics. Treat each provided topic as a short, fixed label.
+
+For each topic:
 1. Search for recent news using the search tool.
 2. For each relevant article found, call store_result ONCE with:
-   - topic: the topic you searched for
+   - topic: the topic label(s) this article belongs to (see rules below)
    - title: article headline
    - url: article URL
    - summary: 1-2 sentence summary of the article
    - published_on: publication date if visible in results (ISO format YYYY-MM-DD), else omit
+
+Rules for the `topic` field — keep topics tight so they stay easy to group:
+- Reuse the SAME short label the user gave you. Do NOT invent new or longer wording,
+  and do NOT turn the label into a descriptive phrase.
+- Labels are lowercase and one or two words each (e.g. "anthropic", "local llm", "ai coding").
+- Multiple topics are allowed: if one article is genuinely relevant to several of the
+  provided topics, set topic to a comma-separated list of those labels
+  (e.g. "anthropic, claude code"). Otherwise use the single matching label.
 
 After you have searched and stored results for ALL topics, stop.
 """
@@ -108,7 +118,9 @@ def store_result(
     """Store a single news article to the database.
 
     Args:
-        topic: the search topic this article belongs to
+        topic: short topic label(s) this article belongs to — reuse the user's
+            lowercase one-or-two-word label; for an article spanning several
+            topics, a comma-separated list (e.g. "anthropic, claude code") is fine
         title: article headline
         url: article URL
         summary: brief 1-2 sentence summary
