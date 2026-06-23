@@ -123,6 +123,84 @@ main {
   max-width: 900px;
 }
 
+.histogram {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem 1.25rem 0.75rem;
+  margin-bottom: 1.25rem;
+}
+
+.histogram-bars {
+  display: flex;
+  align-items: stretch;
+  gap: 0.4rem;
+}
+
+.histogram-bar {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  color: var(--text-muted);
+  text-decoration: none;
+  border-radius: 6px;
+  padding: 2px 0;
+}
+
+.histogram-bar:hover {
+  background: var(--surface2);
+  text-decoration: none;
+}
+
+.histogram-count {
+  font-size: 0.65rem;
+  line-height: 1;
+  margin-bottom: 4px;
+  color: var(--text-muted);
+}
+
+.histogram-track {
+  position: relative;
+  width: 100%;
+  height: 70px;
+}
+
+.histogram-fill {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  width: 60%;
+  margin: 0 auto;
+  min-height: 2px;
+  background: var(--accent);
+  border-radius: 3px 3px 0 0;
+  transition: background 0.1s;
+}
+
+.histogram-bar:hover .histogram-fill,
+.histogram-bar.active .histogram-fill {
+  background: var(--accent-light);
+}
+
+.histogram-label {
+  font-size: 0.62rem;
+  line-height: 1;
+  margin-top: 5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.histogram-bar.active {
+  background: var(--surface2);
+}
+
+.histogram-bar.active .histogram-count,
+.histogram-bar.active .histogram-label {
+  color: var(--text);
+}
+
 .filter-bar {
   display: flex;
   align-items: center;
