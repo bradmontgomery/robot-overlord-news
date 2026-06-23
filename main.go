@@ -34,6 +34,13 @@ type Article struct {
 	PublishedOn string
 }
 
+type DayCount struct {
+	Date  string // 2006-01-02
+	Label string // e.g. "Jun 22"
+	Count int
+	Pct   int // bar height as percent of the busiest day (0-100)
+}
+
 type PageData struct {
 	Articles     []Article
 	Topics       []string
@@ -42,6 +49,7 @@ type PageData struct {
 	FilterTopic  string
 	FilterDate   string
 	RecentDates  []string
+	DailyCounts  []DayCount
 	TotalCount   int
 	DailySummary string
 }
@@ -175,6 +183,12 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	dailyCounts, err := getDailyCounts(10)
+	if err != nil {
+		log.Println("getDailyCounts:", err)
+		dailyCounts = nil
+	}
+
 	total, articles, err := getArticles(topic, dateFilter, page)
 	if err != nil {
 		http.Error(w, "db error", 500)
@@ -195,6 +209,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		FilterTopic:  topic,
 		FilterDate:   dateFilter,
 		RecentDates:  recentDates,
+		DailyCounts:  dailyCounts,
 		TotalCount:   total,
 		DailySummary: dailySummary,
 	}
@@ -314,6 +329,59 @@ func getArticles(topic, date string, page int) (int, []Article, error) {
 		articles = append(articles, a)
 	}
 	return total, articles, rows.Err()
+}
+
+// getDailyCounts returns article counts per day for the last `days` calendar
+// days (inclusive of today), oldest first, with zero-fill for empty days. It
+// is a fixed overview of all articles and ignores any active topic/date filter.
+func getDailyCounts(days int) ([]DayCount, error) {
+	now := time.Now()
+	cutoff := now.AddDate(0, 0, -(days - 1)).Format("2006-01-02")
+
+	rows, err := db.Query(
+		`SELECT DATE(fetched_at) AS d, COUNT(*) FROM news_results WHERE DATE(fetched_at) >= ? GROUP BY d`,
+		cutoff,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	counts := map[string]int{}
+	for rows.Next() {
+		var d string
+		var c int
+		if err := rows.Scan(&d, &c); err != nil {
+			return nil, err
+		}
+		counts[d] = c
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make([]DayCount, days)
+	max := 0
+	for i := 0; i < days; i++ {
+		t := now.AddDate(0, 0, -(days - 1 - i))
+		date := t.Format("2006-01-02")
+		c := counts[date]
+		if c > max {
+			max = c
+		}
+		out[i] = DayCount{Date: date, Label: t.Format("Jan 2"), Count: c}
+	}
+
+	for i := range out {
+		if max > 0 && out[i].Count > 0 {
+			pct := out[i].Count * 100 / max
+			if pct < 4 {
+				pct = 4 // keep a sliver visible for low-but-nonzero days
+			}
+			out[i].Pct = pct
+		}
+	}
+	return out, nil
 }
 
 func getDailySummary(date string) (string, error) {
