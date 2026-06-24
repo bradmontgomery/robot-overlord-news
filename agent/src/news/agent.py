@@ -228,6 +228,18 @@ def _make_search_tool():
     return DuckDuckGoSearchResults(backend="news", output_format="list", max_results=5)
 
 
+def _handle_tool_error(e: Exception) -> str:
+    """Log a tool failure and return a message so the ReAct loop continues.
+
+    The ``e: Exception`` annotation routes ALL tool exceptions here (e.g. a
+    DuckDuckGo ``DDGSException: No results found.``), so an empty search for one
+    topic is logged and treated as "no results" instead of crashing the run.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rprint(f"[dim][{now}][/dim] [yellow]Search/tool error (skipping): {e}[/yellow]")
+    return f"No results available (tool error: {e}). Continue with the next topic."
+
+
 def should_continue(state: MessagesState) -> Literal["tools", "__end__"]:
     """Route to tools if the last message has tool calls, otherwise end."""
     last = state["messages"][-1]
@@ -245,7 +257,7 @@ def build_graph():
     system_message = SystemMessage(_SYSTEM_PROMPT.format(today=today))
 
     model = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL).bind_tools(tools)
-    tool_node = ToolNode(tools)
+    tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
 
     def agent_node(state: MessagesState) -> dict:
         response = model.invoke([system_message] + state["messages"])
@@ -339,10 +351,14 @@ def run(topics: list[str]) -> int:
     today = run_start[:10]
     app = build_graph()
     topic_list = ", ".join(topics)
-    app.invoke(
-        {"messages": [HumanMessage(SEARCH_PROMPT.format(topic_list=topic_list))]},
-        config={"recursion_limit": 50},
-    )
+    try:
+        app.invoke(
+            {"messages": [HumanMessage(SEARCH_PROMPT.format(topic_list=topic_list))]},
+            config={"recursion_limit": 50},
+        )
+    except Exception as e:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rprint(f"[dim][{now}][/dim] [red]News research run failed: {e}[/red]")
     with sqlite3.connect(DB_PATH) as conn:
         (new_count,) = conn.execute(
             "SELECT COUNT(*) FROM news_results WHERE fetched_at >= ?", (run_start,)
