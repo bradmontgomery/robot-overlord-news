@@ -229,6 +229,24 @@ def test_make_search_tool_tavily():
 
 
 # ---------------------------------------------------------------------------
+# _handle_tool_error
+# ---------------------------------------------------------------------------
+
+
+def test_handle_tool_error_logs_and_returns_message():
+    from news import agent as news_agent
+
+    with patch("news.agent.rprint") as mock_print:
+        result = news_agent._handle_tool_error(Exception("No results found."))
+
+    assert "No results found." in result
+    assert result  # non-empty message keeps the ReAct loop going
+    mock_print.assert_called_once()
+    logged = mock_print.call_args[0][0]
+    assert "No results found." in logged
+
+
+# ---------------------------------------------------------------------------
 # should_continue
 # ---------------------------------------------------------------------------
 
@@ -366,6 +384,77 @@ def test_run_returns_count_of_new_articles(tmp_path):
         count = news_agent.run(["AI"])
 
     assert count == 1
+
+
+def test_run_batches_topics(tmp_path):
+    """Topics are searched in BATCH_SIZE-sized invokes, never one giant query."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "batch.db")
+    mock_app = MagicMock()
+    mock_app.invoke.return_value = {}
+    topics = [f"topic{i}" for i in range(20)]
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "BATCH_SIZE", 8), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles") as mock_judge, \
+         patch("news.agent.summarize_day") as mock_summarize:
+        news_agent.run(topics)
+
+    # 20 topics / 8 per batch -> 3 invokes (8 + 8 + 4)
+    assert mock_app.invoke.call_count == 3
+    first_prompt = mock_app.invoke.call_args_list[0].args[0]["messages"][0].content
+    assert "topic7" in first_prompt  # first batch
+    assert "topic8" not in first_prompt  # second batch not included in one query
+    # judge + summarize still run once over the whole topic set
+    mock_judge.assert_called_once()
+    assert mock_judge.call_args[0][0] == topics
+    mock_summarize.assert_called_once()
+
+
+def test_run_continues_after_batch_failure(tmp_path):
+    """A failed batch is logged but the remaining batches still run."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "batch_fail.db")
+    mock_app = MagicMock()
+    mock_app.invoke.side_effect = [RuntimeError("boom"), {}, {}]
+    topics = [f"topic{i}" for i in range(20)]
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "BATCH_SIZE", 8), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles"), \
+         patch("news.agent.summarize_day"), \
+         patch("news.agent.rprint") as mock_print:
+        count = news_agent.run(topics)
+
+    assert mock_app.invoke.call_count == 3  # all batches attempted despite failure
+    assert count == 0
+    assert any("boom" in str(c.args[0]) for c in mock_print.call_args_list)
+
+
+def test_run_survives_invoke_failure(tmp_path):
+    """A failed app.invoke is logged and does not crash run(); judge+summarize still run."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "run_fail.db")
+    mock_app = MagicMock()
+    mock_app.invoke.side_effect = RuntimeError("graph blew up")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles") as mock_judge, \
+         patch("news.agent.summarize_day") as mock_summarize, \
+         patch("news.agent.rprint") as mock_print:
+        count = news_agent.run(["AI"])
+
+    assert count == 0
+    mock_judge.assert_called_once()
+    mock_summarize.assert_called_once()
+    # the failure was logged
+    assert any("graph blew up" in str(c.args[0]) for c in mock_print.call_args_list)
 
 
 def test_run_calls_summarize_day(tmp_path):
