@@ -30,6 +30,12 @@ MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen3.5:latest")
 SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL", "gemma4:26b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 DB_PATH = os.getenv("NEWS_DB_PATH", "news_results.db")
+# Topics are searched in small batches. A single huge query crashes the news
+# backend ("Could not extract vqd"); just as important, once a batch fills the
+# context with many search results the local model stops following through on
+# the store_result step (empirically reliable at 2-3 topics, drops to zero
+# storing at 4+). Keep this small so every topic's articles actually get stored.
+BATCH_SIZE = 2
 DEFAULT_TOPICS = (
     "anthropic",  # AI companies
     "openai",
@@ -104,7 +110,10 @@ You are a news research agent. Today's date is {today}.
 The user gives you one or more topics. Treat each provided topic as a short, fixed label.
 
 For each topic:
-1. Search for recent news using the search tool.
+1. Search for recent news using the search tool. Use a SHORT query — just the
+   topic label itself (optionally add the word "news"). Search ONE topic per
+   query: never combine multiple topics into a single search, and never add
+   site: filters or URLs to the query. Both return zero results.
 2. For each relevant article found, call store_result ONCE with:
    - topic: the topic label(s) this article belongs to (see rules below)
    - title: article headline
@@ -135,16 +144,14 @@ _JUDGE_SYSTEM_PROMPT = (
     "You are a relevance judge. Answer only YES or NO — no explanation."
 )
 
-SEARCH_PROMPT = """Research recent news for: {topic_list}.
+SEARCH_PROMPT = """Research recent news for these topics: {topic_list}.
 
-Prioritize a few websites like:
+Search each topic separately, using a short keyword query — just the topic label
+itself (optionally with the word "news"). Do NOT combine multiple topics into a
+single query, and do NOT add site: filters or URLs to the query; both return no
+results.
 
-* https://steve-yegge.medium.com
-* https://simonwillison.net
-* https://github.blog/ai-and-ml/llms/
-* https://huggingface.co/blog
-
-But otherwise cast a very broad net to find relevant, recent news matching these topics.
+Cast a broad net and store every relevant, recent article you find.
 """
 
 
@@ -350,15 +357,22 @@ def run(topics: list[str]) -> int:
     run_start = datetime.now(timezone.utc).isoformat()
     today = run_start[:10]
     app = build_graph()
-    topic_list = ", ".join(topics)
-    try:
-        app.invoke(
-            {"messages": [HumanMessage(SEARCH_PROMPT.format(topic_list=topic_list))]},
-            config={"recursion_limit": 50},
-        )
-    except Exception as e:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        rprint(f"[dim][{now}][/dim] [red]News research run failed: {e}[/red]")
+    # Search topics in small batches: each invoke gets a fresh recursion budget,
+    # and a failed batch is logged without abandoning the remaining topics.
+    for i in range(0, len(topics), BATCH_SIZE):
+        batch = topics[i : i + BATCH_SIZE]
+        topic_list = ", ".join(batch)
+        try:
+            app.invoke(
+                {"messages": [HumanMessage(SEARCH_PROMPT.format(topic_list=topic_list))]},
+                config={"recursion_limit": 50},
+            )
+        except Exception as e:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rprint(
+                f"[dim][{now}][/dim] [red]News research failed for batch "
+                f"{topic_list}: {e}[/red]"
+            )
     with sqlite3.connect(DB_PATH) as conn:
         (new_count,) = conn.execute(
             "SELECT COUNT(*) FROM news_results WHERE fetched_at >= ?", (run_start,)
