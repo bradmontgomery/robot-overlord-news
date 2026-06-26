@@ -25,6 +25,7 @@ from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from rich import print as rprint
+from rich.markdown import Markdown
 
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen3.5:latest")
 SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL", "gemma4:26b")
@@ -351,8 +352,13 @@ def summarize_day(date: str) -> str | None:
     return summary_text
 
 
-def run(topics: list[str]) -> int:
-    """Research news for each topic, store to SQLite, and return count of new articles."""
+def run(topics: list[str]) -> tuple[int, str | None]:
+    """Research news for each topic and store to SQLite.
+
+    Returns ``(new_article_count, daily_briefing)`` where the briefing is the
+    summary text produced by ``summarize_day`` (or ``None`` if no articles exist
+    for today).
+    """
     init_db(DB_PATH)
     run_start = datetime.now(timezone.utc).isoformat()
     today = run_start[:10]
@@ -378,8 +384,8 @@ def run(topics: list[str]) -> int:
             "SELECT COUNT(*) FROM news_results WHERE fetched_at >= ?", (run_start,)
         ).fetchone()
     judge_articles(topics, run_start)
-    summarize_day(today)
-    return new_count
+    summary = summarize_day(today)
+    return new_count, summary
 
 
 def _print_summary(new_count: int, topics: list[str]) -> None:
@@ -392,6 +398,14 @@ def _print_summary(new_count: int, topics: list[str]) -> None:
         )
     else:
         rprint(f"[dim][{now}][/dim] [yellow]No new articles[/yellow] for: {topic_str}")
+
+
+def _print_briefing(summary: str | None) -> None:
+    """Render the day's briefing as markdown, or do nothing if there is none."""
+    if not summary:
+        return
+    rprint("\n[bold cyan]Daily Briefing[/bold cyan]")
+    rprint(Markdown(summary))
 
 
 def _summarize_cli(day: str | None) -> None:
@@ -449,8 +463,9 @@ def run_cli() -> None:
     topics = args.topics or list(DEFAULT_TOPICS)
     interval = int(os.getenv("NEWS_INTERVAL", "0"))
     while True:
-        new_count = run(topics)
+        new_count, summary = run(topics)
         _print_summary(new_count, topics)
+        _print_briefing(summary)
         if not interval:
             break
         rprint(f"[dim]Sleeping {interval}s...[/dim]")

@@ -40,8 +40,9 @@ PYTHONPATH=src uv run python src/news/agent.py "rust lang" "webassembly"
 ## Ad-hoc day summary
 
 A normal run summarizes the day's articles into the `news_summaries` table as its
-final step. To (re)generate that summary for a single day on demand — without
-running the research pipeline:
+final step, then renders that briefing to the terminal (as a "Daily Briefing"
+markdown block) after the article-count line. To (re)generate that summary for a
+single day on demand — without running the research pipeline:
 
 ```bash
 PYTHONPATH=src uv run python src/news/agent.py --summarize --day 2026-06-21

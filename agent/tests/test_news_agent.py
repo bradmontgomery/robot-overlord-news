@@ -351,7 +351,7 @@ def test_run_returns_zero_when_no_articles_stored(tmp_path):
          patch("news.agent.build_graph", return_value=mock_app), \
          patch("news.agent.judge_articles"), \
          patch("news.agent.summarize_day"):
-        count = news_agent.run(["topic1"])
+        count, _ = news_agent.run(["topic1"])
 
     mock_app.invoke.assert_called_once()
     assert count == 0
@@ -382,7 +382,7 @@ def test_run_returns_count_of_new_articles(tmp_path):
          patch("news.agent.build_graph", return_value=mock_app), \
          patch("news.agent.judge_articles"), \
          patch("news.agent.summarize_day"):
-        count = news_agent.run(["AI"])
+        count, _ = news_agent.run(["AI"])
 
     assert count == 1
 
@@ -429,7 +429,7 @@ def test_run_continues_after_batch_failure(tmp_path):
          patch("news.agent.judge_articles"), \
          patch("news.agent.summarize_day"), \
          patch("news.agent.rprint") as mock_print:
-        count = news_agent.run(topics)
+        count, _ = news_agent.run(topics)
 
     assert mock_app.invoke.call_count == 3  # all batches attempted despite failure
     assert count == 0
@@ -449,7 +449,7 @@ def test_run_survives_invoke_failure(tmp_path):
          patch("news.agent.judge_articles") as mock_judge, \
          patch("news.agent.summarize_day") as mock_summarize, \
          patch("news.agent.rprint") as mock_print:
-        count = news_agent.run(["AI"])
+        count, _ = news_agent.run(["AI"])
 
     assert count == 0
     mock_judge.assert_called_once()
@@ -503,21 +503,24 @@ def test_run_calls_judge_articles(tmp_path):
 def test_run_cli_calls_print_summary():
     from news import agent as news_agent
 
-    with patch("news.agent.run", return_value=3), \
+    with patch("news.agent.run", return_value=(3, "briefing")), \
          patch("news.agent._print_summary") as mock_summary, \
+         patch("news.agent._print_briefing") as mock_briefing, \
          patch("news.agent.rprint"), \
          patch("sys.argv", ["news_agent", "AI"]), \
          patch.dict(os.environ, {"NEWS_INTERVAL": "0"}):
         news_agent.run_cli()
 
     mock_summary.assert_called_once_with(3, ["AI"])
+    mock_briefing.assert_called_once_with("briefing")
 
 
 def test_run_cli_no_results():
     from news import agent as news_agent
 
-    with patch("news.agent.run", return_value=0), \
+    with patch("news.agent.run", return_value=(0, None)), \
          patch("news.agent._print_summary") as mock_summary, \
+         patch("news.agent._print_briefing"), \
          patch("news.agent.rprint"), \
          patch("sys.argv", ["news_agent", "AI"]), \
          patch.dict(os.environ, {"NEWS_INTERVAL": "0"}):
@@ -559,10 +562,49 @@ def test_print_summary_no_results():
     assert "No new articles" in output
 
 
+def test_print_briefing_renders():
+    from news import agent as news_agent
+    from rich.markdown import Markdown
+
+    with patch("news.agent.rprint") as mock_print:
+        news_agent._print_briefing("# Headlines\n\n- one\n- two")
+
+    # header line + the rendered Markdown
+    assert mock_print.call_count == 2
+    rendered = mock_print.call_args_list[1].args[0]
+    assert isinstance(rendered, Markdown)
+
+
+def test_print_briefing_none():
+    from news import agent as news_agent
+
+    with patch("news.agent.rprint") as mock_print:
+        news_agent._print_briefing(None)
+
+    mock_print.assert_not_called()
+
+
+def test_run_returns_summary(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "run_returns_summary.db")
+    mock_app = MagicMock()
+    mock_app.invoke.return_value = {}
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles"), \
+         patch("news.agent.summarize_day", return_value="briefing text"):
+        count, summary = news_agent.run(["AI"])
+
+    assert count == 0
+    assert summary == "briefing text"
+
+
 def test_run_cli_default_topics():
     from news import agent as news_agent
 
-    with patch("news.agent.run", return_value=0) as mock_run, \
+    with patch("news.agent.run", return_value=(0, None)) as mock_run, \
          patch("news.agent._print_summary"), \
          patch("news.agent.rprint"), \
          patch("sys.argv", ["news_agent"]), \
@@ -576,7 +618,7 @@ def test_run_cli_polls_on_interval():
     from news import agent as news_agent
 
     # sleep returns None on first call, then raises to exit the loop
-    with patch("news.agent.run", return_value=0) as mock_run, \
+    with patch("news.agent.run", return_value=(0, None)) as mock_run, \
          patch("news.agent._print_summary"), \
          patch("news.agent.rprint"), \
          patch("news.agent.time.sleep", side_effect=[None, KeyboardInterrupt]) as mock_sleep, \
@@ -594,7 +636,7 @@ def test_run_cli_polls_on_interval():
 def test_run_cli_interval_zero_runs_once():
     from news import agent as news_agent
 
-    with patch("news.agent.run", return_value=0) as mock_run, \
+    with patch("news.agent.run", return_value=(0, None)) as mock_run, \
          patch("news.agent._print_summary"), \
          patch("news.agent.rprint"), \
          patch("news.agent.time.sleep") as mock_sleep, \
@@ -610,7 +652,7 @@ def test_run_cli_interval_unset_runs_once():
     from news import agent as news_agent
 
     env = {k: v for k, v in os.environ.items() if k != "NEWS_INTERVAL"}
-    with patch("news.agent.run", return_value=0) as mock_run, \
+    with patch("news.agent.run", return_value=(0, None)) as mock_run, \
          patch("news.agent._print_summary"), \
          patch("news.agent.rprint"), \
          patch("news.agent.time.sleep") as mock_sleep, \
@@ -784,6 +826,39 @@ def test_summarize_day_passes_articles_to_model(tmp_path):
     human_msg = call_messages[1]
     assert "Big Story" in human_msg.content
     assert "Details here." in human_msg.content
+
+
+def test_summarize_day_scopes_to_fetched_at_date(tmp_path):
+    """Only articles whose fetched_at falls on the target date are summarized."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.executemany(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            [
+                ("AI", "Today Story", "http://today.com", "Happened today.",
+                 "2026-06-16T12:00:00+00:00"),
+                ("AI", "Yesterday Story", "http://yest.com", "Happened yesterday.",
+                 "2026-06-15T23:59:00+00:00"),
+                ("AI", "Tomorrow Story", "http://tom.com", "Happens tomorrow.",
+                 "2026-06-17T00:01:00+00:00"),
+            ],
+        )
+
+    mock_model = MagicMock()
+    mock_model.invoke.return_value = MagicMock(content="Summary text.")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model):
+        news_agent.summarize_day("2026-06-16")
+
+    human_msg = mock_model.invoke.call_args[0][0][1]
+    assert "Today Story" in human_msg.content
+    # Adjacent days must be excluded by the fetched_at filter.
+    assert "Yesterday Story" not in human_msg.content
+    assert "Tomorrow Story" not in human_msg.content
 
 
 def test_summarize_day_falls_back_to_model_name(tmp_path):
