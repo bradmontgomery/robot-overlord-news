@@ -12,9 +12,9 @@ Graph:
                         END
 """
 
+import argparse
 import os
 import sqlite3
-import sys
 import time
 from datetime import datetime, timezone
 from typing import Literal
@@ -394,12 +394,59 @@ def _print_summary(new_count: int, topics: list[str]) -> None:
         rprint(f"[dim][{now}][/dim] [yellow]No new articles[/yellow] for: {topic_str}")
 
 
-def run_cli() -> None:
-    """CLI entry point: read topics from argv and poll on a fixed interval.
+def _summarize_cli(day: str | None) -> None:
+    """Ad-hoc: (re)generate and store the summary for a single day.
 
-    Set NEWS_INTERVAL (seconds) to run repeatedly; unset or 0 runs once.
+    *day* is a YYYY-MM-DD string, or None to default to today (UTC, matching how
+    `fetched_at` is stored). The date is validated up front so a malformed value
+    fails loudly instead of silently matching no articles via the LIKE filter.
     """
-    topics = sys.argv[1:] or list(DEFAULT_TOPICS)
+    if day is None:
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # strptime is lenient about zero-padding ("2026-6-21" parses), but the stored
+    # fetched_at values are canonical "2026-06-21", so a non-padded date would
+    # silently match no rows. Round-trip to require the exact YYYY-MM-DD form.
+    try:
+        parsed = datetime.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        raise SystemExit(f"Invalid --day {day!r}: expected YYYY-MM-DD")
+    if parsed.strftime("%Y-%m-%d") != day:
+        raise SystemExit(f"Invalid --day {day!r}: expected zero-padded YYYY-MM-DD")
+    init_db(DB_PATH)
+    summary = summarize_day(day)
+    if summary is None:
+        rprint(f"[yellow]No articles stored for {day}[/yellow]")
+    else:
+        rprint(summary)
+
+
+def run_cli() -> None:
+    """CLI entry point.
+
+    Default: read topics from argv and research news, polling on a fixed interval
+    (set NEWS_INTERVAL seconds to repeat; unset or 0 runs once).
+
+    With --summarize: (re)generate the stored summary for --day (default today)
+    instead of researching.
+    """
+    parser = argparse.ArgumentParser(description="News research agent.")
+    parser.add_argument("topics", nargs="*", help="topics to research")
+    parser.add_argument(
+        "--summarize",
+        action="store_true",
+        help="summarize a stored day instead of researching",
+    )
+    parser.add_argument(
+        "--day",
+        help="day to summarize as YYYY-MM-DD (default: today, UTC)",
+    )
+    args = parser.parse_args()
+
+    if args.summarize:
+        _summarize_cli(args.day)
+        return
+
+    topics = args.topics or list(DEFAULT_TOPICS)
     interval = int(os.getenv("NEWS_INTERVAL", "0"))
     while True:
         new_count = run(topics)

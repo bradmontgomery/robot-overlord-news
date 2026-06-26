@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -619,6 +620,74 @@ def test_run_cli_interval_unset_runs_once():
 
     mock_run.assert_called_once()
     mock_sleep.assert_not_called()
+
+
+def test_run_cli_summarize_explicit_day():
+    from news import agent as news_agent
+
+    with patch("news.agent.summarize_day", return_value="The summary") as mock_sum, \
+         patch("news.agent.init_db") as mock_init, \
+         patch("news.agent.run") as mock_run, \
+         patch("news.agent.rprint") as mock_print, \
+         patch("sys.argv", ["news_agent", "--summarize", "--day", "2026-06-21"]):
+        news_agent.run_cli()
+
+    mock_sum.assert_called_once_with("2026-06-21")
+    mock_init.assert_called_once()
+    mock_run.assert_not_called()
+    mock_print.assert_called_once_with("The summary")
+
+
+def test_run_cli_summarize_defaults_to_today_utc():
+    from news import agent as news_agent
+
+    expected = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with patch("news.agent.summarize_day", return_value="x") as mock_sum, \
+         patch("news.agent.init_db"), \
+         patch("news.agent.rprint"), \
+         patch("sys.argv", ["news_agent", "--summarize"]):
+        news_agent.run_cli()
+
+    mock_sum.assert_called_once_with(expected)
+
+
+def test_run_cli_summarize_no_articles():
+    from news import agent as news_agent
+
+    with patch("news.agent.summarize_day", return_value=None), \
+         patch("news.agent.init_db"), \
+         patch("news.agent.rprint") as mock_print, \
+         patch("sys.argv", ["news_agent", "--summarize", "--day", "2026-06-21"]):
+        news_agent.run_cli()
+
+    output = mock_print.call_args[0][0]
+    assert "No articles stored for 2026-06-21" in output
+
+
+def test_run_cli_summarize_unpadded_day():
+    from news import agent as news_agent
+
+    with patch("news.agent.summarize_day") as mock_sum, \
+         patch("news.agent.init_db") as mock_init, \
+         patch("sys.argv", ["news_agent", "--summarize", "--day", "2026-6-21"]):
+        with pytest.raises(SystemExit):
+            news_agent.run_cli()
+
+    mock_sum.assert_not_called()
+    mock_init.assert_not_called()
+
+
+def test_run_cli_summarize_unparseable_day():
+    from news import agent as news_agent
+
+    with patch("news.agent.summarize_day") as mock_sum, \
+         patch("news.agent.init_db") as mock_init, \
+         patch("sys.argv", ["news_agent", "--summarize", "--day", "notadate"]):
+        with pytest.raises(SystemExit):
+            news_agent.run_cli()
+
+    mock_sum.assert_not_called()
+    mock_init.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,22 @@ make news                                                  # defaults: ~65 AI/LL
 PYTHONPATH=src uv run python src/news/agent.py "rust lang" "webassembly"
 ```
 
+## Ad-hoc day summary
+
+A normal run summarizes the day's articles into the `news_summaries` table as its
+final step. To (re)generate that summary for a single day on demand — without
+running the research pipeline:
+
+```bash
+PYTHONPATH=src uv run python src/news/agent.py --summarize --day 2026-06-21
+PYTHONPATH=src uv run python src/news/agent.py --summarize   # defaults to today
+```
+
+The summary is upserted (re-running overwrites the existing row for that date) and
+printed to stdout. `--day` selects articles by the date they were **collected**
+(`fetched_at`), not their publication date, and defaults to today in **UTC** to match
+how `fetched_at` is stored. The date must be zero-padded `YYYY-MM-DD`.
+
 ## Polling mode
 
 Set `NEWS_INTERVAL` to a number of seconds to run on a fixed interval instead of once:
