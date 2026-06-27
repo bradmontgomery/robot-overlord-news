@@ -674,10 +674,23 @@ def test_run_cli_summarize_explicit_day():
          patch("sys.argv", ["news_agent", "--summarize", "--day", "2026-06-21"]):
         news_agent.run_cli()
 
-    mock_sum.assert_called_once_with("2026-06-21")
+    mock_sum.assert_called_once_with("2026-06-21", model=None, num_ctx=None)
     mock_init.assert_called_once()
     mock_run.assert_not_called()
     mock_print.assert_called_once_with("The summary")
+
+
+def test_run_cli_summarize_passes_model_and_num_ctx():
+    from news import agent as news_agent
+
+    with patch("news.agent.summarize_day", return_value="s") as mock_sum, \
+         patch("news.agent.init_db"), \
+         patch("news.agent.rprint"), \
+         patch("sys.argv", ["news_agent", "--summarize", "--day", "2026-06-21",
+                            "--model", "qwen3.5:latest", "--num-ctx", "4096"]):
+        news_agent.run_cli()
+
+    mock_sum.assert_called_once_with("2026-06-21", model="qwen3.5:latest", num_ctx=4096)
 
 
 def test_run_cli_summarize_defaults_to_today_utc():
@@ -690,7 +703,7 @@ def test_run_cli_summarize_defaults_to_today_utc():
          patch("sys.argv", ["news_agent", "--summarize"]):
         news_agent.run_cli()
 
-    mock_sum.assert_called_once_with(expected)
+    mock_sum.assert_called_once_with(expected, model=None, num_ctx=None)
 
 
 def test_run_cli_summarize_no_articles():
@@ -861,6 +874,52 @@ def test_summarize_day_scopes_to_fetched_at_date(tmp_path):
     assert "Tomorrow Story" not in human_msg.content
 
 
+def test_summarize_day_uses_default_num_ctx(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "Story", "http://s.com", "Summary.", "2026-06-16T10:00:00+00:00"),
+        )
+
+    mock_model = MagicMock()
+    mock_model.invoke.return_value = MagicMock(content="Summary text.")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model) as mock_chat:
+        news_agent.summarize_day("2026-06-16")
+
+    _, kwargs = mock_chat.call_args
+    assert kwargs["model"] == news_agent.SUMMARY_MODEL_NAME
+    assert kwargs["num_ctx"] == news_agent.SUMMARY_NUM_CTX
+
+
+def test_summarize_day_model_and_num_ctx_override(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "Story", "http://s.com", "Summary.", "2026-06-16T10:00:00+00:00"),
+        )
+
+    mock_model = MagicMock()
+    mock_model.invoke.return_value = MagicMock(content="Summary text.")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model) as mock_chat:
+        news_agent.summarize_day("2026-06-16", model="qwen3.5:latest", num_ctx=8192)
+
+    _, kwargs = mock_chat.call_args
+    assert kwargs["model"] == "qwen3.5:latest"
+    assert kwargs["num_ctx"] == 8192
+
+
 def test_summarize_day_falls_back_to_model_name(tmp_path):
     from news import agent as news_agent
 
@@ -884,6 +943,71 @@ def test_summarize_day_falls_back_to_model_name(tmp_path):
         result = news_agent.summarize_day("2026-06-16")
 
     assert result == "Fallback summary."
+
+
+def test_summarize_day_empty_primary_falls_back(tmp_path):
+    """An empty/whitespace primary response triggers the MODEL_NAME fallback + a warning."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "Story", "http://s.com", "Summary.", "2026-06-16T10:00:00+00:00"),
+        )
+
+    empty_model = MagicMock()
+    empty_model.invoke.return_value = MagicMock(content="   \n")  # whitespace only
+    working_model = MagicMock()
+    working_model.invoke.return_value = MagicMock(content="Fallback summary.")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "SUMMARY_MODEL_NAME", "primary-model"), \
+         patch.object(news_agent, "MODEL_NAME", "fallback-model"), \
+         patch("news.agent.ChatOllama", side_effect=[empty_model, working_model]), \
+         patch("news.agent.rprint") as mock_print:
+        result = news_agent.summarize_day("2026-06-16")
+
+    assert result == "Fallback summary."
+    assert any("falling back" in str(c.args[0]) for c in mock_print.call_args_list)
+    # the blank is never persisted — the stored row is the fallback text
+    with sqlite3.connect(db_file) as conn:
+        stored = conn.execute(
+            "SELECT summary FROM news_summaries WHERE date='2026-06-16'"
+        ).fetchone()[0]
+    assert stored == "Fallback summary."
+
+
+def test_summarize_day_returns_none_when_all_models_empty(tmp_path):
+    """If primary and fallback both return empty, store nothing and return None."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "Story", "http://s.com", "Summary.", "2026-06-16T10:00:00+00:00"),
+        )
+
+    empty_model = MagicMock()
+    empty_model.invoke.return_value = MagicMock(content="")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "SUMMARY_MODEL_NAME", "primary-model"), \
+         patch.object(news_agent, "MODEL_NAME", "fallback-model"), \
+         patch("news.agent.ChatOllama", return_value=empty_model), \
+         patch("news.agent.rprint") as mock_print:
+        result = news_agent.summarize_day("2026-06-16")
+
+    assert result is None
+    with sqlite3.connect(db_file) as conn:
+        rows = conn.execute(
+            "SELECT * FROM news_summaries WHERE date='2026-06-16'"
+        ).fetchall()
+    assert rows == []  # nothing persisted
+    assert any("no summary stored" in str(c.args[0]) for c in mock_print.call_args_list)
 
 
 def test_summarize_day_raises_when_only_model_fails(tmp_path):

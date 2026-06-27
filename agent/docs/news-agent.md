@@ -47,12 +47,24 @@ single day on demand — without running the research pipeline:
 ```bash
 PYTHONPATH=src uv run python src/news/agent.py --summarize --day 2026-06-21
 PYTHONPATH=src uv run python src/news/agent.py --summarize   # defaults to today
+
+# Experiment with a different model / context window for this run only:
+PYTHONPATH=src uv run python src/news/agent.py --summarize --day 2026-06-21 \
+  --model qwen3.5:latest --num-ctx 24576
 ```
 
 The summary is upserted (re-running overwrites the existing row for that date) and
 printed to stdout. `--day` selects articles by the date they were **collected**
 (`fetched_at`), not their publication date, and defaults to today in **UTC** to match
 how `fetched_at` is stored. The date must be zero-padded `YYYY-MM-DD`.
+
+The summary model defaults to `SUMMARY_MODEL` (`ministral-3:8b`) with context window
+`SUMMARY_NUM_CTX` (`49152`). `ministral-3:8b` (6 GB, 256k native context) holds 48k
+tokens at ~11 GB fully on a 16 GB GPU — enough for even the largest news days in one
+pass. `--model` and `--num-ctx` override these for a single run without touching the
+environment — handy for experimenting. If a day ever exceeds the context window it is
+truncated; raise `--num-ctx` only while it still fits on the GPU (check `ollama ps`
+reads `100% GPU`).
 
 ## Polling mode
 
