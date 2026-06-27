@@ -28,7 +28,11 @@ from rich import print as rprint
 from rich.markdown import Markdown
 
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen3.5:latest")
-SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL", "gemma4:26b")
+SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL", "ministral-3:8b")
+# Context window for the summary model. ministral-3:8b (6 GB, 256k native context)
+# holds 48k tokens at ~11 GB fully on a 16 GB GPU — enough for even the largest news
+# days in one pass. Override per-run with --num-ctx or the SUMMARY_NUM_CTX env.
+SUMMARY_NUM_CTX = int(os.getenv("SUMMARY_NUM_CTX", "49152"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 DB_PATH = os.getenv("NEWS_DB_PATH", "news_results.db")
 # Topics are searched in small batches. A single huge query crashes the news
@@ -134,11 +138,17 @@ After you have searched and stored results for ALL topics, stop.
 """
 
 _SUMMARIZE_SYSTEM_PROMPT = """\
-You are a news summarization assistant. Given a list of news articles for a specific date, \
-write a concise high-level summary (2-4 paragraphs) covering the major themes and notable events.
+You are a news summarization assistant. Given a list of news articles for a single date, \
+write a tight briefing of the day's major themes and most notable events.
 
-Format content in markdown and prioritize readability; e.g. use bold, italic, and bulleted lists \
-to enable easily skimming content.
+Requirements:
+- Open with ONE short overview sentence, then 3-5 themed groups of brief bullets. Favor \
+brevity over completeness: merge related items and drop minor or duplicate ones.
+- Use markdown for skimmability (bold the key entities, short bullets). Do NOT use tables.
+- Report only what the articles say. Do NOT speculate, add "impact"/analysis commentary, \
+or invent details not present in the articles.
+- Output ONLY the briefing. No preamble (e.g. "Here's a summary..."), no closing remarks, \
+and no questions to the reader.
 """
 
 _JUDGE_SYSTEM_PROMPT = (
@@ -315,11 +325,42 @@ def judge_articles(topics: list[str], run_start: str) -> int:
     return removed
 
 
-def summarize_day(date: str) -> str | None:
+def _log_summary_warning(message: str, style: str = "yellow") -> None:
+    """Print a timestamped warning about the summary step (mirrors _handle_tool_error)."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rprint(f"[dim][{now}][/dim] [{style}]{message}[/{style}]")
+
+
+def _invoke_summary_model(model_name: str, messages: list, num_ctx: int) -> str:
+    """Invoke a summary model and return its stripped text, raising on empty output.
+
+    Treating an empty/whitespace response as a failure lets ``summarize_day`` fall
+    back to ``MODEL_NAME`` (and ultimately store nothing) instead of silently
+    persisting a blank summary — the failure mode seen with oversized models that
+    spill to CPU.
+    """
+    response = ChatOllama(
+        model=model_name, base_url=OLLAMA_BASE_URL, num_ctx=num_ctx
+    ).invoke(messages)
+    text = (response.content or "").strip()
+    if not text:
+        raise ValueError(f"{model_name} returned an empty summary")
+    return text
+
+
+def summarize_day(
+    date: str, model: str | None = None, num_ctx: int | None = None
+) -> str | None:
     """Summarize all news articles stored for *date* (YYYY-MM-DD) and upsert into news_summaries.
+
+    *model* overrides the summary model (default ``SUMMARY_MODEL_NAME``); *num_ctx*
+    overrides the context window (default ``SUMMARY_NUM_CTX``). Both default to None
+    so positional ``summarize_day(date)`` calls keep working.
 
     Returns the summary text, or None if no articles exist for that date.
     """
+    primary_model = model or SUMMARY_MODEL_NAME
+    ctx = num_ctx or SUMMARY_NUM_CTX
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             "SELECT title, summary FROM news_results WHERE fetched_at LIKE ?",
@@ -333,16 +374,26 @@ def summarize_day(date: str) -> str | None:
         HumanMessage(f"Summarize the news for {date}:\n\n{digest}"),
     ]
     try:
-        response = ChatOllama(
-            model=SUMMARY_MODEL_NAME, base_url=OLLAMA_BASE_URL
-        ).invoke(messages)
-    except Exception:
-        if SUMMARY_MODEL_NAME == MODEL_NAME:
+        summary_text = _invoke_summary_model(primary_model, messages, ctx)
+    except Exception as exc:
+        # A failed or empty response from the only model is fatal; otherwise warn
+        # loudly and retry once with MODEL_NAME so a misconfigured SUMMARY_MODEL
+        # surfaces instead of silently degrading.
+        if primary_model == MODEL_NAME:
             raise
-        response = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL).invoke(
-            messages
+        _log_summary_warning(
+            f"summary model {primary_model!r} failed ({exc}); "
+            f"falling back to {MODEL_NAME!r}"
         )
-    summary_text = response.content
+        try:
+            summary_text = _invoke_summary_model(MODEL_NAME, messages, ctx)
+        except Exception as exc2:
+            _log_summary_warning(
+                f"fallback model {MODEL_NAME!r} also failed ({exc2}); "
+                f"no summary stored for {date}",
+                style="red",
+            )
+            return None
     created_at = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -408,12 +459,16 @@ def _print_briefing(summary: str | None) -> None:
     rprint(Markdown(summary))
 
 
-def _summarize_cli(day: str | None) -> None:
+def _summarize_cli(
+    day: str | None, model: str | None = None, num_ctx: int | None = None
+) -> None:
     """Ad-hoc: (re)generate and store the summary for a single day.
 
     *day* is a YYYY-MM-DD string, or None to default to today (UTC, matching how
     `fetched_at` is stored). The date is validated up front so a malformed value
     fails loudly instead of silently matching no articles via the LIKE filter.
+    *model* and *num_ctx* override the summary model and context window for
+    experimentation (both default to None → use the configured defaults).
     """
     if day is None:
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -427,7 +482,7 @@ def _summarize_cli(day: str | None) -> None:
     if parsed.strftime("%Y-%m-%d") != day:
         raise SystemExit(f"Invalid --day {day!r}: expected zero-padded YYYY-MM-DD")
     init_db(DB_PATH)
-    summary = summarize_day(day)
+    summary = summarize_day(day, model=model, num_ctx=num_ctx)
     if summary is None:
         rprint(f"[yellow]No articles stored for {day}[/yellow]")
     else:
@@ -454,10 +509,19 @@ def run_cli() -> None:
         "--day",
         help="day to summarize as YYYY-MM-DD (default: today, UTC)",
     )
+    parser.add_argument(
+        "--model",
+        help="override the summary model (default: $SUMMARY_MODEL)",
+    )
+    parser.add_argument(
+        "--num-ctx",
+        type=int,
+        help="override the summary context window (default: $SUMMARY_NUM_CTX)",
+    )
     args = parser.parse_args()
 
     if args.summarize:
-        _summarize_cli(args.day)
+        _summarize_cli(args.day, model=args.model, num_ctx=args.num_ctx)
         return
 
     topics = args.topics or list(DEFAULT_TOPICS)
