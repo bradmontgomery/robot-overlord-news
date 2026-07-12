@@ -26,6 +26,11 @@
       {{ end }}
     </ul>
 
+    <h2 class="sidebar-section-gap">Favorites</h2>
+    <ul class="topic-list">
+      <li><a href="#" id="saved-view-toggle">♥ Saved <span id="saved-count" class="saved-count-badge">0</span></a></li>
+    </ul>
+
     <h2 class="sidebar-section-gap">Topics</h2>
     <ul class="topic-list">
       <li>
@@ -44,8 +49,10 @@
   </aside>
 
   <main>
-    {{ template "content" . }}
+    <div id="normal-view">{{ template "content" . }}</div>
+    <div id="saved-view" class="articles" hidden></div>
   </main>
 </div>
+<script src="/static/favorites.js" defer></script>
 </body>
 </html>

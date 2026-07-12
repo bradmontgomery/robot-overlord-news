@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"embed"
+	"encoding/json"
 	"html/template"
 	"log"
 	"math"
@@ -130,6 +131,13 @@ func main() {
 				return s
 			}
 			return t.Format("Jan 2, 2006 3:04 PM")
+		},
+		"toJSON": func(v interface{}) (string, error) {
+			b, err := json.Marshal(v)
+			if err != nil {
+				return "", err
+			}
+			return string(b), nil
 		},
 	}
 

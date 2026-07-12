@@ -39,6 +39,9 @@
 <div class="articles">
   {{ range .Articles }}
   <div class="article">
+    {{ if .URL }}
+    <button class="favorite-btn" type="button" data-article="{{ . | toJSON }}" aria-label="Save article" title="Save article">♡</button>
+    {{ end }}
     <div class="article-meta">
       {{ range .Topics }}
       <a class="topic-pill" href="/?topic={{ . }}{{ if $.FilterDate }}&date={{ $.FilterDate }}{{ end }}" style="background:{{ topicColor . }}">{{ . }}</a>

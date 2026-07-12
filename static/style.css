@@ -234,15 +234,47 @@ main {
 .articles { display: flex; flex-direction: column; gap: 1px; }
 
 .article {
+  position: relative;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 1rem 1.25rem;
+  padding: 1rem 2.5rem 1rem 1.25rem;
   margin-bottom: 0.5rem;
   transition: border-color 0.15s;
 }
 
 .article:hover { border-color: #3e4468; }
+
+.favorite-btn {
+  position: absolute;
+  top: 0.75rem;
+  right: 0.75rem;
+  background: none;
+  border: none;
+  font-size: 1.15rem;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 2px;
+  transition: color 0.1s, transform 0.1s;
+}
+
+.favorite-btn:hover { color: #ef4444; transform: scale(1.1); }
+
+.favorite-btn.favorited { color: #ef4444; }
+
+.saved-count-badge {
+  display: inline-block;
+  min-width: 16px;
+  padding: 0 4px;
+  margin-left: 4px;
+  border-radius: 8px;
+  background: var(--surface2);
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  line-height: 16px;
+  text-align: center;
+}
 
 .article-meta {
   display: flex;
