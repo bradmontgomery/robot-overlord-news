@@ -4,6 +4,12 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Robot Overlord News{{ if .FilterTopic }} — {{ .FilterTopic }}{{ else if .FilterDate }} — {{ formatDate .FilterDate }}{{ end }}</title>
+  <script>
+    (function () {
+      var t = localStorage.getItem("robotOverlordTheme");
+      if (t === "light") document.documentElement.setAttribute("data-theme", "light");
+    })();
+  </script>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -12,6 +18,7 @@
     <h1><a href="/">Robot Overlord <span>News</span></a></h1>
     <p class="tagline">Your new AI masters, summarized for your convenience.</p>
     <span class="header-meta">{{ .TotalCount }} articles</span>
+    <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Switch to light theme" title="Switch to light theme">🌙</button>
   </header>
 
   <aside>
@@ -54,5 +61,6 @@
   </main>
 </div>
 <script src="/static/favorites.js" defer></script>
+<script src="/static/theme.js" defer></script>
 </body>
 </html>
