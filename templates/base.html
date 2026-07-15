@@ -56,11 +56,16 @@
   </aside>
 
   <main>
+    <div class="search-bar">
+      <input type="search" id="article-search" class="search-input" placeholder="Search articles on this page..." aria-label="Search articles" autocomplete="off">
+      <span id="search-count" class="search-count" hidden></span>
+    </div>
     <div id="normal-view">{{ template "content" . }}</div>
     <div id="saved-view" class="articles" hidden></div>
   </main>
 </div>
 <script src="/static/favorites.js" defer></script>
 <script src="/static/theme.js" defer></script>
+<script src="/static/search.js" defer></script>
 </body>
 </html>
