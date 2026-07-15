@@ -51,13 +51,13 @@
     </div>
     <h3>
       {{ if .URL }}
-      <a href="{{ .URL }}" target="_blank" rel="noopener noreferrer">{{ if .Title }}{{ .Title }}{{ else }}(no title){{ end }}</a>
+      <a class="search-title" href="{{ .URL }}" target="_blank" rel="noopener noreferrer">{{ if .Title }}{{ .Title }}{{ else }}(no title){{ end }}</a>
       {{ else }}
-      {{ if .Title }}{{ .Title }}{{ else }}(no title){{ end }}
+      <span class="search-title">{{ if .Title }}{{ .Title }}{{ else }}(no title){{ end }}</span>
       {{ end }}
     </h3>
     {{ if .URL }}{{ with domain .URL }}<span class="article-domain">{{ . }}</span>{{ end }}{{ end }}
-    {{ if .Summary }}<p>{{ .Summary }}</p>{{ end }}
+    {{ if .Summary }}<p class="search-summary">{{ .Summary }}</p>{{ end }}
   </div>
   {{ end }}
 </div>
