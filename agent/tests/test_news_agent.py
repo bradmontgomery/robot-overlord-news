@@ -1062,13 +1062,14 @@ def test_judge_articles_keeps_relevant_row(tmp_path):
         )
 
     mock_model = MagicMock()
-    mock_model.invoke.return_value = MagicMock(content="YES")
+    mock_model.invoke.return_value = MagicMock(content="1: YES")
 
     with patch.object(news_agent, "DB_PATH", db_file), \
          patch("news.agent.ChatOllama", return_value=mock_model):
         removed = news_agent.judge_articles(["AI"], run_start)
 
     assert removed == 0
+    mock_model.invoke.assert_called_once()
     with sqlite3.connect(db_file) as conn:
         count = conn.execute("SELECT COUNT(*) FROM news_results").fetchone()[0]
     assert count == 1
@@ -1087,13 +1088,14 @@ def test_judge_articles_removes_irrelevant_row(tmp_path):
         )
 
     mock_model = MagicMock()
-    mock_model.invoke.return_value = MagicMock(content="NO")
+    mock_model.invoke.return_value = MagicMock(content="1: NO")
 
     with patch.object(news_agent, "DB_PATH", db_file), \
          patch("news.agent.ChatOllama", return_value=mock_model):
         removed = news_agent.judge_articles(["AI"], run_start)
 
     assert removed == 1
+    mock_model.invoke.assert_called_once()
     with sqlite3.connect(db_file) as conn:
         count = conn.execute("SELECT COUNT(*) FROM news_results").fetchone()[0]
     assert count == 0
@@ -1115,18 +1117,100 @@ def test_judge_articles_returns_count(tmp_path):
         )
 
     mock_model = MagicMock()
-    mock_model.invoke.side_effect = [
-        MagicMock(content="YES"),
-        MagicMock(content="NO"),
-    ]
+    mock_model.invoke.return_value = MagicMock(content="1: YES\n2: NO")
 
     with patch.object(news_agent, "DB_PATH", db_file), \
          patch("news.agent.ChatOllama", return_value=mock_model):
         removed = news_agent.judge_articles(["AI"], run_start)
 
     assert removed == 1
+    mock_model.invoke.assert_called_once()
     with sqlite3.connect(db_file) as conn:
         remaining = conn.execute("SELECT title FROM news_results").fetchall()
     assert remaining == [("Good Article",)]
+
+
+def test_judge_articles_batches_large_sets(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    run_start = "2026-06-16T10:00:00+00:00"
+    total = news_agent.JUDGE_BATCH_SIZE + 1
+    with sqlite3.connect(db_file) as conn:
+        conn.executemany(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            [
+                ("AI", f"Article {i}", f"http://a{i}.com", "Relevant.", run_start)
+                for i in range(total)
+            ],
+        )
+
+    mock_model = MagicMock()
+    mock_model.invoke.return_value = MagicMock(content="1: YES")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model):
+        removed = news_agent.judge_articles(["AI"], run_start)
+
+    assert removed == 0
+    assert mock_model.invoke.call_count == 2
+    second_call_prompt = mock_model.invoke.call_args_list[1][0][0][1].content
+    assert f"Article {news_agent.JUDGE_BATCH_SIZE}" in second_call_prompt
+    assert "Article 0" not in second_call_prompt
+
+
+def test_judge_articles_fail_open_on_malformed_response(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    run_start = "2026-06-16T10:00:00+00:00"
+    with sqlite3.connect(db_file) as conn:
+        conn.executemany(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            [
+                ("AI", "Good Article", "http://good.com", "Relevant.", run_start),
+                ("AI", "Missing Verdict Article", "http://missing.com", "Unclear.", run_start),
+            ],
+        )
+
+    mock_model = MagicMock()
+    # No line for article 2 — response is malformed/incomplete.
+    mock_model.invoke.return_value = MagicMock(content="1: YES\nsome unrelated text")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model):
+        removed = news_agent.judge_articles(["AI"], run_start)
+
+    assert removed == 0
+    with sqlite3.connect(db_file) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM news_results").fetchone()[0]
+    assert count == 2
+
+
+def test_judge_articles_fail_open_on_invoke_error(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    run_start = "2026-06-16T10:00:00+00:00"
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "AI Breakthrough", "http://ai.com", "About AI.", run_start),
+        )
+
+    mock_model = MagicMock()
+    mock_model.invoke.side_effect = RuntimeError("ollama unreachable")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model):
+        removed = news_agent.judge_articles(["AI"], run_start)
+
+    assert removed == 0
+    with sqlite3.connect(db_file) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM news_results").fetchone()[0]
+    assert count == 1
 
 

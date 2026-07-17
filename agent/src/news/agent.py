@@ -14,6 +14,7 @@ Graph:
 
 import argparse
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -41,6 +42,10 @@ DB_PATH = os.getenv("NEWS_DB_PATH", "news_results.db")
 # the store_result step (empirically reliable at 2-3 topics, drops to zero
 # storing at 4+). Keep this small so every topic's articles actually get stored.
 BATCH_SIZE = 2
+# Articles judged per LLM call in judge_articles(). 10 articles' title+summary is
+# ~500-700 tokens, comfortably inside the model's default 4096-token context; cuts
+# judge_articles' call count ~10x versus one call per article.
+JUDGE_BATCH_SIZE = 10
 DEFAULT_TOPICS = (
     "anthropic",  # AI companies
     "openai",
@@ -151,9 +156,16 @@ or invent details not present in the articles.
 and no questions to the reader.
 """
 
-_JUDGE_SYSTEM_PROMPT = (
-    "You are a relevance judge. Answer only YES or NO — no explanation."
-)
+_JUDGE_SYSTEM_PROMPT = """\
+You are a relevance judge. You will be given a numbered list of articles and a set \
+of topics. For EACH numbered article, decide if it is genuinely relevant to at \
+least one topic.
+
+Respond with exactly one line per article, in this format and no other text:
+N: YES
+N: NO
+
+where N is the article's number. Do not add explanations, headers, or commentary."""
 
 SEARCH_PROMPT = """Research recent news for these topics: {topic_list}.
 
@@ -290,8 +302,28 @@ def build_graph():
     return graph.compile()
 
 
+_JUDGE_LINE_RE = re.compile(r"(\d+)\s*[:.)]\s*(YES|NO)", re.IGNORECASE)
+
+
+def _parse_judge_verdicts(response_text: str) -> dict[int, str]:
+    """Parse a judge response into {article_number: "YES"|"NO"}.
+
+    If an article number appears more than once (e.g. a reasoning model restates
+    it before its final answer), the LAST occurrence wins.
+    """
+    verdicts: dict[int, str] = {}
+    for number, verdict in _JUDGE_LINE_RE.findall(response_text):
+        verdicts[int(number)] = verdict.upper()
+    return verdicts
+
+
 def judge_articles(topics: list[str], run_start: str) -> int:
     """Delete articles fetched since run_start that are irrelevant to topics.
+
+    Articles are judged in batches of JUDGE_BATCH_SIZE per LLM call. If a batch's
+    response can't be parsed for a given article, or the LLM call itself fails,
+    that article is kept (fail-open) rather than deleted, so a malformed local-model
+    response never silently destroys data.
 
     Returns the count of removed rows.
     """
@@ -305,24 +337,39 @@ def judge_articles(topics: list[str], run_start: str) -> int:
 
     topic_str = ", ".join(topics)
     model = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
-    removed = 0
-    for row_id, title, summary in rows:
-        response = model.invoke(
-            [
-                SystemMessage(_JUDGE_SYSTEM_PROMPT),
-                HumanMessage(
-                    f"Topics: {topic_str}\n\n"
-                    f"Article title: {title}\n"
-                    f"Article summary: {summary}\n\n"
-                    f"Is this article genuinely relevant to at least one of the topics?"
-                ),
-            ]
+    to_delete: list[int] = []
+    for i in range(0, len(rows), JUDGE_BATCH_SIZE):
+        batch = rows[i : i + JUDGE_BATCH_SIZE]
+        articles = "\n\n".join(
+            f"{n}. Article title: {title}\nArticle summary: {summary}"
+            for n, (_, title, summary) in enumerate(batch, start=1)
         )
-        if "yes" not in response.content.lower():
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("DELETE FROM news_results WHERE id = ?", (row_id,))
-            removed += 1
-    return removed
+        try:
+            response = model.invoke(
+                [
+                    SystemMessage(_JUDGE_SYSTEM_PROMPT),
+                    HumanMessage(f"Topics: {topic_str}\n\n{articles}"),
+                ]
+            )
+        except Exception as e:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rprint(
+                f"[dim][{now}][/dim] [yellow]Judge call failed (keeping batch "
+                f"unfiltered): {e}[/yellow]"
+            )
+            continue
+        verdicts = _parse_judge_verdicts(response.content)
+        for n, (row_id, _title, _summary) in enumerate(batch, start=1):
+            if verdicts.get(n) == "NO":
+                to_delete.append(row_id)
+
+    if to_delete:
+        placeholders = ",".join("?" * len(to_delete))
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                f"DELETE FROM news_results WHERE id IN ({placeholders})", to_delete
+            )
+    return len(to_delete)
 
 
 def _log_summary_warning(message: str, style: str = "yellow") -> None:
