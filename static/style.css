@@ -504,6 +504,94 @@ mark {
   background: none;
 }
 
+.presentation-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1.5rem;
+  padding: 3rem 2rem;
+  background: var(--bg);
+  text-align: center;
+}
+
+.presentation-close {
+  position: absolute;
+  top: 1.25rem;
+  right: 1.5rem;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  width: 40px;
+  height: 40px;
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--text-muted);
+  transition: background 0.1s, color 0.1s;
+}
+
+.presentation-close:hover { background: var(--surface2); color: var(--text); }
+
+.presentation-meta {
+  font-size: clamp(0.75rem, 1.2vw, 0.9rem);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.presentation-title {
+  font-size: clamp(1.75rem, 5vw, 3.5rem);
+  font-weight: 700;
+  line-height: 1.25;
+  color: var(--text);
+  max-width: 60ch;
+}
+
+.presentation-summary {
+  font-size: clamp(1rem, 2vw, 1.4rem);
+  line-height: 1.6;
+  color: var(--text-muted);
+  max-width: 65ch;
+}
+
+.presentation-controls {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  margin-top: 1rem;
+}
+
+.presentation-prev,
+.presentation-next,
+.presentation-playpause {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  width: 44px;
+  height: 44px;
+  font-size: 1.2rem;
+  cursor: pointer;
+  color: var(--text);
+  transition: background 0.1s, border-color 0.1s;
+}
+
+.presentation-prev:hover,
+.presentation-next:hover,
+.presentation-playpause:hover {
+  background: var(--surface2);
+  border-color: var(--border-hover);
+}
+
+.presentation-counter {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  min-width: 4rem;
+}
+
 @media (max-width: 700px) {
   .layout { grid-template-columns: 1fr; }
   aside { display: none; }
