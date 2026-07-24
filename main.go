@@ -148,6 +148,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleIndex)
+	mux.HandleFunc("/api/present", handlePresent)
 	mux.Handle("/static/", http.FileServer(http.FS(content)))
 
 	addr := ":8080"
@@ -228,6 +229,40 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handlePresent serves the article list for presentation mode as JSON. It
+// respects the topic/date filters, but only respects pagination if a page
+// was explicitly selected in the query string — otherwise it returns every
+// matching article so presentation mode isn't limited to the first page.
+func handlePresent(w http.ResponseWriter, r *http.Request) {
+	topic := r.URL.Query().Get("topic")
+	dateFilter := r.URL.Query().Get("date")
+	pageStr := r.URL.Query().Get("page")
+
+	var articles []Article
+	var err error
+
+	if pageStr != "" {
+		page := 1
+		if p, perr := strconv.Atoi(pageStr); perr == nil && p > 1 {
+			page = p
+		}
+		_, articles, err = getArticles(topic, dateFilter, page)
+	} else {
+		articles, err = getAllArticles(topic, dateFilter)
+	}
+
+	if err != nil {
+		http.Error(w, "db error", 500)
+		log.Println("handlePresent:", err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if err := json.NewEncoder(w).Encode(articles); err != nil {
+		log.Println("handlePresent encode:", err)
+	}
+}
+
 func getTopics() ([]string, error) {
 	rows, err := db.Query(`SELECT topic FROM news_results`)
 	if err != nil {
@@ -282,61 +317,82 @@ func splitTopics(raw string) []string {
 	return out
 }
 
-func getArticles(topic, date string, page int) (int, []Article, error) {
-	offset := (page - 1) * pageSize
-
-	var countRow *sql.Row
-	var rows *sql.Rows
-	var err error
-
+// articleFilter builds the WHERE clause (without the "WHERE" keyword) and its
+// bind args for the optional topic/date filters shared by getArticles and
+// getAllArticles. Returns an empty clause when neither filter is set.
+func articleFilter(topic, date string) (string, []interface{}) {
 	const topicFilter = `',' || topic || ',' LIKE '%,' || ? || ',%'`
 	const dateFilter = `DATE(fetched_at) = ?`
 
 	switch {
 	case topic != "" && date != "":
-		countRow = db.QueryRow(`SELECT COUNT(*) FROM news_results WHERE `+topicFilter+` AND `+dateFilter, topic, date)
+		return topicFilter + ` AND ` + dateFilter, []interface{}{topic, date}
 	case topic != "":
-		countRow = db.QueryRow(`SELECT COUNT(*) FROM news_results WHERE `+topicFilter, topic)
+		return topicFilter, []interface{}{topic}
 	case date != "":
-		countRow = db.QueryRow(`SELECT COUNT(*) FROM news_results WHERE `+dateFilter, date)
+		return dateFilter, []interface{}{date}
 	default:
-		countRow = db.QueryRow(`SELECT COUNT(*) FROM news_results`)
+		return "", nil
+	}
+}
+
+func scanArticles(rows *sql.Rows) ([]Article, error) {
+	articles := []Article{}
+	for rows.Next() {
+		var a Article
+		var rawTopic string
+		if err := rows.Scan(&a.ID, &rawTopic, &a.Title, &a.URL, &a.Summary, &a.FetchedAt, &a.PublishedOn); err != nil {
+			return nil, err
+		}
+		a.Topics = splitTopics(rawTopic)
+		articles = append(articles, a)
+	}
+	return articles, rows.Err()
+}
+
+func getArticles(topic, date string, page int) (int, []Article, error) {
+	offset := (page - 1) * pageSize
+
+	clause, args := articleFilter(topic, date)
+	where := ""
+	if clause != "" {
+		where = ` WHERE ` + clause
 	}
 
 	var total int
-	if err = countRow.Scan(&total); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM news_results`+where, args...).Scan(&total); err != nil {
 		return 0, nil, err
 	}
 
 	const cols = `SELECT id, topic, COALESCE(title,''), COALESCE(url,''), COALESCE(summary,''), fetched_at, COALESCE(published_on,'') FROM news_results`
-	const tail = `ORDER BY fetched_at DESC LIMIT ? OFFSET ?`
-
-	switch {
-	case topic != "" && date != "":
-		rows, err = db.Query(cols+` WHERE `+topicFilter+` AND `+dateFilter+` `+tail, topic, date, pageSize, offset)
-	case topic != "":
-		rows, err = db.Query(cols+` WHERE `+topicFilter+` `+tail, topic, pageSize, offset)
-	case date != "":
-		rows, err = db.Query(cols+` WHERE `+dateFilter+` `+tail, date, pageSize, offset)
-	default:
-		rows, err = db.Query(cols+` `+tail, pageSize, offset)
-	}
+	rows, err := db.Query(cols+where+` ORDER BY fetched_at DESC LIMIT ? OFFSET ?`, append(append([]interface{}{}, args...), pageSize, offset)...)
 	if err != nil {
 		return 0, nil, err
 	}
 	defer rows.Close()
 
-	var articles []Article
-	for rows.Next() {
-		var a Article
-		var rawTopic string
-		if err := rows.Scan(&a.ID, &rawTopic, &a.Title, &a.URL, &a.Summary, &a.FetchedAt, &a.PublishedOn); err != nil {
-			return 0, nil, err
-		}
-		a.Topics = splitTopics(rawTopic)
-		articles = append(articles, a)
+	articles, err := scanArticles(rows)
+	return total, articles, err
+}
+
+// getAllArticles returns every article matching the topic/date filter, with
+// no pagination limit. Used by presentation mode when no page has been
+// explicitly selected.
+func getAllArticles(topic, date string) ([]Article, error) {
+	clause, args := articleFilter(topic, date)
+	where := ""
+	if clause != "" {
+		where = ` WHERE ` + clause
 	}
-	return total, articles, rows.Err()
+
+	const cols = `SELECT id, topic, COALESCE(title,''), COALESCE(url,''), COALESCE(summary,''), fetched_at, COALESCE(published_on,'') FROM news_results`
+	rows, err := db.Query(cols+where+` ORDER BY fetched_at DESC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanArticles(rows)
 }
 
 // getDailyCounts returns article counts per day for the last `days` calendar
