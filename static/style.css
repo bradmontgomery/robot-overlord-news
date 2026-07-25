@@ -592,6 +592,21 @@ mark {
   min-width: 4rem;
 }
 
+.presentation-progress {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 3px;
+  background: transparent;
+}
+
+.presentation-progress-bar {
+  height: 100%;
+  width: 0%;
+  background: var(--accent, #4a9eff);
+}
+
 @media (max-width: 700px) {
   .layout { grid-template-columns: 1fr; }
   aside { display: none; }

@@ -52,13 +52,14 @@
     return fetchNormalArticles();
   }
 
-  var AUTOPLAY_INTERVAL_MS = 2000;
+  var AUTOPLAY_INTERVAL_MS = 8000;
 
   var overlay = null;
   var articles = [];
   var index = 0;
   var playing = true;
   var timer = null;
+  var progressRAF = null;
 
   function metaLine(article) {
     var parts = [];
@@ -79,6 +80,42 @@
     btn.title = playing ? "Pause autoplay" : "Resume autoplay";
   }
 
+  function getProgressBar() {
+    return overlay ? overlay.querySelector(".presentation-progress-bar") : null;
+  }
+
+  function stopProgressAnimation() {
+    if (progressRAF) {
+      cancelAnimationFrame(progressRAF);
+      progressRAF = null;
+    }
+  }
+
+  function resetProgressBar() {
+    stopProgressAnimation();
+    var bar = getProgressBar();
+    if (!bar) return;
+    bar.style.width = "0%";
+  }
+
+  function tickProgress(startTime) {
+    var bar = getProgressBar();
+    if (!bar) return;
+    var pct = Math.min(100, ((Date.now() - startTime) / AUTOPLAY_INTERVAL_MS) * 100);
+    bar.style.width = pct + "%";
+    if (pct < 100) {
+      progressRAF = requestAnimationFrame(function () { tickProgress(startTime); });
+    }
+  }
+
+  function animateProgressBar() {
+    stopProgressAnimation();
+    var bar = getProgressBar();
+    if (!bar) return;
+    bar.style.width = "0%";
+    progressRAF = requestAnimationFrame(function () { tickProgress(Date.now()); });
+  }
+
   function renderSlide() {
     var titleEl = overlay.querySelector(".presentation-title");
     var summaryEl = overlay.querySelector(".presentation-summary");
@@ -86,6 +123,8 @@
     var counterEl = overlay.querySelector(".presentation-counter");
     var prevBtn = overlay.querySelector(".presentation-prev");
     var nextBtn = overlay.querySelector(".presentation-next");
+
+    resetProgressBar();
 
     if (articles.length === 0) {
       titleEl.textContent = "Nothing to present";
@@ -113,12 +152,14 @@
       clearInterval(timer);
       timer = null;
     }
+    stopProgressAnimation();
   }
 
   function startAutoplay() {
     stopAutoplay();
     if (!playing || articles.length < 2) return;
     timer = setInterval(showNext, AUTOPLAY_INTERVAL_MS);
+    animateProgressBar();
   }
 
   function showNext() {
@@ -168,6 +209,7 @@
     el.className = "presentation-overlay";
     el.innerHTML =
       '<button class="presentation-close" type="button" aria-label="Close presentation">✕</button>' +
+      '<div class="presentation-progress"><div class="presentation-progress-bar"></div></div>' +
       '<div class="presentation-meta"></div>' +
       '<div class="presentation-title"></div>' +
       '<div class="presentation-summary"></div>' +
