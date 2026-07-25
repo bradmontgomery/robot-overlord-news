@@ -50,43 +50,43 @@ DEFAULT_TOPICS = (
     "anthropic",  # AI companies
     "openai",
     "ollama",
-    "Google",
+    "google",
     "xai",
-    "SpaceX",
-    "Z.ai",
-    "Nvidia",
-    "Microsoft",
+    "spacex",
+    "z.ai",
+    "nvidia",
+    "microsoft",
     "perplexity",
-    "Moonshot",
+    "moonshot",
     "hugging face",
-    "Groq",
+    "groq",
     "claude",  # Models
-    "Gemini",
+    "gemini",
     "chatgpt",
-    "GPT-5",
+    "gpt-5",
     "nova",
-    "Phi",
-    "Sora",
+    "phi",
+    "sora",
     "veo",
-    "Midjourney",
-    "Stable Diffusion",
+    "midjourney",
+    "stable diffusion",
     "grok",
     "deepseek",
     "meta llama",
-    "GLM",
-    "Kimi",
-    "Qwen",
-    "Minimax",
-    "LFM",
+    "glm",
+    "kimi",
+    "qwen",
+    "minimax",
+    "lfm",
     "gemma",
     "nemotron",
     "mistral",
-    "Cohere",
+    "cohere",
     "claude code",  # tools, harnesses
     "codex",
     "opencode",
-    "Cursor",
-    "LangChain",
+    "cursor",
+    "langchain",
     "copilot",
     "kiro",
     "openclaw",
@@ -96,9 +96,9 @@ DEFAULT_TOPICS = (
     "zed",
     "local llm",  # broader topics
     "vllm",
-    "MCP",
+    "mcp",
     "model context protocol",
-    "A2A",
+    "a2a",
     "coding agents",
     "ai harness",
     "artificial intelligence",
@@ -109,9 +109,9 @@ DEFAULT_TOPICS = (
     "ai policy",
     "reasoning models",
     "open weights",
-    "AGI",
+    "agi",
     "vibe coding",
-    "RAG",
+    "rag",
 )
 
 _SYSTEM_PROMPT = """\
@@ -220,6 +220,12 @@ def init_db(path: str) -> None:
         """)
 
 
+def _normalize_topic(topic: str) -> str:
+    """Lowercase and trim each comma-separated topic label so the same topic
+    (e.g. "Nvidia" vs "nvidia") always collapses to one row in GROUP BY topic."""
+    return ", ".join(part.strip().lower() for part in topic.split(","))
+
+
 @tool
 def store_result(
     topic: str, title: str, url: str, summary: str, published_on: str = ""
@@ -241,7 +247,7 @@ def store_result(
         cursor = conn.execute(
             "INSERT OR IGNORE INTO news_results (topic, title, url, summary, fetched_at, published_on)"
             " VALUES (?, ?, ?, ?, ?, ?)",
-            (topic, title, url, summary, fetched_at, pub_date),
+            (_normalize_topic(topic), title, url, summary, fetched_at, pub_date),
         )
     if cursor.rowcount:
         return f"Stored: {title}"
