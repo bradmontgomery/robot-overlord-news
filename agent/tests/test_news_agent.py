@@ -117,7 +117,7 @@ def test_store_result_inserts_row(tmp_path):
     assert "Test Article" in result
     with sqlite3.connect(db_file) as conn:
         rows = conn.execute("SELECT topic, title, url, summary FROM news_results").fetchall()
-    assert rows == [("AI", "Test Article", "http://example.com", "Short summary.")]
+    assert rows == [("ai", "Test Article", "http://example.com", "Short summary.")]
 
 
 def test_store_result_stores_published_on(tmp_path):
@@ -196,6 +196,34 @@ def test_store_result_sets_fetched_at(tmp_path):
     with sqlite3.connect(db_file) as conn:
         fetched_at = conn.execute("SELECT fetched_at FROM news_results").fetchone()[0]
     assert fetched_at  # non-empty ISO string
+
+
+def test_store_result_lowercases_topic(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "test.db")
+    news_agent.init_db(db_file)
+    with patch.object(news_agent, "DB_PATH", db_file):
+        news_agent.store_result.invoke(
+            {"topic": "Nvidia", "title": "T", "url": "http://example.com", "summary": "s"}
+        )
+    with sqlite3.connect(db_file) as conn:
+        topic = conn.execute("SELECT topic FROM news_results").fetchone()[0]
+    assert topic == "nvidia"
+
+
+def test_store_result_normalizes_multi_topic(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "test.db")
+    news_agent.init_db(db_file)
+    with patch.object(news_agent, "DB_PATH", db_file):
+        news_agent.store_result.invoke(
+            {"topic": "Anthropic,  Claude Code", "title": "T", "url": "http://example.com", "summary": "s"}
+        )
+    with sqlite3.connect(db_file) as conn:
+        topic = conn.execute("SELECT topic FROM news_results").fetchone()[0]
+    assert topic == "anthropic, claude code"
 
 
 # ---------------------------------------------------------------------------

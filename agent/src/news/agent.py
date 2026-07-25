@@ -50,43 +50,43 @@ DEFAULT_TOPICS = (
     "anthropic",  # AI companies
     "openai",
     "ollama",
-    "Google",
+    "google",
     "xai",
-    "SpaceX",
-    "Z.ai",
-    "Nvidia",
-    "Microsoft",
+    "spacex",
+    "z.ai",
+    "nvidia",
+    "microsoft",
     "perplexity",
-    "Moonshot",
+    "moonshot",
     "hugging face",
-    "Groq",
+    "groq",
     "claude",  # Models
-    "Gemini",
+    "gemini",
     "chatgpt",
-    "GPT-5",
+    "gpt-5",
     "nova",
-    "Phi",
-    "Sora",
+    "phi",
+    "sora",
     "veo",
-    "Midjourney",
-    "Stable Diffusion",
+    "midjourney",
+    "stable diffusion",
     "grok",
     "deepseek",
     "meta llama",
-    "GLM",
-    "Kimi",
-    "Qwen",
-    "Minimax",
-    "LFM",
+    "glm",
+    "kimi",
+    "qwen",
+    "minimax",
+    "lfm",
     "gemma",
     "nemotron",
     "mistral",
-    "Cohere",
+    "cohere",
     "claude code",  # tools, harnesses
     "codex",
     "opencode",
-    "Cursor",
-    "LangChain",
+    "cursor",
+    "langchain",
     "copilot",
     "kiro",
     "openclaw",
@@ -96,9 +96,9 @@ DEFAULT_TOPICS = (
     "zed",
     "local llm",  # broader topics
     "vllm",
-    "MCP",
+    "mcp",
     "model context protocol",
-    "A2A",
+    "a2a",
     "coding agents",
     "ai harness",
     "artificial intelligence",
@@ -109,22 +109,29 @@ DEFAULT_TOPICS = (
     "ai policy",
     "reasoning models",
     "open weights",
-    "AGI",
+    "agi",
     "vibe coding",
-    "RAG",
+    "rag",
 )
 
 _SYSTEM_PROMPT = """\
-You are a news research agent. Today's date is {today}.
+You are an AI/ML technology news research agent. Today's date is {today}.
 
-The user gives you one or more topics. Treat each provided topic as a short, fixed label.
+The user gives you one or more topics — companies, products, models, or concepts from
+the AI industry. Treat each provided topic as a short, fixed label.
 
 For each topic:
 1. Search for recent news using the search tool. Use a SHORT query — just the
    topic label itself (optionally add the word "news"). Search ONE topic per
    query: never combine multiple topics into a single search, and never add
    site: filters or URLs to the query. Both return zero results.
-2. For each relevant article found, call store_result ONCE with:
+2. For each article found, only store it if it is genuinely about AI/ML technology
+   (a model, AI product/feature, AI research, AI tooling, or AI industry strategy).
+   Company topics like "nvidia", "microsoft", "google", or "spacex" also generate
+   plenty of ordinary corporate, financial, or product news with no AI angle — stock
+   moves, earnings, unrelated product launches, layoffs, legal rulings, rocket
+   launches, gaming. Skip those even though the company name matches the topic.
+   For each article that passes this check, call store_result ONCE with:
    - topic: the topic label(s) this article belongs to (see rules below)
    - title: article headline
    - url: article URL
@@ -157,9 +164,20 @@ and no questions to the reader.
 """
 
 _JUDGE_SYSTEM_PROMPT = """\
-You are a relevance judge. You will be given a numbered list of articles and a set \
-of topics. For EACH numbered article, decide if it is genuinely relevant to at \
-least one topic.
+You are a relevance judge for an AI/ML technology news digest. You will be given a \
+numbered list of articles and a set of topics (companies, products, models, or \
+concepts from the AI industry). For EACH numbered article, decide YES only if it is \
+BOTH:
+  1. genuinely about artificial intelligence / machine learning technology
+     (a model, AI product/feature, AI research, AI tooling, or AI industry strategy), AND
+  2. relevant to at least one of the given topics.
+
+Many topics are company names (e.g. "nvidia", "microsoft", "google", "spacex") that \
+also generate large volumes of ordinary corporate, financial, or product news with no \
+AI angle — stock price moves, earnings, unrelated product launches, layoffs, legal/
+antitrust rulings, rocket launches, gaming, or general company gossip. Answer NO for \
+those even though the company name matches the topic. Only answer YES when the AI/ML \
+angle is actually present in the title or summary.
 
 Respond with exactly one line per article, in this format and no other text:
 N: YES
@@ -220,6 +238,12 @@ def init_db(path: str) -> None:
         """)
 
 
+def _normalize_topic(topic: str) -> str:
+    """Lowercase and trim each comma-separated topic label so the same topic
+    (e.g. "Nvidia" vs "nvidia") always collapses to one row in GROUP BY topic."""
+    return ", ".join(part.strip().lower() for part in topic.split(","))
+
+
 @tool
 def store_result(
     topic: str, title: str, url: str, summary: str, published_on: str = ""
@@ -241,7 +265,7 @@ def store_result(
         cursor = conn.execute(
             "INSERT OR IGNORE INTO news_results (topic, title, url, summary, fetched_at, published_on)"
             " VALUES (?, ?, ?, ?, ?, ?)",
-            (topic, title, url, summary, fetched_at, pub_date),
+            (_normalize_topic(topic), title, url, summary, fetched_at, pub_date),
         )
     if cursor.rowcount:
         return f"Stored: {title}"
@@ -336,7 +360,12 @@ def judge_articles(topics: list[str], run_start: str) -> int:
         return 0
 
     topic_str = ", ".join(topics)
-    model = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
+    # reasoning=False: qwen3.5 is a reasoning model and its <think> traces reliably
+    # blow past the response length limit on a 10-article batch, causing done_reason
+    # "length" with empty .content — which fails open and keeps every article,
+    # including the false positives this judge exists to catch. The judge only needs
+    # short YES/NO tokens, so reasoning adds cost without adding judgment quality.
+    model = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, reasoning=False)
     to_delete: list[int] = []
     for i in range(0, len(rows), JUDGE_BATCH_SIZE):
         batch = rows[i : i + JUDGE_BATCH_SIZE]
