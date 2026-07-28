@@ -7,6 +7,79 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 
+@pytest.fixture(autouse=True)
+def _isolate_metrics_path(tmp_path, monkeypatch):
+    """Redirect every test's metrics writes to a scratch file, never the repo root."""
+    from news import agent as news_agent
+
+    monkeypatch.setattr(news_agent, "METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+
+
+def _read_metrics(path) -> list[dict]:
+    import json
+
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+# ---------------------------------------------------------------------------
+# metrics helpers
+# ---------------------------------------------------------------------------
+
+
+def test_llm_perf_fields_extracts_usage_and_timing():
+    from news.agent import _llm_perf_fields
+
+    response = AIMessage(
+        content="hi",
+        usage_metadata={"input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
+        response_metadata={
+            "load_duration": 1_000_000,
+            "prompt_eval_duration": 2_000_000_000,
+            "eval_duration": 5_000_000_000,
+            "total_duration": 8_000_000,
+            "done_reason": "stop",
+        },
+    )
+    fields = _llm_perf_fields(response)
+    assert fields["input_tokens"] == 100
+    assert fields["output_tokens"] == 50
+    assert fields["total_tokens"] == 150
+    assert fields["load_duration_ns"] == 1_000_000
+    assert fields["eval_duration_ns"] == 5_000_000_000
+    assert fields["done_reason"] == "stop"
+    assert fields["tokens_per_sec"] == 10.0  # 50 tokens / 5s
+
+
+def test_llm_perf_fields_handles_missing_usage_metadata():
+    from news.agent import _llm_perf_fields
+
+    response = AIMessage(content="hi")  # usage_metadata=None, response_metadata={}
+    fields = _llm_perf_fields(response)
+    assert fields["input_tokens"] is None
+    assert fields["tokens_per_sec"] is None
+    assert fields["done_reason"] is None
+
+
+def test_llm_perf_fields_handles_bare_mock_response():
+    from news.agent import _llm_perf_fields
+
+    fields = _llm_perf_fields(MagicMock())
+    assert fields == {
+        "input_tokens": None, "output_tokens": None, "total_tokens": None,
+        "load_duration_ns": None, "prompt_eval_duration_ns": None,
+        "eval_duration_ns": None, "total_duration_ns": None,
+        "tokens_per_sec": None, "done_reason": None,
+    }
+
+
+def test_llm_perf_fields_handles_none_response():
+    from news.agent import _llm_perf_fields
+
+    fields = _llm_perf_fields(None)
+    assert fields["input_tokens"] is None
+
+
 # ---------------------------------------------------------------------------
 # init_db
 # ---------------------------------------------------------------------------
@@ -88,6 +161,42 @@ def test_init_db_adds_published_on_to_existing_db(tmp_path):
     assert "published_on" in cols
 
 
+def test_init_db_adds_model_name_to_existing_news_results(tmp_path):
+    from news.agent import init_db
+
+    db_file = str(tmp_path / "test.db")
+    # Simulate a DB without model_name (old schema)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("""
+            CREATE TABLE news_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL, title TEXT, url TEXT, summary TEXT, fetched_at TEXT NOT NULL
+            )
+        """)
+    init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(news_results)").fetchall()]
+    assert "model_name" in cols
+
+
+def test_init_db_adds_model_name_to_existing_news_summaries(tmp_path):
+    from news.agent import init_db
+
+    db_file = str(tmp_path / "test.db")
+    # Simulate a DB with news_summaries but without model_name (old schema)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("""
+            CREATE TABLE news_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL UNIQUE, summary TEXT NOT NULL, created_at TEXT NOT NULL
+            )
+        """)
+    init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(news_summaries)").fetchall()]
+    assert "model_name" in cols
+
+
 def test_init_db_creates_news_summaries_table(tmp_path):
     from news.agent import init_db
 
@@ -147,6 +256,21 @@ def test_store_result_published_on_none_when_omitted(tmp_path):
     with sqlite3.connect(db_file) as conn:
         pub = conn.execute("SELECT published_on FROM news_results").fetchone()[0]
     assert pub is None
+
+
+def test_store_result_stores_model_name(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "test.db")
+    news_agent.init_db(db_file)
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "MODEL_NAME", "test-model:latest"):
+        news_agent.store_result.invoke(
+            {"topic": "AI", "title": "T", "url": "http://example.com", "summary": "s"}
+        )
+    with sqlite3.connect(db_file) as conn:
+        model_name = conn.execute("SELECT model_name FROM news_results").fetchone()[0]
+    assert model_name == "test-model:latest"
 
 
 def test_store_result_deduplicates_by_url(tmp_path):
@@ -341,6 +465,7 @@ def test_build_graph_tavily():
 
 def test_build_graph_agent_node_invokes_model():
     """Verify agent_node prepends system message and calls model.invoke."""
+    from news import agent as news_agent
     from news.agent import build_graph
 
     mock_response = AIMessage(content="done")
@@ -350,7 +475,7 @@ def test_build_graph_agent_node_invokes_model():
 
     with patch("news.agent.ChatOllama", return_value=mock_model), \
          patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "TAVILY_API_KEY"}, clear=True):
-        graph = build_graph()
+        graph = build_graph(run_id="run-123")
 
     # Invoke the graph — model returns AIMessage with no tool_calls so it terminates
     result = graph.invoke({"messages": [HumanMessage("test")]})
@@ -360,6 +485,12 @@ def test_build_graph_agent_node_invokes_model():
     from langchain_core.messages import SystemMessage
     assert isinstance(call_args[0], SystemMessage)
     assert "news research agent" in call_args[0].content
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    llm_calls = [r for r in records if r["type"] == "llm_call" and r["step"] == "agent_step"]
+    assert len(llm_calls) == 1
+    assert llm_calls[0]["run_id"] == "run-123"
+    assert llm_calls[0]["tool_call_count"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +571,52 @@ def test_run_batches_topics(tmp_path):
     mock_judge.assert_called_once()
     assert mock_judge.call_args[0][0] == topics
     mock_summarize.assert_called_once()
+
+
+def test_run_logs_run_and_search_batch_metrics(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "metrics_run.db")
+    mock_app = MagicMock()
+    mock_app.invoke.return_value = {}
+    topics = [f"topic{i}" for i in range(20)]
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "BATCH_SIZE", 8), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles"), \
+         patch("news.agent.summarize_day"):
+        news_agent.run(topics)
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    run_records = [r for r in records if r["type"] == "step" and r["step"] == "run"]
+    assert len(run_records) == 1
+    assert run_records[0]["topics"] == 20
+
+    search_records = [r for r in records if r["type"] == "step" and r["step"] == "search_batch"]
+    assert len(search_records) == 3
+    assert all(r["success"] for r in search_records)
+    assert {r["run_id"] for r in run_records + search_records} == {run_records[0]["run_id"]}
+
+
+def test_run_logs_failed_search_batch_metrics(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "metrics_run_fail.db")
+    mock_app = MagicMock()
+    mock_app.invoke.side_effect = RuntimeError("boom")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles"), \
+         patch("news.agent.summarize_day"):
+        news_agent.run(["topic1"])
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    search_records = [r for r in records if r["type"] == "step" and r["step"] == "search_batch"]
+    assert len(search_records) == 1
+    assert search_records[0]["success"] is False
+    assert "boom" in search_records[0]["error"]
 
 
 def test_run_continues_after_batch_failure(tmp_path):
@@ -806,14 +983,25 @@ def test_summarize_day_stores_summary(tmp_path):
 
     with patch.object(news_agent, "DB_PATH", db_file), \
          patch("news.agent.ChatOllama", return_value=mock_model):
-        result = news_agent.summarize_day("2026-06-16")
+        result = news_agent.summarize_day("2026-06-16", run_id="run-abc")
 
     assert result == "Today AI dominated the news."
     with sqlite3.connect(db_file) as conn:
         row = conn.execute(
-            "SELECT date, summary FROM news_summaries WHERE date='2026-06-16'"
+            "SELECT date, summary, model_name FROM news_summaries WHERE date='2026-06-16'"
         ).fetchone()
-    assert row == ("2026-06-16", "Today AI dominated the news.")
+    assert row == ("2026-06-16", "Today AI dominated the news.", news_agent.SUMMARY_MODEL_NAME)
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    llm_calls = [r for r in records if r["type"] == "llm_call" and r["step"] == "summarize_primary"]
+    assert len(llm_calls) == 1
+    assert llm_calls[0]["run_id"] == "run-abc"
+    assert llm_calls[0]["success"] is True
+
+    steps = [r for r in records if r["type"] == "step" and r["step"] == "summarize_day"]
+    assert len(steps) == 1
+    assert steps[0]["success"] is True
+    assert steps[0]["used_model"] == news_agent.SUMMARY_MODEL_NAME
 
 
 def test_summarize_day_upserts_on_rerun(tmp_path):
@@ -971,6 +1159,20 @@ def test_summarize_day_falls_back_to_model_name(tmp_path):
         result = news_agent.summarize_day("2026-06-16")
 
     assert result == "Fallback summary."
+    with sqlite3.connect(db_file) as conn:
+        model_name = conn.execute(
+            "SELECT model_name FROM news_summaries WHERE date='2026-06-16'"
+        ).fetchone()[0]
+    assert model_name == "fallback-model"
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    primary_calls = [r for r in records if r["type"] == "llm_call" and r["step"] == "summarize_primary"]
+    fallback_calls = [r for r in records if r["type"] == "llm_call" and r["step"] == "summarize_fallback"]
+    assert len(primary_calls) == 1
+    assert primary_calls[0]["success"] is False
+    assert len(fallback_calls) == 1
+    assert fallback_calls[0]["success"] is True
+    assert fallback_calls[0]["model"] == "fallback-model"
 
 
 def test_summarize_day_empty_primary_falls_back(tmp_path):
@@ -1240,5 +1442,62 @@ def test_judge_articles_fail_open_on_invoke_error(tmp_path):
     with sqlite3.connect(db_file) as conn:
         count = conn.execute("SELECT COUNT(*) FROM news_results").fetchone()[0]
     assert count == 1
+
+
+def test_judge_articles_logs_llm_call_and_step_metrics(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    run_start = "2026-06-16T10:00:00+00:00"
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "AI Breakthrough", "http://ai.com", "About AI.", run_start),
+        )
+
+    mock_model = MagicMock()
+    mock_model.invoke.return_value = MagicMock(content="1: YES")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model):
+        news_agent.judge_articles(["AI"], run_start)
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    llm_calls = [r for r in records if r["type"] == "llm_call" and r["step"] == "judge_batch"]
+    assert len(llm_calls) == 1
+    assert llm_calls[0]["run_id"] == run_start
+    assert llm_calls[0]["success"] is True
+
+    steps = [r for r in records if r["type"] == "step" and r["step"] == "judge_articles"]
+    assert len(steps) == 1
+    assert steps[0]["articles_judged"] == 1
+    assert steps[0]["articles_deleted"] == 0
+
+
+def test_judge_articles_logs_failed_llm_call_metrics(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    run_start = "2026-06-16T10:00:00+00:00"
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "AI Breakthrough", "http://ai.com", "About AI.", run_start),
+        )
+
+    mock_model = MagicMock()
+    mock_model.invoke.side_effect = RuntimeError("ollama unreachable")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model):
+        news_agent.judge_articles(["AI"], run_start)
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    llm_calls = [r for r in records if r["type"] == "llm_call" and r["step"] == "judge_batch"]
+    assert len(llm_calls) == 1
+    assert llm_calls[0]["success"] is False
+    assert "ollama unreachable" in llm_calls[0]["error"]
 
 
