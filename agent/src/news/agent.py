@@ -13,6 +13,7 @@ Graph:
 """
 
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -36,6 +37,7 @@ SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL", "ministral-3:8b")
 SUMMARY_NUM_CTX = int(os.getenv("SUMMARY_NUM_CTX", "49152"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 DB_PATH = os.getenv("NEWS_DB_PATH", "news_results.db")
+METRICS_PATH = os.getenv("NEWS_METRICS_PATH", "news_metrics.jsonl")
 # Topics are searched in small batches. A single huge query crashes the news
 # backend ("Could not extract vqd"); just as important, once a batch fills the
 # context with many search results the local model stops following through on
@@ -196,6 +198,64 @@ Cast a broad net and store every relevant, recent article you find.
 """
 
 
+def _write_metric(record: dict) -> None:
+    record["logged_at"] = datetime.now(timezone.utc).isoformat()
+    with open(METRICS_PATH, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def _llm_perf_fields(response) -> dict:
+    """Best-effort extraction of token/timing fields from an AIMessage-like response.
+
+    Tolerant of test doubles: a plain ``MagicMock()`` auto-creates non-dict
+    attributes, so both fields are coerced to ``{}`` unless they're real dicts.
+    """
+    usage = getattr(response, "usage_metadata", None)
+    meta = getattr(response, "response_metadata", None)
+    usage = usage if isinstance(usage, dict) else {}
+    meta = meta if isinstance(meta, dict) else {}
+    output_tokens = usage.get("output_tokens")
+    eval_duration = meta.get("eval_duration")
+    tokens_per_sec = (
+        round(output_tokens / (eval_duration / 1e9), 2)
+        if output_tokens and eval_duration
+        else None
+    )
+    return {
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": output_tokens,
+        "total_tokens": usage.get("total_tokens"),
+        "load_duration_ns": meta.get("load_duration"),
+        "prompt_eval_duration_ns": meta.get("prompt_eval_duration"),
+        "eval_duration_ns": eval_duration,
+        "total_duration_ns": meta.get("total_duration"),
+        "tokens_per_sec": tokens_per_sec,
+        "done_reason": meta.get("done_reason"),
+    }
+
+
+def _log_llm_call(run_id, step, model_name, response, elapsed_s, **extra) -> None:
+    _write_metric({
+        "type": "llm_call",
+        "run_id": run_id,
+        "step": step,
+        "model": model_name,
+        "elapsed_s": round(elapsed_s, 3),
+        **_llm_perf_fields(response),
+        **extra,
+    })
+
+
+def _log_step(run_id, step, elapsed_s, **extra) -> None:
+    _write_metric({
+        "type": "step",
+        "run_id": run_id,
+        "step": step,
+        "elapsed_s": round(elapsed_s, 3),
+        **extra,
+    })
+
+
 def init_db(path: str) -> None:
     """Create tables and indexes if they do not exist; migrate existing DBs."""
     with sqlite3.connect(path) as conn:
@@ -312,7 +372,7 @@ def should_continue(state: MessagesState) -> Literal["tools", "__end__"]:
     return END
 
 
-def build_graph():
+def build_graph(run_id: str | None = None):
     """Compile and return the news research StateGraph."""
     search_tool = _make_search_tool()
     tools = [search_tool, store_result]
@@ -324,7 +384,12 @@ def build_graph():
     tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
 
     def agent_node(state: MessagesState) -> dict:
+        start = time.perf_counter()
         response = model.invoke([system_message] + state["messages"])
+        _log_llm_call(
+            run_id, "agent_step", MODEL_NAME, response, time.perf_counter() - start,
+            tool_call_count=len(getattr(response, "tool_calls", None) or []),
+        )
         return {"messages": [response]}
 
     graph = StateGraph(MessagesState)
@@ -361,6 +426,7 @@ def judge_articles(topics: list[str], run_start: str) -> int:
 
     Returns the count of removed rows.
     """
+    judge_start = time.perf_counter()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             "SELECT id, title, summary FROM news_results WHERE fetched_at >= ?",
@@ -383,6 +449,8 @@ def judge_articles(topics: list[str], run_start: str) -> int:
             f"{n}. Article title: {title}\nArticle summary: {summary}"
             for n, (_, title, summary) in enumerate(batch, start=1)
         )
+        batch_index = i // JUDGE_BATCH_SIZE
+        call_start = time.perf_counter()
         try:
             response = model.invoke(
                 [
@@ -391,12 +459,20 @@ def judge_articles(topics: list[str], run_start: str) -> int:
                 ]
             )
         except Exception as e:
+            _log_llm_call(
+                run_start, "judge_batch", MODEL_NAME, None, time.perf_counter() - call_start,
+                batch_index=batch_index, batch_size=len(batch), success=False, error=str(e),
+            )
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             rprint(
                 f"[dim][{now}][/dim] [yellow]Judge call failed (keeping batch "
                 f"unfiltered): {e}[/yellow]"
             )
             continue
+        _log_llm_call(
+            run_start, "judge_batch", MODEL_NAME, response, time.perf_counter() - call_start,
+            batch_index=batch_index, batch_size=len(batch), success=True,
+        )
         verdicts = _parse_judge_verdicts(response.content)
         for n, (row_id, _title, _summary) in enumerate(batch, start=1):
             if verdicts.get(n) == "NO":
@@ -408,6 +484,10 @@ def judge_articles(topics: list[str], run_start: str) -> int:
             conn.execute(
                 f"DELETE FROM news_results WHERE id IN ({placeholders})", to_delete
             )
+    _log_step(
+        run_start, "judge_articles", time.perf_counter() - judge_start,
+        articles_judged=len(rows), articles_deleted=len(to_delete),
+    )
     return len(to_delete)
 
 
@@ -417,7 +497,9 @@ def _log_summary_warning(message: str, style: str = "yellow") -> None:
     rprint(f"[dim][{now}][/dim] [{style}]{message}[/{style}]")
 
 
-def _invoke_summary_model(model_name: str, messages: list, num_ctx: int) -> str:
+def _invoke_summary_model(
+    model_name: str, messages: list, num_ctx: int, run_id: str | None, step: str
+) -> str:
     """Invoke a summary model and return its stripped text, raising on empty output.
 
     Treating an empty/whitespace response as a failure lets ``summarize_day`` fall
@@ -425,23 +507,39 @@ def _invoke_summary_model(model_name: str, messages: list, num_ctx: int) -> str:
     persisting a blank summary — the failure mode seen with oversized models that
     spill to CPU.
     """
-    response = ChatOllama(
-        model=model_name, base_url=OLLAMA_BASE_URL, num_ctx=num_ctx
-    ).invoke(messages)
+    start = time.perf_counter()
+    try:
+        response = ChatOllama(
+            model=model_name, base_url=OLLAMA_BASE_URL, num_ctx=num_ctx
+        ).invoke(messages)
+    except Exception as exc:
+        _log_llm_call(
+            run_id, step, model_name, None, time.perf_counter() - start,
+            num_ctx=num_ctx, success=False, error=str(exc),
+        )
+        raise
     text = (response.content or "").strip()
+    _log_llm_call(
+        run_id, step, model_name, response, time.perf_counter() - start,
+        num_ctx=num_ctx, success=bool(text),
+    )
     if not text:
         raise ValueError(f"{model_name} returned an empty summary")
     return text
 
 
 def summarize_day(
-    date: str, model: str | None = None, num_ctx: int | None = None
+    date: str,
+    model: str | None = None,
+    num_ctx: int | None = None,
+    run_id: str | None = None,
 ) -> str | None:
     """Summarize all news articles stored for *date* (YYYY-MM-DD) and upsert into news_summaries.
 
     *model* overrides the summary model (default ``SUMMARY_MODEL_NAME``); *num_ctx*
     overrides the context window (default ``SUMMARY_NUM_CTX``). Both default to None
-    so positional ``summarize_day(date)`` calls keep working.
+    so positional ``summarize_day(date)`` calls keep working. *run_id* correlates
+    metrics with the enclosing ``run()`` loop iteration, if any.
 
     Returns the summary text, or None if no articles exist for that date.
     """
@@ -459,27 +557,40 @@ def summarize_day(
         SystemMessage(_SUMMARIZE_SYSTEM_PROMPT),
         HumanMessage(f"Summarize the news for {date}:\n\n{digest}"),
     ]
+    summarize_start = time.perf_counter()
     try:
-        summary_text = _invoke_summary_model(primary_model, messages, ctx)
+        summary_text = _invoke_summary_model(
+            primary_model, messages, ctx, run_id, "summarize_primary"
+        )
         used_model = primary_model
     except Exception as exc:
         # A failed or empty response from the only model is fatal; otherwise warn
         # loudly and retry once with MODEL_NAME so a misconfigured SUMMARY_MODEL
         # surfaces instead of silently degrading.
         if primary_model == MODEL_NAME:
+            _log_step(
+                run_id, "summarize_day", time.perf_counter() - summarize_start,
+                success=False,
+            )
             raise
         _log_summary_warning(
             f"summary model {primary_model!r} failed ({exc}); "
             f"falling back to {MODEL_NAME!r}"
         )
         try:
-            summary_text = _invoke_summary_model(MODEL_NAME, messages, ctx)
+            summary_text = _invoke_summary_model(
+                MODEL_NAME, messages, ctx, run_id, "summarize_fallback"
+            )
             used_model = MODEL_NAME
         except Exception as exc2:
             _log_summary_warning(
                 f"fallback model {MODEL_NAME!r} also failed ({exc2}); "
                 f"no summary stored for {date}",
                 style="red",
+            )
+            _log_step(
+                run_id, "summarize_day", time.perf_counter() - summarize_start,
+                success=False,
             )
             return None
     created_at = datetime.now(timezone.utc).isoformat()
@@ -489,6 +600,10 @@ def summarize_day(
             " VALUES (?, ?, ?, ?)",
             (date, summary_text, used_model, created_at),
         )
+    _log_step(
+        run_id, "summarize_day", time.perf_counter() - summarize_start,
+        used_model=used_model, success=True,
+    )
     return summary_text
 
 
@@ -499,32 +614,47 @@ def run(topics: list[str]) -> tuple[int, str | None]:
     summary text produced by ``summarize_day`` (or ``None`` if no articles exist
     for today).
     """
+    run_loop_start = time.perf_counter()
     init_db(DB_PATH)
     run_start = datetime.now(timezone.utc).isoformat()
     today = run_start[:10]
-    app = build_graph()
+    app = build_graph(run_id=run_start)
     # Search topics in small batches: each invoke gets a fresh recursion budget,
     # and a failed batch is logged without abandoning the remaining topics.
     for i in range(0, len(topics), BATCH_SIZE):
         batch = topics[i : i + BATCH_SIZE]
         topic_list = ", ".join(batch)
+        batch_start = time.perf_counter()
         try:
             app.invoke(
                 {"messages": [HumanMessage(SEARCH_PROMPT.format(topic_list=topic_list))]},
                 config={"recursion_limit": 50},
             )
         except Exception as e:
+            _log_step(
+                run_start, "search_batch", time.perf_counter() - batch_start,
+                batch_index=i // BATCH_SIZE, topics=topic_list, success=False, error=str(e),
+            )
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             rprint(
                 f"[dim][{now}][/dim] [red]News research failed for batch "
                 f"{topic_list}: {e}[/red]"
             )
+            continue
+        _log_step(
+            run_start, "search_batch", time.perf_counter() - batch_start,
+            batch_index=i // BATCH_SIZE, topics=topic_list, success=True,
+        )
     with sqlite3.connect(DB_PATH) as conn:
         (new_count,) = conn.execute(
             "SELECT COUNT(*) FROM news_results WHERE fetched_at >= ?", (run_start,)
         ).fetchone()
     judge_articles(topics, run_start)
-    summary = summarize_day(today)
+    summary = summarize_day(today, run_id=run_start)
+    _log_step(
+        run_start, "run", time.perf_counter() - run_loop_start,
+        topics=len(topics), new_articles=new_count,
+    )
     return new_count, summary
 
 
