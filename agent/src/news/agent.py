@@ -207,15 +207,18 @@ def init_db(path: str) -> None:
                 url          TEXT,
                 summary      TEXT,
                 fetched_at   TEXT NOT NULL,
-                published_on TEXT
+                published_on TEXT,
+                model_name   TEXT
             )
         """)
-        # Migrate existing DBs that lack the published_on column.
+        # Migrate existing DBs that lack the published_on/model_name columns.
         existing_cols = [
             r[1] for r in conn.execute("PRAGMA table_info(news_results)").fetchall()
         ]
         if "published_on" not in existing_cols:
             conn.execute("ALTER TABLE news_results ADD COLUMN published_on TEXT")
+        if "model_name" not in existing_cols:
+            conn.execute("ALTER TABLE news_results ADD COLUMN model_name TEXT")
         # Remove duplicate URLs before enforcing the unique index, keeping the
         # earliest row (lowest id) for each URL so existing databases migrate cleanly.
         conn.execute("""
@@ -233,9 +236,15 @@ def init_db(path: str) -> None:
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 date       TEXT NOT NULL UNIQUE,
                 summary    TEXT NOT NULL,
+                model_name TEXT,
                 created_at TEXT NOT NULL
             )
         """)
+        existing_summary_cols = [
+            r[1] for r in conn.execute("PRAGMA table_info(news_summaries)").fetchall()
+        ]
+        if "model_name" not in existing_summary_cols:
+            conn.execute("ALTER TABLE news_summaries ADD COLUMN model_name TEXT")
 
 
 def _normalize_topic(topic: str) -> str:
@@ -263,9 +272,10 @@ def store_result(
     pub_date = published_on.strip() or None
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute(
-            "INSERT OR IGNORE INTO news_results (topic, title, url, summary, fetched_at, published_on)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (_normalize_topic(topic), title, url, summary, fetched_at, pub_date),
+            "INSERT OR IGNORE INTO news_results"
+            " (topic, title, url, summary, fetched_at, published_on, model_name)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (_normalize_topic(topic), title, url, summary, fetched_at, pub_date, MODEL_NAME),
         )
     if cursor.rowcount:
         return f"Stored: {title}"
@@ -451,6 +461,7 @@ def summarize_day(
     ]
     try:
         summary_text = _invoke_summary_model(primary_model, messages, ctx)
+        used_model = primary_model
     except Exception as exc:
         # A failed or empty response from the only model is fatal; otherwise warn
         # loudly and retry once with MODEL_NAME so a misconfigured SUMMARY_MODEL
@@ -463,6 +474,7 @@ def summarize_day(
         )
         try:
             summary_text = _invoke_summary_model(MODEL_NAME, messages, ctx)
+            used_model = MODEL_NAME
         except Exception as exc2:
             _log_summary_warning(
                 f"fallback model {MODEL_NAME!r} also failed ({exc2}); "
@@ -473,8 +485,9 @@ def summarize_day(
     created_at = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO news_summaries (date, summary, created_at) VALUES (?, ?, ?)",
-            (date, summary_text, created_at),
+            "INSERT OR REPLACE INTO news_summaries (date, summary, model_name, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (date, summary_text, used_model, created_at),
         )
     return summary_text
 

@@ -88,6 +88,42 @@ def test_init_db_adds_published_on_to_existing_db(tmp_path):
     assert "published_on" in cols
 
 
+def test_init_db_adds_model_name_to_existing_news_results(tmp_path):
+    from news.agent import init_db
+
+    db_file = str(tmp_path / "test.db")
+    # Simulate a DB without model_name (old schema)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("""
+            CREATE TABLE news_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL, title TEXT, url TEXT, summary TEXT, fetched_at TEXT NOT NULL
+            )
+        """)
+    init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(news_results)").fetchall()]
+    assert "model_name" in cols
+
+
+def test_init_db_adds_model_name_to_existing_news_summaries(tmp_path):
+    from news.agent import init_db
+
+    db_file = str(tmp_path / "test.db")
+    # Simulate a DB with news_summaries but without model_name (old schema)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("""
+            CREATE TABLE news_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL UNIQUE, summary TEXT NOT NULL, created_at TEXT NOT NULL
+            )
+        """)
+    init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(news_summaries)").fetchall()]
+    assert "model_name" in cols
+
+
 def test_init_db_creates_news_summaries_table(tmp_path):
     from news.agent import init_db
 
@@ -147,6 +183,21 @@ def test_store_result_published_on_none_when_omitted(tmp_path):
     with sqlite3.connect(db_file) as conn:
         pub = conn.execute("SELECT published_on FROM news_results").fetchone()[0]
     assert pub is None
+
+
+def test_store_result_stores_model_name(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "test.db")
+    news_agent.init_db(db_file)
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "MODEL_NAME", "test-model:latest"):
+        news_agent.store_result.invoke(
+            {"topic": "AI", "title": "T", "url": "http://example.com", "summary": "s"}
+        )
+    with sqlite3.connect(db_file) as conn:
+        model_name = conn.execute("SELECT model_name FROM news_results").fetchone()[0]
+    assert model_name == "test-model:latest"
 
 
 def test_store_result_deduplicates_by_url(tmp_path):
@@ -811,9 +862,9 @@ def test_summarize_day_stores_summary(tmp_path):
     assert result == "Today AI dominated the news."
     with sqlite3.connect(db_file) as conn:
         row = conn.execute(
-            "SELECT date, summary FROM news_summaries WHERE date='2026-06-16'"
+            "SELECT date, summary, model_name FROM news_summaries WHERE date='2026-06-16'"
         ).fetchone()
-    assert row == ("2026-06-16", "Today AI dominated the news.")
+    assert row == ("2026-06-16", "Today AI dominated the news.", news_agent.SUMMARY_MODEL_NAME)
 
 
 def test_summarize_day_upserts_on_rerun(tmp_path):
@@ -971,6 +1022,11 @@ def test_summarize_day_falls_back_to_model_name(tmp_path):
         result = news_agent.summarize_day("2026-06-16")
 
     assert result == "Fallback summary."
+    with sqlite3.connect(db_file) as conn:
+        model_name = conn.execute(
+            "SELECT model_name FROM news_summaries WHERE date='2026-06-16'"
+        ).fetchone()[0]
+    assert model_name == "fallback-model"
 
 
 def test_summarize_day_empty_primary_falls_back(tmp_path):
