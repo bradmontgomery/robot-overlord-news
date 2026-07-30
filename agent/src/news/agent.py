@@ -35,6 +35,15 @@ SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL", "ministral-3:8b")
 # holds 48k tokens at ~11 GB fully on a 16 GB GPU — enough for even the largest news
 # days in one pass. Override per-run with --num-ctx or the SUMMARY_NUM_CTX env.
 SUMMARY_NUM_CTX = int(os.getenv("SUMMARY_NUM_CTX", "49152"))
+# Context window for the ReAct loop. Left unset, Ollama defaults to 4096 — and the
+# metrics show what that costs: 15% of agent_step calls stopped at exactly 4096
+# tokens, and 88% of those emitted zero tool calls, so the whole loop iteration was
+# wasted mid-reasoning. Prompts run to ~4.1k and complete responses to ~1.8k, so the
+# real floor is ~6k; 16k leaves room for conversations that grow once they stop
+# being clipped. Costs ~1.7 GB of KV cache on top of qwen3.5's 6.6 GB — roughly
+# 8.3 GB of a 16 GB card. If load_duration_ns starts spiking in the metrics, this is
+# too large for the GPU and is spilling to CPU.
+AGENT_NUM_CTX = int(os.getenv("NEWS_NUM_CTX", "16384"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 DB_PATH = os.getenv("NEWS_DB_PATH", "news_results.db")
 METRICS_PATH = os.getenv("NEWS_METRICS_PATH", "news_metrics.jsonl")
@@ -48,6 +57,13 @@ BATCH_SIZE = 2
 # ~500-700 tokens, comfortably inside the model's default 4096-token context; cuts
 # judge_articles' call count ~10x versus one call per article.
 JUDGE_BATCH_SIZE = 10
+# Hard cap on judge output. The judge is not context-starved — its prompts peak at
+# ~1.2k tokens, well inside the 4096 default — but its output is bimodal: 41 tokens
+# for a normal verdict, or a runaway that burns every remaining token and stops at
+# the limit with empty .content, which fails open and keeps every article (see the
+# reasoning=False note in judge_articles). A bigger window would only let a runaway
+# burn more; capping it ends one in ~256 tokens instead of ~3000.
+JUDGE_NUM_PREDICT = 256
 DEFAULT_TOPICS = (
     "anthropic",  # AI companies
     "openai",
@@ -380,7 +396,9 @@ def build_graph(run_id: str | None = None):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     system_message = SystemMessage(_SYSTEM_PROMPT.format(today=today))
 
-    model = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL).bind_tools(tools)
+    model = ChatOllama(
+        model=MODEL_NAME, base_url=OLLAMA_BASE_URL, num_ctx=AGENT_NUM_CTX
+    ).bind_tools(tools)
     tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
 
     def agent_node(state: MessagesState) -> dict:
@@ -389,6 +407,7 @@ def build_graph(run_id: str | None = None):
         _log_llm_call(
             run_id, "agent_step", MODEL_NAME, response, time.perf_counter() - start,
             tool_call_count=len(getattr(response, "tool_calls", None) or []),
+            num_ctx=AGENT_NUM_CTX,
         )
         return {"messages": [response]}
 
@@ -441,7 +460,12 @@ def judge_articles(topics: list[str], run_start: str) -> int:
     # "length" with empty .content — which fails open and keeps every article,
     # including the false positives this judge exists to catch. The judge only needs
     # short YES/NO tokens, so reasoning adds cost without adding judgment quality.
-    model = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, reasoning=False)
+    model = ChatOllama(
+        model=MODEL_NAME,
+        base_url=OLLAMA_BASE_URL,
+        reasoning=False,
+        num_predict=JUDGE_NUM_PREDICT,
+    )
     to_delete: list[int] = []
     for i in range(0, len(rows), JUDGE_BATCH_SIZE):
         batch = rows[i : i + JUDGE_BATCH_SIZE]
@@ -472,6 +496,7 @@ def judge_articles(topics: list[str], run_start: str) -> int:
         _log_llm_call(
             run_start, "judge_batch", MODEL_NAME, response, time.perf_counter() - call_start,
             batch_index=batch_index, batch_size=len(batch), success=True,
+            num_predict=JUDGE_NUM_PREDICT,
         )
         verdicts = _parse_judge_verdicts(response.content)
         for n, (row_id, _title, _summary) in enumerate(batch, start=1):

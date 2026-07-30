@@ -1501,3 +1501,67 @@ def test_judge_articles_logs_failed_llm_call_metrics(tmp_path):
     assert "ollama unreachable" in llm_calls[0]["error"]
 
 
+
+
+# ---------------------------------------------------------------------------
+# context sizing — see AGENT_NUM_CTX / JUDGE_NUM_PREDICT
+# ---------------------------------------------------------------------------
+
+
+def test_build_graph_sets_the_agent_context_window():
+    """The ReAct loop must not fall back to Ollama's 4096-token default."""
+    from news import agent as news_agent
+
+    mock_model = MagicMock()
+    with patch("news.agent.ChatOllama", return_value=mock_model) as mock_chat:
+        news_agent.build_graph()
+
+    _, kwargs = mock_chat.call_args
+    assert kwargs["num_ctx"] == news_agent.AGENT_NUM_CTX
+    assert news_agent.AGENT_NUM_CTX > 4096
+
+
+def test_agent_step_metrics_record_the_context_window(tmp_path):
+    """num_ctx is logged so the metrics show which window a run actually used."""
+    from news import agent as news_agent
+
+    response = AIMessage(content="done", usage_metadata={
+        "input_tokens": 10, "output_tokens": 5, "total_tokens": 15})
+    mock_bound = MagicMock()
+    mock_bound.invoke.return_value = response
+    mock_model = MagicMock()
+    mock_model.bind_tools.return_value = mock_bound
+
+    with patch("news.agent.ChatOllama", return_value=mock_model):
+        graph = news_agent.build_graph(run_id="run-ctx")
+        graph.invoke({"messages": [HumanMessage(content="hi")]})
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    steps = [r for r in records if r.get("step") == "agent_step"]
+    assert steps and steps[0]["num_ctx"] == news_agent.AGENT_NUM_CTX
+
+
+def test_judge_caps_output_instead_of_widening_the_context(tmp_path):
+    """The judge is not context-starved; it runs away. Cap the output instead."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    run_start = "2026-06-16T10:00:00+00:00"
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "AI Breakthrough", "http://ai.com", "About AI.", run_start),
+        )
+
+    mock_model = MagicMock()
+    mock_model.invoke.return_value = MagicMock(content="1: YES")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model) as mock_chat:
+        news_agent.judge_articles(["AI"], run_start)
+
+    _, kwargs = mock_chat.call_args
+    assert kwargs["num_predict"] == news_agent.JUDGE_NUM_PREDICT
+    # A wider window would only let a runaway burn more tokens before failing open.
+    assert "num_ctx" not in kwargs
