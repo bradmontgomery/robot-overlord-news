@@ -92,7 +92,9 @@ def test_summarize_counts_truncation_over_all_llm_calls(records):
     assert k["llm_calls"] == 6
     assert k["truncated"] == 3
     assert k["truncated_pct"] == pytest.approx(50.0)
-    assert k["all_at_ceiling"] is True
+    # Headline is scoped to the current config, not the all-time pool.
+    assert k["current_trunc_pct"] == pytest.approx(100 * 2 / 4)
+    assert k["current_label"] == "num_ctx 4,096 (default)"
 
 
 def test_truncation_by_step_shows_num_ctx_only_where_set(records):
@@ -115,7 +117,7 @@ def test_truncation_by_step_omits_steps_with_no_calls():
 def test_all_at_ceiling_false_when_a_truncation_misses_the_ceiling():
     records = [_llm(done="length", total=2048), _llm()]
 
-    assert mr.summarize(records)["kpis"]["all_at_ceiling"] is False
+    assert mr.summarize(records)["cohorts"][0]["all_at_ceiling"] is False
 
 
 def test_token_bins_split_and_fold_the_overflow(records):
@@ -191,7 +193,8 @@ def test_summarize_handles_no_records():
 
     assert summary["kpis"]["runs"] == 0
     assert summary["kpis"]["truncated_pct"] == 0.0
-    assert summary["kpis"]["all_at_ceiling"] is False
+    assert summary["kpis"]["current_trunc_pct"] == 0.0
+    assert summary["cohorts"] == []
     assert summary["topics"] == [] and summary["runs"] == []
 
 
@@ -216,9 +219,9 @@ def test_render_html_is_self_contained_and_carries_the_headline(records):
 
     assert page.startswith("<!doctype html>")
     assert "https://" not in page and "<script" not in page
-    # The 4096 finding, its cause, and both theme scopes.
+    # The 4096 finding, scoped to the cohort it describes, and both theme scopes.
     assert "4,096 tokens" in page
-    assert "src/news/agent.py:383" in page
+    assert "Under num_ctx 4,096 (default)" in page
     assert 'prefers-color-scheme: dark' in page
     assert ':root[data-theme="dark"]' in page
     # Three charts, each with a table view for the contrast-relief rule.
@@ -291,3 +294,148 @@ def test_module_runs_as_a_script(tmp_path, records, monkeypatch):
         runpy.run_module("news.metrics_report", run_name="__main__")
 
     assert exc.value.code == 0
+
+
+# ---------------------------------------------------------------------------
+# cohorts — before/after a config change
+# ---------------------------------------------------------------------------
+
+
+def _judge(run_id, output, done, **extra):
+    return _llm(step="judge_batch", tokens=1050, total=1050 + output, done=done,
+                run_id=run_id, success=True, **extra)
+
+
+@pytest.fixture
+def two_cohorts():
+    """One run per era, shaped like the real before/after.
+
+    Pre-change: prompts capped below 4,096, responses cut off there, an unbounded
+    judge runaway. Post-change: prompts above the old ceiling, nothing cut off, a
+    judge runaway bounded at exactly the cap.
+    """
+    pre, post = "2026-07-28T03:00:00+00:00", "2026-07-30T01:00:00+00:00"
+    return [
+        # --- num_ctx unset: Ollama's 4096 default ---
+        _llm(tokens=2000, total=2400, run_id=pre, tool_call_count=1),
+        _llm(tokens=3800, total=4096, done="length", run_id=pre, tool_call_count=0),
+        _judge(pre, 2900, "length"),
+        {"type": "step", "run_id": pre, "step": "run", "elapsed_s": 730.0,
+         "topics": 65, "new_articles": 22},
+        # --- num_ctx raised to 16384 ---
+        _llm(tokens=5200, total=5600, num_ctx=16384, run_id=post, tool_call_count=2),
+        _llm(tokens=2000, total=2400, num_ctx=16384, run_id=post, tool_call_count=2),
+        _judge(post, 256, "length", num_predict=256),
+        {"type": "step", "run_id": post, "step": "run", "elapsed_s": 660.0,
+         "topics": 65, "new_articles": 24},
+    ]
+
+
+def test_cohorts_split_on_whether_num_ctx_was_logged(two_cohorts):
+    cohorts = mr.summarize(two_cohorts)["cohorts"]
+
+    assert [c["label"] for c in cohorts] == ["num_ctx 4,096 (default)", "num_ctx 16,384"]
+    assert cohorts[0]["num_ctx"] is None  # absence dates the run to the default era
+    assert cohorts[1]["num_ctx"] == 16384
+
+
+def test_cohorts_are_ordered_oldest_first(two_cohorts):
+    cohorts = mr.summarize(two_cohorts)["cohorts"]
+
+    assert cohorts[0]["first_run"] < cohorts[1]["first_run"]
+
+
+def test_each_cohort_is_measured_only_on_its_own_runs(two_cohorts):
+    pre, post = mr.summarize(two_cohorts)["cohorts"]
+
+    # Pre-change: 1 of 2 agent calls truncated. Post-change: none of 2.
+    assert (pre["agent_calls"], pre["truncated"]) == (2, 1)
+    assert (post["agent_calls"], post["truncated"]) == (2, 0)
+    assert pre["truncated_pct"] == 50.0
+    assert post["truncated_pct"] == 0.0
+    # The truncated pre-change step emitted no tool call — a wasted iteration.
+    assert pre["truncated_no_tool"] == 1
+    assert post["truncated_no_tool"] == 0
+
+
+def test_headline_kpi_tracks_the_current_config_not_the_pool(two_cohorts):
+    """Pooling would drag a working fix into a slow drift instead of a step change."""
+    k = mr.summarize(two_cohorts)["kpis"]
+
+    assert k["current_label"] == "num_ctx 16,384"
+    assert k["current_trunc_pct"] == 0.0
+    # The all-time pooled figure is still non-zero — that's the number we avoid.
+    assert k["truncated_pct"] > 0
+
+
+def test_prompts_above_the_old_ceiling_are_counted(two_cohorts):
+    """The one signal that says inputs were clipped, not just outputs."""
+    pre, post = mr.summarize(two_cohorts)["cohorts"]
+
+    assert pre["prompts_over_ceiling"] == 0  # impossible under a 4096 window
+    assert post["prompts_over_ceiling"] == 1
+
+
+def test_capped_judge_runaways_still_count_as_runaways(two_cohorts):
+    """A cap bounds a runaway's cost; it does not prevent it.
+
+    The capped call stops at exactly num_predict, so a `>` test would report zero
+    and make the cap look like a cure.
+    """
+    pre, post = mr.summarize(two_cohorts)["cohorts"]
+
+    assert post["judge_runaways"] == 1
+    assert pre["judge_runaways"] == 1
+
+
+def test_cohort_stats_survive_a_cohort_with_no_runs():
+    """agent_step records can exist for a run whose `run` record never landed."""
+    stats = mr._cohort_stats([_llm()], None, {"2026-07-28T03:29:53+00:00"})
+
+    assert stats["runs"] == 0
+    assert stats["median_wall_s"] == 0.0
+    assert stats["mean_tool_calls"] == 0.0
+
+
+def test_render_shows_the_comparison_table_only_when_configs_differ(records, two_cohorts):
+    one = mr.render_html(mr.summarize(records))
+    both = mr.render_html(mr.summarize(two_cohorts))
+
+    assert 'table class="cohort"' not in one
+    assert 'table class="cohort"' in both
+    assert "Before and after the context change" in both
+
+
+def test_comparison_marks_direction_not_just_magnitude(two_cohorts):
+    page = mr.render_html(mr.summarize(two_cohorts))
+
+    # Falling truncation and rising prompt sizes are both improvements, and the
+    # arrow carries that so the meaning survives without color.
+    assert 'class="delta good">↓' in page
+    assert 'class="delta good">↑' in page
+
+
+def test_histograms_are_small_multiples_one_per_cohort(records, two_cohorts):
+    one = mr.render_html(mr.summarize(records))
+    both = mr.render_html(mr.summarize(two_cohorts))
+
+    assert one.count("<svg") == 3
+    assert both.count("<svg") == 4  # the extra panel is the second cohort
+    assert both.count('class="panel-title"') == 2
+
+
+def test_ceiling_note_stays_scoped_to_the_cohort_it_describes(two_cohorts):
+    """A later config change must not silently delete the earlier explanation."""
+    page = mr.render_html(mr.summarize(two_cohorts))
+
+    assert "Under num_ctx 4,096 (default)" in page
+
+
+def test_render_falls_back_when_there_are_no_agent_steps():
+    """No agent_step records means no cohorts, but the page must still render."""
+    records = [_llm(step="judge_batch"), _step("run", 10.0, new_articles=1)]
+
+    page = mr.render_html(mr.summarize(records))
+
+    assert page.count("<svg") == 3
+    assert 'table class="cohort"' not in page

@@ -9,9 +9,14 @@ Stdlib only — no matplotlib, no plotly, no JS. Run it with `make report`.
 
 Layout:
   KPI row       runs, wall time, where the time goes, truncation, failures, yield
-  Chart 1       input tokens vs truncation — the 4096 ceiling (agent_step only)
+  Comparison    before/after table, when runs span more than one agent config
+  Chart 1       input tokens vs truncation, one panel per config, shared scale
   Chart 2       per-topic-batch cost, with an aligned failure-count panel
   Chart 3       cost vs yield across runs (two panels, one shared x axis)
+
+Runs are grouped into cohorts by the `num_ctx` logged on their agent steps, so a
+config change shows up as a step change rather than being averaged away against
+every run that came before it.
 
 Aggregation (`summarize`) is pure and separate from rendering so the numbers can
 be tested without parsing HTML.
@@ -41,6 +46,11 @@ PIPELINE_STEPS = ("search_batch", "judge_articles", "summarize_day")
 
 # Buckets in the sequential ramp used for per-topic cost (--ramp-1 … --ramp-N).
 RAMP_STEPS = 4
+# Mirrors JUDGE_NUM_PREDICT in agent.py. A judge verdict is ~41 tokens; anything
+# past this was a runaway, and capping bounds its cost rather than preventing it —
+# so a capped runaway still reports done_reason "length". Counting those as
+# "truncated" alongside real agent truncations would blend two unlike things.
+JUDGE_OUTPUT_CAP = 256
 
 
 # --------------------------------------------------------------------------
@@ -169,6 +179,75 @@ def _run_rows(records: list[dict]) -> list[dict]:
     return rows
 
 
+def _run_cohorts(records: list[dict]) -> dict[str, int | None]:
+    """Map each run_id to the agent context window that run used.
+
+    `num_ctx` is only logged from the point the agent started setting it, so its
+    absence dates a run to the era of Ollama's 4096-token default. That makes it
+    the pre/post marker for a config change, with no backfill needed.
+    """
+    cohorts: dict[str, int | None] = {}
+    for r in _llm_calls(records, "agent_step"):
+        run_id = r.get("run_id") or ""
+        if cohorts.get(run_id) is None:
+            cohorts[run_id] = r.get("num_ctx")
+    return cohorts
+
+
+def _cohort_stats(records: list[dict], num_ctx: int | None, run_ids: set) -> dict:
+    """The signals worth comparing across a config change, for one cohort."""
+    sub = [r for r in records if r.get("run_id") in run_ids]
+    agent = _llm_calls(sub, "agent_step")
+    judge = _llm_calls(sub, "judge_batch")
+    llm = _llm_calls(sub)
+    runs = _run_rows(sub)
+
+    truncated = [r for r in agent if r.get("done_reason") == "length"]
+    tool_counts = [r["tool_call_count"] for r in agent if r.get("tool_call_count") is not None]
+    stalls = [r for r in llm if (r.get("load_duration_ns") or 0) > 1e9]
+    # Prompts above the old default are only possible once the window is raised —
+    # the one signal that says whether inputs were being clipped, not just outputs.
+    over = [r for r in agent if (r.get("input_tokens") or 0) > CONTEXT_CEILING]
+    # `>=`, not `>`: a capped runaway stops at exactly num_predict, so a `>` test
+    # would report zero runaways the moment the cap starts working and make the
+    # cap look like a cure rather than a bound. No legitimate verdict comes close
+    # (the largest observed is 152 tokens).
+    runaways = [r for r in judge if (r.get("output_tokens") or 0) >= JUDGE_OUTPUT_CAP]
+
+    return {
+        "num_ctx": num_ctx,
+        "label": f"num_ctx {num_ctx:,}" if num_ctx else f"num_ctx {CONTEXT_CEILING:,} (default)",
+        "runs": len(runs),
+        "agent_calls": len(agent),
+        "truncated": len(truncated),
+        "truncated_pct": _pct(len(truncated), len(agent)),
+        "truncated_no_tool": sum(1 for r in truncated if r.get("tool_call_count") == 0),
+        "prompts_over_ceiling": len(over),
+        "mean_tool_calls": (sum(tool_counts) / len(tool_counts)) if tool_counts else 0.0,
+        "judge_runaways": len(runaways),
+        "judge_runaway_s": sum(r.get("elapsed_s") or 0.0 for r in runaways),
+        "load_stall_pct": _pct(len(stalls), len(llm)),
+        "median_wall_s": _median([r["wall_s"] for r in runs]),
+        "steps_per_run": _median(list(Counter(r.get("run_id") for r in agent).values())),
+        "token_bins": _token_bins(agent),
+        "all_at_ceiling": bool(truncated) and all(
+            r.get("total_tokens") == CONTEXT_CEILING for r in truncated
+        ),
+        "first_run": min(run_ids) if run_ids else "",
+    }
+
+
+def _cohorts(records: list[dict]) -> list[dict]:
+    """One entry per distinct agent config, oldest first."""
+    by_run = _run_cohorts(records)
+    groups: dict[int | None, set] = defaultdict(set)
+    for run_id, num_ctx in by_run.items():
+        groups[num_ctx].add(run_id)
+    stats = [_cohort_stats(records, ctx, ids) for ctx, ids in groups.items()]
+    stats.sort(key=lambda c: c["first_run"])
+    return stats
+
+
 def summarize(records: list[dict]) -> dict:
     """Roll the raw records up into everything the page renders."""
     calls = _llm_calls(records)
@@ -191,10 +270,11 @@ def summarize(records: list[dict]) -> dict:
     judged = sum(r.get("articles_judged") or 0 for r in _steps(records, "judge_articles"))
     deleted = sum(r.get("articles_deleted") or 0 for r in _steps(records, "judge_articles"))
     failures = [r for r in records if r.get("success") is False]
-    ceiling_hits = [
-        r for r in calls
-        if r.get("done_reason") == "length" and r.get("total_tokens") == CONTEXT_CEILING
-    ]
+    cohorts = _cohorts(records)
+    # Headline truncation is the *current* config's rate, not the all-time average.
+    # Pooling them would let a fixed pile of old failures drag a working fix down
+    # into a slow drift instead of showing the step change.
+    current = cohorts[-1] if cohorts else None
 
     return {
         "kpis": {
@@ -203,13 +283,16 @@ def summarize(records: list[dict]) -> dict:
             "llm_calls": len(calls),
             "truncated": truncated,
             "truncated_pct": _pct(truncated, len(calls)),
-            "all_at_ceiling": len(ceiling_hits) == truncated and truncated > 0,
+            "current_trunc_pct": current["truncated_pct"] if current else 0.0,
+            "current_label": current["label"] if current else "",
+            "current_runs": current["runs"] if current else 0,
             "search_share_pct": step_share[0]["pct"] if step_share else 0.0,
             "failures": len(failures),
             "judged": judged,
             "deleted": deleted,
             "new_articles": sum(r["new_articles"] for r in runs),
         },
+        "cohorts": cohorts,
         "token_bins": _token_bins(agent_calls),
         "truncation_by_step": _truncation_by_step(records),
         "step_share": step_share,
@@ -246,12 +329,16 @@ def _axis_label(x: float, y: float, text: str, anchor: str = "middle") -> str:
     )
 
 
-def svg_stacked_histogram(bins: list[dict]) -> str:
-    """Chart 1 — input tokens vs truncation, stacked, with the 4096 rule."""
+def svg_stacked_histogram(bins: list[dict], y_max: float | None = None) -> str:
+    """Chart 1 — input tokens vs truncation, stacked, with the 4096 rule.
+
+    *y_max* is passed in when this is rendered as small multiples per config
+    cohort, so the panels share one scale and are actually comparable.
+    """
     w, h = 880, 340
     pad_l, pad_r, pad_t, pad_b = 56, 16, 24, 56
     plot_w, plot_h = w - pad_l - pad_r, h - pad_t - pad_b
-    y_max = _nice_max(max((b["total"] for b in bins), default=1))
+    y_max = y_max or _nice_max(max((b["total"] for b in bins), default=1))
     slot = plot_w / max(len(bins), 1)
     bar_w = min(slot - 10, 64)
 
@@ -413,7 +500,7 @@ STYLE = """
   --page: #f9f9f7; --surface: #fcfcfb;
   --text: #0b0b0b; --text-2: #52514e; --muted: #898781;
   --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
-  --series-1: #2a78d6; --series-3: #1baf7a; --critical: #d03b3b;
+  --series-1: #2a78d6; --series-3: #1baf7a; --critical: #d03b3b; --good: #006300;
   /* Ordinal blue ramp, low→high magnitude. On the light surface that means
      light→dark (no lighter than step 250, the 2:1 floor). Four steps, not
      more: six packed the range so tightly that adjacent steps failed the
@@ -426,7 +513,7 @@ STYLE = """
     --page: #0d0d0d; --surface: #1a1a19;
     --text: #ffffff; --text-2: #c3c2b7; --muted: #898781;
     --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
-    --series-1: #3987e5; --series-3: #199e70; --critical: #d03b3b;
+    --series-1: #3987e5; --series-3: #199e70; --critical: #d03b3b; --good: #0ca30c;
     /* Reversed for the dark surface: high magnitude must stay the most
        prominent mark, so the ramp runs dark→light (no darker than step 600). */
     --ramp-1: #184f95; --ramp-2: #2a78d6; --ramp-3: #6da7ec; --ramp-4: #b7d3f6;
@@ -437,7 +524,7 @@ STYLE = """
   --page: #0d0d0d; --surface: #1a1a19;
   --text: #ffffff; --text-2: #c3c2b7; --muted: #898781;
   --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
-  --series-1: #3987e5; --series-3: #199e70; --critical: #d03b3b;
+  --series-1: #3987e5; --series-3: #199e70; --critical: #d03b3b; --good: #0ca30c;
   --ramp-1: #184f95; --ramp-2: #2a78d6; --ramp-3: #6da7ec; --ramp-4: #b7d3f6;
 }
 * { box-sizing: border-box; }
@@ -484,6 +571,15 @@ summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
 table { border-collapse: collapse; width: 100%; margin-top: 10px; font-size: 13px; }
 th, td { text-align: left; padding: 5px 10px; border-bottom: 1px solid var(--border); }
 td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+table.cohort { margin-top: 4px; font-size: 13.5px; }
+table.cohort th { color: var(--text-2); font-weight: 600; }
+table.cohort tbody tr:hover { background: var(--page); }
+.panel-title { color: var(--text-2); font-size: 13px; font-weight: 600; margin: 14px 0 2px; }
+.delta { font-weight: 600; }
+/* Direction is carried by the arrow glyph as well as the color, so the
+   good/bad distinction survives for red-green colorblind readers. */
+.delta.good { color: var(--good); }
+.delta.bad { color: var(--critical); }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em; }
 """
 
@@ -512,34 +608,102 @@ def _kpi(value: str, label: str, alert: bool = False) -> str:
     return f'<div class="{cls}"><div class="v">{_esc(value)}</div><div class="k">{_esc(label)}</div></div>'
 
 
+#: Comparison rows: (label, key, formatter, "lower is better"). The direction
+#: matters — it decides which way an arrow reads as an improvement.
+COHORT_METRICS = (
+    ("pipeline runs", "runs", lambda v: f"{v:,.0f}", None),
+    ("agent-loop calls", "agent_calls", lambda v: f"{v:,.0f}", None),
+    ("agent steps truncated", "truncated_pct", lambda v: f"{v:.1f}%", True),
+    ("…of those, emitting no tool call", "truncated_no_tool", lambda v: f"{v:,.0f}", True),
+    ("prompts above 4,096 tokens", "prompts_over_ceiling", lambda v: f"{v:,.0f}", False),
+    ("mean tool calls per step", "mean_tool_calls", lambda v: f"{v:.2f}", False),
+    ("agent steps per run (median)", "steps_per_run", lambda v: f"{v:,.0f}", None),
+    ("judge runaways (≥256 tokens out)", "judge_runaways", lambda v: f"{v:,.0f}", True),
+    ("…seconds burned on them", "judge_runaway_s", lambda v: f"{v:,.0f}s", True),
+    ("model load stalls >1s", "load_stall_pct", lambda v: f"{v:.1f}%", True),
+    ("median run duration", "median_wall_s", lambda v: f"{v / 60:.1f} min", None),
+)
+
+
+def _cohort_table(cohorts: list[dict]) -> str:
+    """Before/after comparison. Each config gets a column; the last is current."""
+    head = "".join(f'<th class="n">{_esc(c["label"])}</th>' for c in cohorts)
+    rows = []
+    for label, key, fmt, lower_better in COHORT_METRICS:
+        cells = "".join(f'<td class="n">{_esc(fmt(c[key]))}</td>' for c in cohorts)
+        delta = ""
+        if len(cohorts) > 1 and lower_better is not None:
+            first, last = cohorts[0][key], cohorts[-1][key]
+            if first != last:
+                better = (last < first) if lower_better else (last > first)
+                arrow = "↓" if last < first else "↑"
+                cls = "good" if better else "bad"
+                delta = f'<span class="delta {cls}">{arrow} {fmt(abs(last - first))}</span>'
+        rows.append(f'<tr><td>{_esc(label)}</td>{cells}<td class="n">{delta}</td></tr>')
+    return (
+        f'<table class="cohort"><thead><tr><th>signal</th>{head}'
+        f'<th class="n">change</th></tr></thead><tbody>{"".join(rows)}</tbody></table>'
+    )
+
+
 def render_html(summary: dict) -> str:
     k = summary["kpis"]
-    bins, topics, runs = summary["token_bins"], summary["topics"], summary["runs"]
+    topics, runs = summary["topics"], summary["runs"]
     by_step = summary["truncation_by_step"]
+    cohorts = summary["cohorts"]
 
     kpis = "".join([
         _kpi(str(k["runs"]), "pipeline runs"),
         _kpi(f'{k["median_wall_s"] / 60:.1f} min', "median run duration"),
         _kpi(f'{k["search_share_pct"]:.1f}%', "of wall time in search"),
-        _kpi(f'{k["truncated_pct"]:.1f}%', f'of {k["llm_calls"]:,} LLM calls truncated', alert=True),
+        _kpi(f'{k["current_trunc_pct"]:.1f}%',
+             f'agent steps truncated — {k["current_label"]}, {k["current_runs"]} runs',
+             alert=k["current_trunc_pct"] > 1),
         _kpi(str(k["failures"]), "failed searches", alert=bool(k["failures"])),
         _kpi(f'{k["new_articles"]}', "new articles stored"),
     ])
 
+    # Scoped to whichever cohort it describes, so a later config change cannot
+    # silently delete the explanation of what the earlier one was doing wrong.
     ceiling_note = ""
-    if k["all_at_ceiling"]:
+    stuck = next((c for c in cohorts if c["all_at_ceiling"] and not c["num_ctx"]), None)
+    if stuck:
         rows = "; ".join(
             f'<code>{_esc(r["step"])}</code> {r["pct"]:.1f}%'
             + (f' (num_ctx {r["num_ctx"]:,})' if r["num_ctx"] else " (num_ctx unset)")
             for r in by_step
         )
         ceiling_note = (
-            f'<p class="note"><b>All {k["truncated"]} truncated responses stopped at exactly '
-            f'{CONTEXT_CEILING:,} tokens.</b> {rows}. The one step that sets '
-            f'<code>num_ctx</code> explicitly is the only one that never truncates — '
-            f'<code>src/news/agent.py:383</code> builds the agent model without it, so '
-            f"Ollama's {CONTEXT_CEILING:,}-token default applies.</p>"
+            f'<p class="note"><b>Under {stuck["label"]}, all {stuck["truncated"]} truncated '
+            f'agent responses stopped at exactly {CONTEXT_CEILING:,} tokens.</b> {rows}. '
+            f'The one step that sets <code>num_ctx</code> explicitly is the only one that '
+            f'never truncates — the agent model was built without it, so Ollama\'s '
+            f'{CONTEXT_CEILING:,}-token default applied.</p>'
         )
+
+    comparison = ""
+    if len(cohorts) > 1:
+        comparison = f"""
+<figure>
+  <figcaption>
+    <div class="t">Before and after the context change</div>
+    <div class="d">Runs grouped by the agent context window they ran under.
+      Each config is measured on its own runs — pooling them would average a fixed
+      pile of old failures against new successes and turn a step change into a drift.</div>
+  </figcaption>
+  <div class="scroll">{_cohort_table(cohorts)}</div>
+</figure>"""
+
+    # Small multiples, one per config, sharing a y scale so they compare honestly.
+    y_max = _nice_max(max(
+        (b["total"] for c in cohorts for b in c["token_bins"]), default=1
+    ))
+    histograms = "".join(
+        f'<div class="panel-title">{_esc(c["label"])} — {c["runs"]} runs, '
+        f'{c["truncated_pct"]:.1f}% truncated</div>'
+        + svg_stacked_histogram(c["token_bins"], y_max=y_max)
+        for c in cohorts
+    ) or svg_stacked_histogram(summary["token_bins"])
 
     err_rows = "".join(
         f'<li>{count}× <code>{_esc(msg[:80])}</code></li>' for msg, count in summary["errors"][:4]
@@ -557,22 +721,25 @@ def render_html(summary: dict) -> str:
 
 <div class="kpis">{kpis}</div>
 {ceiling_note}
+{comparison}
 
 <figure>
   <figcaption>
-    <div class="t">Every truncation hits the same wall</div>
-    <div class="d">Agent-loop calls by prompt size. Past ~3.5k input tokens the
-      response is more likely than not to be cut off; past 4k it always is.</div>
+    <div class="t">Where the responses get cut off</div>
+    <div class="d">Agent-loop calls by prompt size, one panel per context window,
+      sharing a scale. Under the 4,096 default, a prompt past ~3.5k tokens is more
+      likely than not to have its response cut off; past 4k it always is.</div>
   </figcaption>
-  {svg_stacked_histogram(bins)}
+  {histograms}
   <ul class="legend">
     <li><span class="swatch" style="background:var(--series-1)"></span>completed normally</li>
-    <li><span class="swatch" style="background:var(--critical)"></span>truncated at the {CONTEXT_CEILING:,}-token limit</li>
+    <li><span class="swatch" style="background:var(--critical)"></span>truncated at the context limit</li>
   </ul>
   {_details("Show data table", _table(
-      ["input tokens", "calls", "truncated", "% truncated"],
-      [[b["label"], b["total"], b["truncated"], f'{b["pct_truncated"]:.1f}%'] for b in bins],
-      {1, 2, 3}))}
+      ["config", "input tokens", "calls", "truncated", "% truncated"],
+      [[c["label"], b["label"], b["total"], b["truncated"], f'{b["pct_truncated"]:.1f}%']
+       for c in cohorts for b in c["token_bins"]],
+      {2, 3, 4}))}
 </figure>
 
 <figure>
