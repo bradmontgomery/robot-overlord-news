@@ -549,6 +549,12 @@ mark {
   line-height: 1.25;
   color: var(--text);
   max-width: 60ch;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.presentation-title:hover {
+  text-decoration: underline;
 }
 
 .presentation-summary {

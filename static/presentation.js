@@ -128,6 +128,7 @@
 
     if (articles.length === 0) {
       titleEl.textContent = "Nothing to present";
+      titleEl.removeAttribute("href");
       summaryEl.textContent = "No articles match the current view.";
       metaEl.textContent = "";
       counterEl.textContent = "";
@@ -139,6 +140,11 @@
 
     var a = articles[index];
     titleEl.textContent = a.Title || "(no title)";
+    if (a.URL) {
+      titleEl.href = a.URL;
+    } else {
+      titleEl.removeAttribute("href");
+    }
     summaryEl.textContent = a.Summary || "";
     metaEl.textContent = metaLine(a);
     counterEl.textContent = (index + 1) + " / " + articles.length;
@@ -211,7 +217,7 @@
       '<button class="presentation-close" type="button" aria-label="Close presentation">✕</button>' +
       '<div class="presentation-progress"><div class="presentation-progress-bar"></div></div>' +
       '<div class="presentation-meta"></div>' +
-      '<div class="presentation-title"></div>' +
+      '<a class="presentation-title" target="_blank" rel="noopener"></a>' +
       '<div class="presentation-summary"></div>' +
       '<div class="presentation-controls">' +
       '<button class="presentation-prev" type="button" aria-label="Previous article">&larr;</button>' +
