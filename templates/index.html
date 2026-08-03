@@ -1,19 +1,5 @@
 {{ define "content" }}
-{{ if .DailyCounts }}
-<div class="histogram" aria-label="Articles fetched per day, last 10 days">
-  <div class="histogram-bars">
-    {{ range .DailyCounts }}
-    <a class="histogram-bar{{ if eq .Date $.FilterDate }} active{{ end }}"
-       href="/?date={{ .Date }}{{ if $.FilterTopic }}&topic={{ $.FilterTopic }}{{ end }}"
-       title="{{ .Label }}: {{ .Count }} article{{ if ne .Count 1 }}s{{ end }}">
-      <span class="histogram-count">{{ .Count }}</span>
-      <span class="histogram-track"><span class="histogram-fill" style="height:{{ .Pct }}%"></span></span>
-      <span class="histogram-label">{{ .Label }}</span>
-    </a>
-    {{ end }}
-  </div>
-</div>
-{{ end }}
+{{ template "histogram" . }}
 
 <div class="filter-bar">
   {{ if .FilterTopic }}

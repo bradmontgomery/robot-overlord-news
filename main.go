@@ -42,6 +42,11 @@ type DayCount struct {
 	Pct   int // bar height as percent of the busiest day (0-100)
 }
 
+type NameCount struct {
+	Name  string
+	Count int
+}
+
 type PageData struct {
 	Articles     []Article
 	Topics       []string
@@ -51,12 +56,15 @@ type PageData struct {
 	FilterDate   string
 	RecentDates  []string
 	DailyCounts  []DayCount
+	TopicCounts  []NameCount
+	SourceCounts []NameCount
 	TotalCount   int
 	DailySummary string
 }
 
 var db *sql.DB
-var tmpl *template.Template
+var indexTmpl *template.Template
+var statsTmpl *template.Template
 
 func main() {
 	dbPath := os.Getenv("NEWS_DB")
@@ -95,14 +103,7 @@ func main() {
 			return s
 		},
 		"topicColor": topicColor,
-		"domain": func(rawURL string) string {
-			u, err := url.Parse(rawURL)
-			if err != nil || u.Host == "" {
-				return ""
-			}
-			host := u.Hostname()
-			return strings.TrimPrefix(host, "www.")
-		},
+		"domain":     fqdn,
 		"formatDate": func(dateStr string) string {
 			t, err := time.Parse("2006-01-02", dateStr)
 			if err != nil {
@@ -141,13 +142,21 @@ func main() {
 		},
 	}
 
-	tmpl, err = template.New("").Funcs(funcMap).ParseFS(content, "templates/*.html")
+	indexTmpl, err = template.New("").Funcs(funcMap).ParseFS(content,
+		"templates/base.html", "templates/index.html", "templates/histogram.html")
 	if err != nil {
-		log.Fatalf("parse templates: %v", err)
+		log.Fatalf("parse index templates: %v", err)
+	}
+
+	statsTmpl, err = template.New("").Funcs(funcMap).ParseFS(content,
+		"templates/base.html", "templates/stats.html", "templates/histogram.html")
+	if err != nil {
+		log.Fatalf("parse stats templates: %v", err)
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleIndex)
+	mux.HandleFunc("/stats", handleStats)
 	mux.HandleFunc("/api/present", handlePresent)
 	mux.Handle("/static/", http.FileServer(http.FS(content)))
 
@@ -170,10 +179,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		page = p
 	}
 
-	recentDates := make([]string, 5)
-	for i := 0; i < 5; i++ {
-		recentDates[i] = time.Now().AddDate(0, 0, -i).Format("2006-01-02")
-	}
+	recentDates := lastNDates(5)
 
 	summaryDate := dateFilter
 	if summaryDate == "" {
@@ -224,7 +230,62 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := tmpl.ExecuteTemplate(w, "base.html", data); err != nil {
+	if err := indexTmpl.ExecuteTemplate(w, "base.html", data); err != nil {
+		log.Println("template:", err)
+	}
+}
+
+const statsDays = 10
+
+// handleStats serves a stand-alone page summarizing article activity over
+// the last statsDays days: the daily histogram plus per-topic and
+// per-source (FQDN) counts.
+func handleStats(w http.ResponseWriter, r *http.Request) {
+	topics, err := getTopics()
+	if err != nil {
+		http.Error(w, "db error", 500)
+		log.Println("getTopics:", err)
+		return
+	}
+
+	total, err := getTotalCount()
+	if err != nil {
+		http.Error(w, "db error", 500)
+		log.Println("getTotalCount:", err)
+		return
+	}
+
+	dailyCounts, err := getDailyCounts(statsDays)
+	if err != nil {
+		log.Println("getDailyCounts:", err)
+		dailyCounts = nil
+	}
+
+	topicCounts, err := getTopicCounts(statsDays)
+	if err != nil {
+		http.Error(w, "db error", 500)
+		log.Println("getTopicCounts:", err)
+		return
+	}
+
+	sourceCounts, err := getSourceCounts(statsDays)
+	if err != nil {
+		http.Error(w, "db error", 500)
+		log.Println("getSourceCounts:", err)
+		return
+	}
+
+	data := PageData{
+		Topics:       topics,
+		TotalCount:   total,
+		RecentDates:  lastNDates(5),
+		DailyCounts:  dailyCounts,
+		TopicCounts:  topicCounts,
+		SourceCounts: sourceCounts,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := statsTmpl.ExecuteTemplate(w, "base.html", data); err != nil {
 		log.Println("template:", err)
 	}
 }
@@ -284,26 +345,110 @@ func getTopics() ([]string, error) {
 		return nil, err
 	}
 
-	type topicCount struct {
-		name  string
-		count int
-	}
-	tc := make([]topicCount, 0, len(counts))
-	for name, cnt := range counts {
-		tc = append(tc, topicCount{name, cnt})
-	}
-	sort.Slice(tc, func(i, j int) bool {
-		if tc[i].count != tc[j].count {
-			return tc[i].count > tc[j].count
-		}
-		return tc[i].name < tc[j].name
-	})
-
-	topics := make([]string, len(tc))
-	for i, t := range tc {
-		topics[i] = t.name
+	nc := sortedNameCounts(counts)
+	topics := make([]string, len(nc))
+	for i, t := range nc {
+		topics[i] = t.Name
 	}
 	return topics, nil
+}
+
+// sortedNameCounts converts a name->count map into a slice sorted by count
+// desc, then name asc.
+func sortedNameCounts(counts map[string]int) []NameCount {
+	nc := make([]NameCount, 0, len(counts))
+	for name, cnt := range counts {
+		nc = append(nc, NameCount{name, cnt})
+	}
+	sort.Slice(nc, func(i, j int) bool {
+		if nc[i].Count != nc[j].Count {
+			return nc[i].Count > nc[j].Count
+		}
+		return nc[i].Name < nc[j].Name
+	})
+	return nc
+}
+
+// cutoffDate returns the earliest calendar date (inclusive) covered by a
+// window of the last `days` days, ending today.
+func cutoffDate(days int) string {
+	return time.Now().AddDate(0, 0, -(days - 1)).Format("2006-01-02")
+}
+
+// getTopicCounts returns per-topic article counts for the last `days` days.
+func getTopicCounts(days int) ([]NameCount, error) {
+	rows, err := db.Query(`SELECT topic FROM news_results WHERE DATE(fetched_at) >= ?`, cutoffDate(days))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	counts := map[string]int{}
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		for _, t := range splitTopics(raw) {
+			counts[t]++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return sortedNameCounts(counts), nil
+}
+
+// getSourceCounts returns per-source (FQDN) article counts for the last
+// `days` days. URL parsing can't be done cleanly in SQL, so the tally
+// happens in Go using fqdn().
+func getSourceCounts(days int) ([]NameCount, error) {
+	rows, err := db.Query(`SELECT url FROM news_results WHERE DATE(fetched_at) >= ?`, cutoffDate(days))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	counts := map[string]int{}
+	for rows.Next() {
+		var rawURL string
+		if err := rows.Scan(&rawURL); err != nil {
+			return nil, err
+		}
+		if d := fqdn(rawURL); d != "" {
+			counts[d]++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return sortedNameCounts(counts), nil
+}
+
+// getTotalCount returns the total number of articles, ignoring any filter.
+func getTotalCount() (int, error) {
+	var total int
+	err := db.QueryRow(`SELECT COUNT(*) FROM news_results`).Scan(&total)
+	return total, err
+}
+
+// fqdn extracts the hostname from a URL, stripped of a leading "www.".
+func fqdn(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return strings.TrimPrefix(u.Hostname(), "www.")
+}
+
+// lastNDates returns the last n calendar dates (today first, oldest last)
+// formatted as "2006-01-02".
+func lastNDates(n int) []string {
+	dates := make([]string, n)
+	for i := 0; i < n; i++ {
+		dates[i] = time.Now().AddDate(0, 0, -i).Format("2006-01-02")
+	}
+	return dates
 }
 
 func splitTopics(raw string) []string {
@@ -400,11 +545,10 @@ func getAllArticles(topic, date string) ([]Article, error) {
 // is a fixed overview of all articles and ignores any active topic/date filter.
 func getDailyCounts(days int) ([]DayCount, error) {
 	now := time.Now()
-	cutoff := now.AddDate(0, 0, -(days - 1)).Format("2006-01-02")
 
 	rows, err := db.Query(
 		`SELECT DATE(fetched_at) AS d, COUNT(*) FROM news_results WHERE DATE(fetched_at) >= ? GROUP BY d`,
-		cutoff,
+		cutoffDate(days),
 	)
 	if err != nil {
 		return nil, err

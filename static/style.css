@@ -79,6 +79,9 @@ header h1 span { color: var(--accent-light); }
 }
 
 .theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   background: none;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -88,10 +91,11 @@ header h1 span { color: var(--accent-light); }
   line-height: 1;
   cursor: pointer;
   color: var(--text-muted);
+  text-decoration: none;
   transition: background 0.1s, color 0.1s;
 }
 
-.theme-toggle:hover { background: var(--surface2); color: var(--text); }
+.theme-toggle:hover { background: var(--surface2); color: var(--text); text-decoration: none; }
 
 aside {
   background: var(--surface);
@@ -229,6 +233,69 @@ main {
 .histogram-bar.active .histogram-count,
 .histogram-bar.active .histogram-label {
   color: var(--text);
+}
+
+.stats-heading {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.25rem;
+}
+
+@media (max-width: 700px) {
+  .stats-grid { grid-template-columns: 1fr; }
+}
+
+.stats-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem 1.25rem;
+}
+
+.stats-panel h3 {
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-bottom: 0.75rem;
+}
+
+.stats-list { list-style: none; }
+
+.stats-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+
+.stats-list li:last-child { border-bottom: none; }
+
+.stats-list-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.stats-list-count {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.stats-empty {
+  color: var(--text-muted);
+  font-size: 0.85rem;
 }
 
 .search-bar {

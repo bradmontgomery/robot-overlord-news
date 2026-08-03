@@ -1,0 +1,40 @@
+{{ define "content" }}
+<h2 class="stats-heading">Stats — last 10 days</h2>
+
+{{ template "histogram" . }}
+
+<div class="stats-grid">
+  <section class="stats-panel">
+    <h3>Articles per topic</h3>
+    {{ if .TopicCounts }}
+    <ul class="stats-list">
+      {{ range .TopicCounts }}
+      <li>
+        <span class="topic-dot" style="background:{{ topicColor .Name }}"></span>
+        <span class="stats-list-name">{{ .Name }}</span>
+        <span class="stats-list-count">{{ .Count }}</span>
+      </li>
+      {{ end }}
+    </ul>
+    {{ else }}
+    <p class="stats-empty">No articles in this window.</p>
+    {{ end }}
+  </section>
+
+  <section class="stats-panel">
+    <h3>Articles per source</h3>
+    {{ if .SourceCounts }}
+    <ul class="stats-list">
+      {{ range .SourceCounts }}
+      <li>
+        <span class="stats-list-name">{{ .Name }}</span>
+        <span class="stats-list-count">{{ .Count }}</span>
+      </li>
+      {{ end }}
+    </ul>
+    {{ else }}
+    <p class="stats-empty">No articles in this window.</p>
+    {{ end }}
+  </section>
+</div>
+{{ end }}
