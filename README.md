@@ -18,6 +18,7 @@ binary, so deployment is a single file with no runtime dependencies.
 - Presentation mode for hands-free reading, with autoplay and a progress bar
 - Light/dark theme toggle
 - Paginated by fetch date, newest first
+- RSS feed at `/rss`, ordered by when each article was captured
 
 ## Routes
 
@@ -25,6 +26,7 @@ binary, so deployment is a single file with no runtime dependencies.
 |---|---|
 | `/` | Article listing; accepts `?topic=`, `?date=`, `?page=` |
 | `/stats` | Topic and source breakdown for the last 10 days |
+| `/rss` | RSS 2.0 feed, newest first by `fetched_at`; accepts `?topic=`, `?date=`, `?limit=` (default 50, max 500) |
 | `/api/present` | JSON article feed used by presentation mode |
 | `/static/*` | Embedded CSS and JS |
 

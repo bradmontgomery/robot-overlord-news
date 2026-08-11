@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"embed"
 	"encoding/json"
+	"encoding/xml"
 	"html/template"
 	"log"
 	"math"
@@ -45,6 +46,46 @@ type DayCount struct {
 type NameCount struct {
 	Name  string
 	Count int
+}
+
+// RSS 2.0 feed types. These exist only to be marshaled by encoding/xml --
+// string fields are plain chardata so the encoder handles escaping (article
+// titles routinely contain curly quotes and ampersands).
+type rssFeed struct {
+	XMLName xml.Name   `xml:"rss"`
+	Version string     `xml:"version,attr"`
+	Atom    string     `xml:"xmlns:atom,attr"`
+	Channel rssChannel `xml:"channel"`
+}
+
+type rssChannel struct {
+	Title         string      `xml:"title"`
+	Link          string      `xml:"link"`
+	Description   string      `xml:"description"`
+	Language      string      `xml:"language"`
+	LastBuildDate string      `xml:"lastBuildDate,omitempty"`
+	AtomLink      rssAtomLink `xml:"atom:link"`
+	Items         []rssItem   `xml:"item"`
+}
+
+type rssAtomLink struct {
+	Href string `xml:"href,attr"`
+	Rel  string `xml:"rel,attr"`
+	Type string `xml:"type,attr"`
+}
+
+type rssItem struct {
+	Title       string   `xml:"title"`
+	Link        string   `xml:"link"`
+	GUID        rssGUID  `xml:"guid"`
+	PubDate     string   `xml:"pubDate,omitempty"`
+	Description string   `xml:"description"`
+	Categories  []string `xml:"category"`
+}
+
+type rssGUID struct {
+	Value       string `xml:",chardata"`
+	IsPermaLink bool   `xml:"isPermaLink,attr"`
 }
 
 type PageData struct {
@@ -157,6 +198,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleIndex)
 	mux.HandleFunc("/stats", handleStats)
+	mux.HandleFunc("/rss", handleRSS)
 	mux.HandleFunc("/api/present", handlePresent)
 	mux.Handle("/static/", http.FileServer(http.FS(content)))
 
@@ -321,6 +363,131 @@ func handlePresent(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(articles); err != nil {
 		log.Println("handlePresent encode:", err)
+	}
+}
+
+const (
+	feedDefaultLimit = 50
+	feedMaxLimit     = 500
+)
+
+// baseURL reconstructs this site's absolute origin from the request. Nginx
+// sets Host and X-Forwarded-Proto, so this is correct in production and in
+// local dev without a hardcoded domain or extra configuration.
+func baseURL(r *http.Request) string {
+	scheme := r.Header.Get("X-Forwarded-Proto")
+	if scheme == "" {
+		scheme = "http"
+	}
+	return scheme + "://" + r.Host
+}
+
+// rssPubDate converts a stored fetched_at into the RFC1123Z format RSS
+// requires. A handful of legacy rows hold a bare date rather than a full
+// timestamp; those fall back to midnight, and anything unparseable returns ""
+// so the pubDate element is omitted entirely rather than emitted malformed.
+func rssPubDate(fetchedAt string) string {
+	if t, err := time.Parse(time.RFC3339Nano, fetchedAt); err == nil {
+		return t.Format(time.RFC1123Z)
+	}
+	if t, err := time.Parse("2006-01-02", fetchedAt); err == nil {
+		return t.Format(time.RFC1123Z)
+	}
+	return ""
+}
+
+// handleRSS serves the article list as an RSS 2.0 feed, honoring the same
+// topic/date filters as the listing page plus a ?limit= override.
+func handleRSS(w http.ResponseWriter, r *http.Request) {
+	topic := r.URL.Query().Get("topic")
+	dateFilter := r.URL.Query().Get("date")
+
+	limit := feedDefaultLimit
+	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil {
+		limit = n
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > feedMaxLimit {
+		limit = feedMaxLimit
+	}
+
+	articles, err := getFeedArticles(topic, dateFilter, limit)
+	if err != nil {
+		http.Error(w, "db error", 500)
+		log.Println("getFeedArticles:", err)
+		return
+	}
+
+	base := baseURL(r)
+
+	title := "Robot Overlord News"
+	switch {
+	case topic != "" && dateFilter != "":
+		title += " — " + topic + ", " + dateFilter
+	case topic != "":
+		title += " — " + topic
+	case dateFilter != "":
+		title += " — " + dateFilter
+	}
+
+	items := make([]rssItem, 0, len(articles))
+	for _, a := range articles {
+		desc := a.Summary
+		if a.PublishedOn != "" {
+			// Original publication date belongs in the body, not pubDate --
+			// see the ordering note below.
+			desc = strings.TrimSpace(desc + "\n\nPublished: " + a.PublishedOn)
+		}
+
+		items = append(items, rssItem{
+			Title: a.Title,
+			Link:  a.URL,
+			// url carries a unique index, so it's a stable permalink-style id.
+			GUID: rssGUID{Value: a.URL, IsPermaLink: true},
+			// pubDate is fetched_at, NOT published_on: readers re-sort and
+			// de-duplicate by pubDate, so using the (often stale, often
+			// missing) publication date here would silently discard the
+			// save-order this feed is meant to syndicate.
+			PubDate:     rssPubDate(a.FetchedAt),
+			Description: desc,
+			Categories:  a.Topics,
+		})
+	}
+
+	lastBuild := ""
+	if len(items) > 0 {
+		lastBuild = items[0].PubDate
+	}
+
+	feed := rssFeed{
+		Version: "2.0",
+		Atom:    "http://www.w3.org/2005/Atom",
+		Channel: rssChannel{
+			Title:         title,
+			Link:          base + "/",
+			Description:   "Your new AI masters, summarized for your convenience.",
+			Language:      "en-us",
+			LastBuildDate: lastBuild,
+			AtomLink: rssAtomLink{
+				Href: base + r.URL.RequestURI(),
+				Rel:  "self",
+				Type: "application/rss+xml",
+			},
+			Items: items,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
+	if _, err := w.Write([]byte(xml.Header)); err != nil {
+		log.Println("handleRSS write header:", err)
+		return
+	}
+	enc := xml.NewEncoder(w)
+	enc.Indent("", "  ")
+	if err := enc.Encode(feed); err != nil {
+		log.Println("handleRSS encode:", err)
 	}
 }
 
@@ -532,6 +699,27 @@ func getAllArticles(topic, date string) ([]Article, error) {
 
 	const cols = `SELECT id, topic, COALESCE(title,''), COALESCE(url,''), COALESCE(summary,''), fetched_at, COALESCE(published_on,'') FROM news_results`
 	rows, err := db.Query(cols+where+` ORDER BY fetched_at DESC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanArticles(rows)
+}
+
+// getFeedArticles returns the newest `limit` articles matching the topic/date
+// filter, ordered by fetched_at desc. Rows with a blank url are excluded --
+// an RSS item with an empty link and guid is invalid, and the data contains a
+// few such rows.
+func getFeedArticles(topic, date string, limit int) ([]Article, error) {
+	clause, args := articleFilter(topic, date)
+	where := ` WHERE COALESCE(url,'') != ''`
+	if clause != "" {
+		where += ` AND (` + clause + `)`
+	}
+
+	const cols = `SELECT id, topic, COALESCE(title,''), COALESCE(url,''), COALESCE(summary,''), fetched_at, COALESCE(published_on,'') FROM news_results`
+	rows, err := db.Query(cols+where+` ORDER BY fetched_at DESC LIMIT ?`, append(append([]interface{}{}, args...), limit)...)
 	if err != nil {
 		return nil, err
 	}
