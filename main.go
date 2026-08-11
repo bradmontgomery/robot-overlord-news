@@ -606,20 +606,14 @@ var topicColors = []string{
 	"#06b6d4", "#ec4899", "#84cc16", "#f97316", "#6366f1",
 }
 
-var colorCache = map[string]string{}
-
+// topicColor deterministically maps a topic name to one of topicColors. It's a
+// pure hash over a short string, so it's called fresh on every render rather
+// than memoized -- a cache here would need locking to be safe across concurrent
+// requests, and would cost more than it saves.
 func topicColor(topic string) string {
-	if c, ok := colorCache[topic]; ok {
-		return c
-	}
-	h := 0
+	h := uint32(0)
 	for _, c := range strings.ToLower(topic) {
-		h = h*31 + int(c)
+		h = h*31 + uint32(c)
 	}
-	if h < 0 {
-		h = -h
-	}
-	color := topicColors[h%len(topicColors)]
-	colorCache[topic] = color
-	return color
+	return topicColors[h%uint32(len(topicColors))]
 }

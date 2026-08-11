@@ -87,5 +87,5 @@ colors as variables in both blocks — never hardcode a hex outside `:root`.
 
 - **No tests exist.** CI runs `go test ./...`, which passes vacuously and gates nothing. Don't
   assume coverage.
-- `colorCache` (main.go:609) is a package-level map written from HTTP handlers with no mutex — a
-  data race under concurrent requests.
+- No package-level mutable state. `topicColor` is deliberately uncached — it's a pure hash, and a
+  memo map would need locking to stay safe under concurrent requests. Don't reintroduce one.
