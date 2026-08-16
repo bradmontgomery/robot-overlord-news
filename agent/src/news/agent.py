@@ -76,6 +76,7 @@ DEFAULT_TOPICS = (
     "microsoft",
     "perplexity",
     "moonshot",
+    "minimax",
     "hugging face",
     "groq",
     "claude",  # Models
@@ -100,8 +101,14 @@ DEFAULT_TOPICS = (
     "nemotron",
     "mistral",
     "cohere",
+    "llama",
+    "astra",
+    "fable",
+    "mistral",
+    "muse spark",
     "claude code",  # tools, harnesses
     "codex",
+    "muse code",
     "opencode",
     "cursor",
     "langchain",
@@ -114,6 +121,10 @@ DEFAULT_TOPICS = (
     "zed",
     "local llm",  # broader topics
     "vllm",
+    "llamacpp",
+    "sglang",
+    "mlx",
+    "transformers",
     "mcp",
     "model context protocol",
     "a2a",
@@ -160,7 +171,7 @@ Rules for the `topic` field — keep topics tight so they stay easy to group:
 - Reuse the SAME short label the user gave you. Do not expand the label or invent longer wording,
   and do NOT turn the label into a descriptive phrase. You may shorten or make the label more succint.
 - Labels are lowercase and one or two words each (e.g. "anthropic", "local llm", "ai coding").
-- Multiple topics are allowed: if one article is genuinely relevant to several of the
+- Multiple labels on a news article are allowed: if one article is genuinely relevant to several of the
   provided topics, set topic to a comma-separated list of those labels
   (e.g. "anthropic, claude code"). Otherwise use the single matching label.
 
@@ -251,25 +262,29 @@ def _llm_perf_fields(response) -> dict:
 
 
 def _log_llm_call(run_id, step, model_name, response, elapsed_s, **extra) -> None:
-    _write_metric({
-        "type": "llm_call",
-        "run_id": run_id,
-        "step": step,
-        "model": model_name,
-        "elapsed_s": round(elapsed_s, 3),
-        **_llm_perf_fields(response),
-        **extra,
-    })
+    _write_metric(
+        {
+            "type": "llm_call",
+            "run_id": run_id,
+            "step": step,
+            "model": model_name,
+            "elapsed_s": round(elapsed_s, 3),
+            **_llm_perf_fields(response),
+            **extra,
+        }
+    )
 
 
 def _log_step(run_id, step, elapsed_s, **extra) -> None:
-    _write_metric({
-        "type": "step",
-        "run_id": run_id,
-        "step": step,
-        "elapsed_s": round(elapsed_s, 3),
-        **extra,
-    })
+    _write_metric(
+        {
+            "type": "step",
+            "run_id": run_id,
+            "step": step,
+            "elapsed_s": round(elapsed_s, 3),
+            **extra,
+        }
+    )
 
 
 def init_db(path: str) -> None:
@@ -351,7 +366,15 @@ def store_result(
             "INSERT OR IGNORE INTO news_results"
             " (topic, title, url, summary, fetched_at, published_on, model_name)"
             " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (_normalize_topic(topic), title, url, summary, fetched_at, pub_date, MODEL_NAME),
+            (
+                _normalize_topic(topic),
+                title,
+                url,
+                summary,
+                fetched_at,
+                pub_date,
+                MODEL_NAME,
+            ),
         )
     if cursor.rowcount:
         return f"Stored: {title}"
@@ -405,7 +428,11 @@ def build_graph(run_id: str | None = None):
         start = time.perf_counter()
         response = model.invoke([system_message] + state["messages"])
         _log_llm_call(
-            run_id, "agent_step", MODEL_NAME, response, time.perf_counter() - start,
+            run_id,
+            "agent_step",
+            MODEL_NAME,
+            response,
+            time.perf_counter() - start,
             tool_call_count=len(getattr(response, "tool_calls", None) or []),
             num_ctx=AGENT_NUM_CTX,
         )
@@ -484,8 +511,15 @@ def judge_articles(topics: list[str], run_start: str) -> int:
             )
         except Exception as e:
             _log_llm_call(
-                run_start, "judge_batch", MODEL_NAME, None, time.perf_counter() - call_start,
-                batch_index=batch_index, batch_size=len(batch), success=False, error=str(e),
+                run_start,
+                "judge_batch",
+                MODEL_NAME,
+                None,
+                time.perf_counter() - call_start,
+                batch_index=batch_index,
+                batch_size=len(batch),
+                success=False,
+                error=str(e),
             )
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             rprint(
@@ -494,8 +528,14 @@ def judge_articles(topics: list[str], run_start: str) -> int:
             )
             continue
         _log_llm_call(
-            run_start, "judge_batch", MODEL_NAME, response, time.perf_counter() - call_start,
-            batch_index=batch_index, batch_size=len(batch), success=True,
+            run_start,
+            "judge_batch",
+            MODEL_NAME,
+            response,
+            time.perf_counter() - call_start,
+            batch_index=batch_index,
+            batch_size=len(batch),
+            success=True,
             num_predict=JUDGE_NUM_PREDICT,
         )
         verdicts = _parse_judge_verdicts(response.content)
@@ -510,8 +550,11 @@ def judge_articles(topics: list[str], run_start: str) -> int:
                 f"DELETE FROM news_results WHERE id IN ({placeholders})", to_delete
             )
     _log_step(
-        run_start, "judge_articles", time.perf_counter() - judge_start,
-        articles_judged=len(rows), articles_deleted=len(to_delete),
+        run_start,
+        "judge_articles",
+        time.perf_counter() - judge_start,
+        articles_judged=len(rows),
+        articles_deleted=len(to_delete),
     )
     return len(to_delete)
 
@@ -539,14 +582,25 @@ def _invoke_summary_model(
         ).invoke(messages)
     except Exception as exc:
         _log_llm_call(
-            run_id, step, model_name, None, time.perf_counter() - start,
-            num_ctx=num_ctx, success=False, error=str(exc),
+            run_id,
+            step,
+            model_name,
+            None,
+            time.perf_counter() - start,
+            num_ctx=num_ctx,
+            success=False,
+            error=str(exc),
         )
         raise
     text = (response.content or "").strip()
     _log_llm_call(
-        run_id, step, model_name, response, time.perf_counter() - start,
-        num_ctx=num_ctx, success=bool(text),
+        run_id,
+        step,
+        model_name,
+        response,
+        time.perf_counter() - start,
+        num_ctx=num_ctx,
+        success=bool(text),
     )
     if not text:
         raise ValueError(f"{model_name} returned an empty summary")
@@ -594,7 +648,9 @@ def summarize_day(
         # surfaces instead of silently degrading.
         if primary_model == MODEL_NAME:
             _log_step(
-                run_id, "summarize_day", time.perf_counter() - summarize_start,
+                run_id,
+                "summarize_day",
+                time.perf_counter() - summarize_start,
                 success=False,
             )
             raise
@@ -614,7 +670,9 @@ def summarize_day(
                 style="red",
             )
             _log_step(
-                run_id, "summarize_day", time.perf_counter() - summarize_start,
+                run_id,
+                "summarize_day",
+                time.perf_counter() - summarize_start,
                 success=False,
             )
             return None
@@ -626,8 +684,11 @@ def summarize_day(
             (date, summary_text, used_model, created_at),
         )
     _log_step(
-        run_id, "summarize_day", time.perf_counter() - summarize_start,
-        used_model=used_model, success=True,
+        run_id,
+        "summarize_day",
+        time.perf_counter() - summarize_start,
+        used_model=used_model,
+        success=True,
     )
     return summary_text
 
@@ -652,13 +713,22 @@ def run(topics: list[str]) -> tuple[int, str | None]:
         batch_start = time.perf_counter()
         try:
             app.invoke(
-                {"messages": [HumanMessage(SEARCH_PROMPT.format(topic_list=topic_list))]},
+                {
+                    "messages": [
+                        HumanMessage(SEARCH_PROMPT.format(topic_list=topic_list))
+                    ]
+                },
                 config={"recursion_limit": 50},
             )
         except Exception as e:
             _log_step(
-                run_start, "search_batch", time.perf_counter() - batch_start,
-                batch_index=i // BATCH_SIZE, topics=topic_list, success=False, error=str(e),
+                run_start,
+                "search_batch",
+                time.perf_counter() - batch_start,
+                batch_index=i // BATCH_SIZE,
+                topics=topic_list,
+                success=False,
+                error=str(e),
             )
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             rprint(
@@ -667,8 +737,12 @@ def run(topics: list[str]) -> tuple[int, str | None]:
             )
             continue
         _log_step(
-            run_start, "search_batch", time.perf_counter() - batch_start,
-            batch_index=i // BATCH_SIZE, topics=topic_list, success=True,
+            run_start,
+            "search_batch",
+            time.perf_counter() - batch_start,
+            batch_index=i // BATCH_SIZE,
+            topics=topic_list,
+            success=True,
         )
     with sqlite3.connect(DB_PATH) as conn:
         (new_count,) = conn.execute(
@@ -677,8 +751,11 @@ def run(topics: list[str]) -> tuple[int, str | None]:
     judge_articles(topics, run_start)
     summary = summarize_day(today, run_id=run_start)
     _log_step(
-        run_start, "run", time.perf_counter() - run_loop_start,
-        topics=len(topics), new_articles=new_count,
+        run_start,
+        "run",
+        time.perf_counter() - run_loop_start,
+        topics=len(topics),
+        new_articles=new_count,
     )
     return new_count, summary
 

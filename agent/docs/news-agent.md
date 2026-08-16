@@ -85,3 +85,8 @@ The loop runs → prints → sleeps → repeats until interrupted (`Ctrl-C`). Un
 
 Search tool follows the same Tavily / DuckDuckGo logic as the other agents: set
 `TAVILY_API_KEY` to use Tavily; otherwise falls back to DuckDuckGo's news backend.
+
+## Model choices
+
+Evaluations of candidate models for the agent's three LLM workloads — and why the
+current ones were kept — live in [news-agent-model-research.md](news-agent-model-research.md).
