@@ -13,6 +13,12 @@ def _isolate_metrics_path(tmp_path, monkeypatch):
     from news import agent as news_agent
 
     monkeypatch.setattr(news_agent, "METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    monkeypatch.setattr(news_agent, "FAILURE_DIR", str(tmp_path / "failures"))
+    # The batch context is a ContextVar shared across the whole process; without this
+    # a run() test leaks its run_id into every test that follows.
+    token = news_agent._BATCH_CONTEXT.set({})
+    yield
+    news_agent._BATCH_CONTEXT.reset(token)
 
 
 def _read_metrics(path) -> list[dict]:
@@ -355,30 +361,95 @@ def test_store_result_normalizes_multi_topic(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _fake_underlying_tool(result=None, error=None):
+    """A stand-in for a community search tool, with a real name/description/schema.
+
+    `_instrument_tool` copies args_schema onto a StructuredTool, which rejects a
+    MagicMock — so the double has to carry a genuine pydantic schema.
+    """
+    from pydantic import BaseModel
+
+    class _Args(BaseModel):
+        query: str
+
+    underlying = MagicMock()
+    underlying.name = "duckduckgo_results_json"
+    underlying.description = "Search the web for news."
+    underlying.args_schema = _Args
+    if error is not None:
+        underlying.invoke.side_effect = error
+    else:
+        underlying.invoke.return_value = result
+    return underlying
+
+
 def test_make_search_tool_duckduckgo():
+    """The wrapper must be transparent: same name, description and schema."""
+    from langchain_community.tools import DuckDuckGoSearchResults
+
     from news.agent import _make_search_tool
 
     env = {k: v for k, v in os.environ.items() if k != "TAVILY_API_KEY"}
     with patch.dict(os.environ, env, clear=True):
         tool = _make_search_tool()
-    from langchain_community.tools import DuckDuckGoSearchResults
 
-    assert isinstance(tool, DuckDuckGoSearchResults)
-    assert tool.backend == "news"
-    assert tool.output_format == "list"
+    reference = DuckDuckGoSearchResults(
+        backend="news", output_format="list", max_results=5
+    )
+    # The schema bound to the model must be byte-identical to the unwrapped tool's —
+    # renaming it could change tool-call reliability and confound the failure rate
+    # this instrumentation exists to measure.
+    assert tool.name == reference.name
+    assert tool.description == reference.description
+    assert tool.args_schema is reference.args_schema
+
+
+def test_instrumented_tool_logs_result_count(tmp_path):
+    """A successful call records how many results came back — including zero."""
+    from news import agent as news_agent
+
+    tool = news_agent._instrument_tool(_fake_underlying_tool(result=[]))
+    tool.invoke({"query": "anthropic"})
+
+    calls = [
+        r for r in _read_metrics(news_agent.METRICS_PATH) if r.get("type") == "tool_call"
+    ]
+    assert calls and calls[-1]["success"] is True
+    # Zero results is not an error, and was previously indistinguishable from a tool
+    # that was never called at all.
+    assert calls[-1]["result_count"] == 0
+    assert calls[-1]["query"] == "anthropic"
+
+
+def test_instrumented_tool_logs_failure_and_reraises(tmp_path):
+    """Tool exceptions are recorded, then re-raised so ToolNode still recovers."""
+    from news import agent as news_agent
+
+    tool = news_agent._instrument_tool(
+        _fake_underlying_tool(error=RuntimeError("no results"))
+    )
+    with pytest.raises(Exception):
+        tool.invoke({"query": "openai"})
+
+    calls = [
+        r for r in _read_metrics(news_agent.METRICS_PATH) if r.get("type") == "tool_call"
+    ]
+    assert calls[-1]["success"] is False
+    assert calls[-1]["error_type"] == "RuntimeError"
 
 
 def test_make_search_tool_tavily():
     from news.agent import _make_search_tool
 
     mock_cls = MagicMock()
-    mock_instance = MagicMock()
+    mock_instance = _fake_underlying_tool(result=[])
+    mock_instance.name = "tavily_search_results_json"
     mock_cls.return_value = mock_instance
     with patch.dict(os.environ, {"TAVILY_API_KEY": "test-key"}), \
          patch("langchain_community.tools.tavily_search.TavilySearchResults", mock_cls):
         tool = _make_search_tool()
     mock_cls.assert_called_once_with(max_results=5)
-    assert tool is mock_instance
+    assert tool.name == "tavily_search_results_json"
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +525,7 @@ def test_build_graph_tavily():
     mock_model = MagicMock()
     mock_model.bind_tools.return_value = mock_model
     mock_tavily_cls = MagicMock()
-    mock_tavily_cls.return_value = MagicMock()
+    mock_tavily_cls.return_value = _fake_underlying_tool(result=[])
     with patch("news.agent.ChatOllama", return_value=mock_model), \
          patch("news.agent.ToolNode"), \
          patch.dict(os.environ, {"TAVILY_API_KEY": "test-key"}), \
@@ -1574,3 +1645,200 @@ def test_judge_caps_output_instead_of_widening_the_context(tmp_path):
     assert "num_ctx" not in kwargs
     # Sampling entropy is pure downside for a YES/NO verdict.
     assert kwargs["temperature"] == 0
+
+
+# ---------------------------------------------------------------------------
+# failure instrumentation — agent-step errors, conversation dumps, config stamping
+# ---------------------------------------------------------------------------
+
+
+def _failing_graph(error):
+    """A ChatOllama double whose bound model always raises *error* on invoke."""
+    mock_bound = MagicMock()
+    mock_bound.invoke.side_effect = error
+    mock_model = MagicMock()
+    mock_model.bind_tools.return_value = mock_bound
+    return mock_model
+
+
+def test_agent_step_failure_is_logged_and_reraised():
+    """A call that raises used to vanish from the data entirely."""
+    from news import agent as news_agent
+
+    mock_model = _failing_graph(RuntimeError("XML syntax error on line 17"))
+    with patch("news.agent.ChatOllama", return_value=mock_model):
+        graph = news_agent.build_graph(run_id="run-fail")
+        with pytest.raises(Exception):
+            graph.invoke({"messages": [HumanMessage(content="hi")]})
+
+    steps = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("step") == "agent_step"
+    ]
+    assert steps and steps[-1]["success"] is False
+    assert steps[-1]["error_type"] == "RuntimeError"
+    assert steps[-1]["message_count"] == 2  # system + human
+    # The config is stamped on the failure too, so a failure can be attributed to the
+    # settings that produced it.
+    assert steps[-1]["temperature"] == news_agent.AGENT_TEMPERATURE
+    assert steps[-1]["num_ctx"] == news_agent.AGENT_NUM_CTX
+
+
+def test_agent_step_failure_dumps_a_replayable_conversation():
+    """The dump must round-trip back into a model call, not just be readable."""
+    import json
+
+    from langchain_core.messages import messages_from_dict
+
+    from news import agent as news_agent
+
+    mock_model = _failing_graph(RuntimeError("boom"))
+    with patch("news.agent.ChatOllama", return_value=mock_model):
+        graph = news_agent.build_graph(run_id="run-dump")
+        with pytest.raises(Exception):
+            graph.invoke({"messages": [HumanMessage(content="research anthropic")]})
+
+    steps = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("step") == "agent_step"
+    ]
+    with open(steps[-1]["dump_path"]) as fh:
+        dump = json.load(fh)
+    assert dump["model"] == news_agent.MODEL_NAME
+    assert dump["model_kwargs"] == news_agent.AGENT_MODEL_KWARGS
+    # Ollama discards the malformed completion, so the inputs are the only evidence —
+    # they have to be replayable.
+    restored = messages_from_dict(dump["messages"])
+    assert restored[-1].content == "research anthropic"
+    # The tool schemas are load-bearing, not decoration: the XML errors come from
+    # Ollama parsing a tool call, so a replay without bind_tools cannot reproduce them.
+    assert {t["function"]["name"] for t in dump["tools"]} >= {"store_result"}
+
+
+def test_failure_dumps_are_pruned_to_the_newest_few(monkeypatch):
+    """~12% of batches fail, so the dump directory needs a ceiling."""
+    from news import agent as news_agent
+
+    monkeypatch.setattr(news_agent, "FAILURE_KEEP", 2)
+    for i in range(4):
+        news_agent._dump_failed_conversation([HumanMessage(content=f"msg {i}")])
+
+    assert len(os.listdir(news_agent.FAILURE_DIR)) == 2
+
+
+def test_dump_failure_never_masks_the_original_error(monkeypatch):
+    """A problem while recording a failure must not replace the failure itself."""
+    from news import agent as news_agent
+
+    monkeypatch.setattr(news_agent.os, "makedirs", MagicMock(side_effect=OSError("ro")))
+    assert news_agent._dump_failed_conversation([HumanMessage(content="x")]) is None
+
+
+def test_handle_tool_error_writes_a_crosscheck_record():
+    """ToolNode's handler cannot see the tool name, so this is a backstop only."""
+    from news import agent as news_agent
+
+    news_agent._handle_tool_error(ValueError("no results"))
+
+    errors = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("type") == "tool_error"
+    ]
+    assert errors and errors[-1]["error_type"] == "ValueError"
+    assert errors[-1]["handled_by"] == "ToolNode"
+
+
+def test_store_result_logs_stored_and_duplicate_outcomes(tmp_path):
+    """"No new articles" and "the agent stopped storing" are different failures."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "store.db")
+    news_agent.init_db(db_file)
+    args = {
+        "topic": "Anthropic",
+        "title": "T",
+        "url": "http://a.com",
+        "summary": "S",
+    }
+    with patch.object(news_agent, "DB_PATH", db_file):
+        news_agent.store_result.invoke(args)
+        news_agent.store_result.invoke(args)
+
+    calls = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("type") == "tool_call" and r["tool"] == "store_result"
+    ]
+    assert [c["outcome"] for c in calls] == ["stored", "duplicate"]
+    assert calls[0]["topic"] == "anthropic"
+
+
+def test_batch_context_stamps_agent_steps(monkeypatch):
+    """A run spans ~64 batches; without batch_index a failure cannot be traced back."""
+    from news import agent as news_agent
+
+    response = AIMessage(content="done", usage_metadata={
+        "input_tokens": 10, "output_tokens": 5, "total_tokens": 15})
+    mock_bound = MagicMock()
+    mock_bound.invoke.return_value = response
+    mock_model = MagicMock()
+    mock_model.bind_tools.return_value = mock_bound
+
+    news_agent._BATCH_CONTEXT.set({"run_id": "run-ctx", "batch_index": 7})
+    try:
+        with patch("news.agent.ChatOllama", return_value=mock_model):
+            graph = news_agent.build_graph(run_id="run-ctx")
+            graph.invoke({"messages": [HumanMessage(content="hi")]})
+    finally:
+        news_agent._BATCH_CONTEXT.set({})
+
+    steps = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("step") == "agent_step"
+    ]
+    assert steps[-1]["batch_index"] == 7
+    assert steps[-1]["success"] is True
+
+
+def test_judge_logs_its_full_config():
+    """reasoning=False shapes the judge's output but was invisible in the metrics."""
+    from news import agent as news_agent
+
+    assert news_agent.JUDGE_MODEL_KWARGS["reasoning"] is False
+    assert news_agent.JUDGE_MODEL_KWARGS["temperature"] == news_agent.JUDGE_TEMPERATURE
+    assert news_agent.JUDGE_MODEL_KWARGS["num_predict"] == news_agent.JUDGE_NUM_PREDICT
+
+
+def test_store_result_logs_a_database_failure(tmp_path):
+    """A DB error must land in the tool_call records, not only in the crosscheck."""
+    from news import agent as news_agent
+
+    with patch.object(news_agent, "DB_PATH", str(tmp_path / "missing" / "no.db")):
+        with pytest.raises(Exception):
+            news_agent.store_result.invoke(
+                {"topic": "a", "title": "T", "url": "u", "summary": "S"}
+            )
+
+    calls = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("type") == "tool_call" and r["tool"] == "store_result"
+    ]
+    assert calls[-1]["success"] is False
+    assert calls[-1]["error_type"]
+
+
+def test_pruning_failure_does_not_discard_a_good_dump(monkeypatch):
+    """The dump was written; a pruning error must not lose its path."""
+    from news import agent as news_agent
+
+    monkeypatch.setattr(
+        news_agent, "_prune_failure_dumps", MagicMock(side_effect=OSError("race"))
+    )
+    path = news_agent._dump_failed_conversation([HumanMessage(content="x")])
+
+    assert path is not None and os.path.exists(path)

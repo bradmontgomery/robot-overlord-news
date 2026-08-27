@@ -13,6 +13,7 @@ Graph:
 """
 
 import argparse
+import contextvars
 import json
 import os
 import re
@@ -21,8 +22,9 @@ import time
 from datetime import datetime, timezone
 from typing import Literal
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, SystemMessage, messages_to_dict
+from langchain_core.tools import StructuredTool, tool
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
@@ -82,6 +84,30 @@ JUDGE_TEMPERATURE = 0.0
 SUMMARY_TEMPERATURE = 0.5
 SUMMARY_TOP_K = 40
 SUMMARY_TOP_P = 0.9
+# Every knob that shapes a model's output, defined once and used twice: to build the
+# ChatOllama and to stamp the metrics record. Passing the same dict to both makes it
+# structurally impossible for the logged config to drift from the config actually used,
+# which is what lets metrics_report.py cohort runs by config and trust the answer.
+AGENT_MODEL_KWARGS = {"num_ctx": AGENT_NUM_CTX, "temperature": AGENT_TEMPERATURE}
+JUDGE_MODEL_KWARGS = {
+    "num_predict": JUDGE_NUM_PREDICT,
+    "temperature": JUDGE_TEMPERATURE,
+    "reasoning": False,
+}
+# num_ctx is per-call for the summary (see summarize_day), so it is merged in there
+# rather than fixed here.
+SUMMARY_MODEL_KWARGS = {
+    "temperature": SUMMARY_TEMPERATURE,
+    "top_k": SUMMARY_TOP_K,
+    "top_p": SUMMARY_TOP_P,
+}
+# Where agent-step failures dump the conversation that produced them. Ollama discards
+# the malformed completion server-side (its ResponseError carries only a message and a
+# status code), so the inputs are the only recoverable evidence — dumping them is what
+# makes a failure replayable. Kept out of the metrics file because a failing prompt runs
+# to ~4k tokens; the JSONL records only the path.
+FAILURE_DIR = os.getenv("NEWS_FAILURE_DIR", "news_failures")
+FAILURE_KEEP = int(os.getenv("NEWS_FAILURE_KEEP", "50"))
 DEFAULT_TOPICS = (
     "anthropic",  # AI companies
     "openai",
@@ -249,6 +275,94 @@ def _write_metric(record: dict) -> None:
         f.write(json.dumps(record) + "\n")
 
 
+# Which run and which topic batch is currently executing. build_graph() is called once
+# per run but invoked once per batch, so batch_index cannot be closed over — and tools
+# receive only their own arguments, so it cannot be threaded through the graph state
+# either. A ContextVar reaches both the agent node and the tool wrappers with one
+# mechanism, and stays correct if the loop is ever made async.
+_BATCH_CONTEXT: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "news_batch_context", default={}
+)
+
+
+def _log_tool_call(tool_name: str, elapsed_s: float, **extra) -> None:
+    """Record one tool invocation — success or failure.
+
+    Without this, a tool failure existed only in stdout: `_handle_tool_error` printed
+    and returned a string to the model, writing nothing. Logging every call (not only
+    failures) is what supplies the denominator — an error count alone cannot say
+    whether a failure rate is rising or falling.
+    """
+    ctx = _BATCH_CONTEXT.get()
+    _write_metric(
+        {
+            "type": "tool_call",
+            "run_id": ctx.get("run_id"),
+            "batch_index": ctx.get("batch_index"),
+            "tool": tool_name,
+            "elapsed_s": round(elapsed_s, 3),
+            **extra,
+        }
+    )
+
+
+def _dump_failed_conversation(messages: list, tools: list | None = None) -> str | None:
+    """Serialize *messages* to FAILURE_DIR and return the path, or None on failure.
+
+    Written in langchain's own `messages_to_dict` form so a dump round-trips through
+    `messages_from_dict` straight back into a model call — the point is a case that can
+    be replayed against Ollama, not a log line to read.
+
+    The tool schemas are captured too, and they are not optional for the failure this
+    exists to diagnose: the XML errors come from Ollama parsing a *tool call*, so a
+    replay that skips `.bind_tools()` will not reproduce them. Replay with:
+
+        model = ChatOllama(model=d["model"], base_url=..., **d["model_kwargs"])
+        model.bind_tools(d["tools"]).invoke(messages_from_dict(d["messages"]))
+
+    Never raises: a failure while recording a failure must not mask the original error.
+    """
+    ctx = _BATCH_CONTEXT.get()
+    run_id = (ctx.get("run_id") or "adhoc").replace(":", "").replace("+", "")
+    # Nanoseconds, not milliseconds: consecutive failures in one batch land inside the
+    # same millisecond and would overwrite each other.
+    name = f"{run_id}-batch{ctx.get('batch_index')}-{time.time_ns()}.json"
+    try:
+        os.makedirs(FAILURE_DIR, exist_ok=True)
+        path = os.path.join(FAILURE_DIR, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "model": MODEL_NAME,
+                    "base_url": OLLAMA_BASE_URL,
+                    "model_kwargs": AGENT_MODEL_KWARGS,
+                    "tools": [convert_to_openai_tool(t) for t in tools or []],
+                    "messages": messages_to_dict(messages),
+                },
+                fh,
+            )
+    except Exception:
+        return None
+    # Pruning happens after the path is secured. A file vanishing between scandir and
+    # remove (two runs overlapping) must not throw away a dump that was written fine.
+    try:
+        _prune_failure_dumps()
+    except Exception:
+        pass
+    return path
+
+
+def _prune_failure_dumps() -> None:
+    """Keep only the newest FAILURE_KEEP dumps; ~12% of batches fail, so this grows."""
+    entries = sorted(
+        (e for e in os.scandir(FAILURE_DIR) if e.is_file()),
+        key=lambda e: e.stat().st_mtime,
+        reverse=True,
+    )
+    for entry in entries[FAILURE_KEEP:]:
+        os.remove(entry.path)
+
+
 def _llm_perf_fields(response) -> dict:
     """Best-effort extraction of token/timing fields from an AIMessage-like response.
 
@@ -377,36 +491,109 @@ def store_result(
         summary: brief 1-2 sentence summary
         published_on: publication date in YYYY-MM-DD format if known, else omit
     """
+    start = time.perf_counter()
     fetched_at = datetime.now(timezone.utc).isoformat()
     pub_date = published_on.strip() or None
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            "INSERT OR IGNORE INTO news_results"
-            " (topic, title, url, summary, fetched_at, published_on, model_name)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                _normalize_topic(topic),
-                title,
-                url,
-                summary,
-                fetched_at,
-                pub_date,
-                MODEL_NAME,
-            ),
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO news_results"
+                " (topic, title, url, summary, fetched_at, published_on, model_name)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    _normalize_topic(topic),
+                    title,
+                    url,
+                    summary,
+                    fetched_at,
+                    pub_date,
+                    MODEL_NAME,
+                ),
+            )
+    except Exception as e:
+        # Without this, a locked or missing database would raise before the success
+        # log below and store_result's error rate would sit at a structural 0% —
+        # exactly the blind spot this instrumentation exists to close.
+        _log_tool_call(
+            "store_result",
+            time.perf_counter() - start,
+            success=False,
+            error=str(e),
+            error_type=type(e).__name__,
         )
-    if cursor.rowcount:
+        raise
+    # The rowcount branch already knew whether this was a new article or a duplicate;
+    # it just threw the fact away. Recording it separates "the agent found nothing new"
+    # from "the agent stopped calling store_result".
+    stored = bool(cursor.rowcount)
+    _log_tool_call(
+        "store_result",
+        time.perf_counter() - start,
+        success=True,
+        outcome="stored" if stored else "duplicate",
+        topic=_normalize_topic(topic),
+    )
+    if stored:
         return f"Stored: {title}"
     return f"Skipped (duplicate URL): {title}"
+
+
+def _instrument_tool(underlying):
+    """Wrap a tool so every call is logged, without changing what the model sees.
+
+    name, description and args_schema are copied verbatim, so the schema bound to the
+    model is identical to the unwrapped tool's. That matters: renaming the search tool
+    could change tool-call reliability by itself, which would confound the very failure
+    rate this instrumentation exists to measure.
+
+    Exceptions are logged and re-raised, leaving ToolNode's existing `_handle_tool_error`
+    recovery path intact.
+    """
+
+    def call(**kwargs):
+        start = time.perf_counter()
+        try:
+            result = underlying.invoke(kwargs)
+        except Exception as e:
+            _log_tool_call(
+                underlying.name,
+                time.perf_counter() - start,
+                success=False,
+                error=str(e),
+                error_type=type(e).__name__,
+                **kwargs,
+            )
+            raise
+        # A search that returns zero results is not an error, and until now it was
+        # indistinguishable from one that was never called. Counting it separately is
+        # the difference between "the backend is failing" and "there is no news".
+        _log_tool_call(
+            underlying.name,
+            time.perf_counter() - start,
+            success=True,
+            result_count=len(result) if isinstance(result, (list, tuple)) else None,
+            **kwargs,
+        )
+        return result
+
+    return StructuredTool.from_function(
+        func=call,
+        name=underlying.name,
+        description=underlying.description,
+        args_schema=underlying.args_schema,
+    )
 
 
 def _make_search_tool():
     if os.getenv("TAVILY_API_KEY"):
         from langchain_community.tools.tavily_search import TavilySearchResults
 
-        return TavilySearchResults(max_results=5)
+        return _instrument_tool(TavilySearchResults(max_results=5))
     from langchain_community.tools import DuckDuckGoSearchResults
 
-    return DuckDuckGoSearchResults(backend="news", output_format="list", max_results=5)
+    return _instrument_tool(
+        DuckDuckGoSearchResults(backend="news", output_format="list", max_results=5)
+    )
 
 
 def _handle_tool_error(e: Exception) -> str:
@@ -416,6 +603,20 @@ def _handle_tool_error(e: Exception) -> str:
     DuckDuckGo ``DDGSException: No results found.``), so an empty search for one
     topic is logged and treated as "no results" instead of crashing the run.
     """
+    # A cross-check, not the primary record: _instrument_tool already logged this call
+    # with its name and arguments, which ToolNode's handler signature cannot see. Kept
+    # as the safety net for any tool that is not wrapped. Rates come from `tool_call`
+    # records; counting both types would double-count every wrapped failure.
+    _write_metric(
+        {
+            "type": "tool_error",
+            "run_id": _BATCH_CONTEXT.get().get("run_id"),
+            "batch_index": _BATCH_CONTEXT.get().get("batch_index"),
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "handled_by": "ToolNode",
+        }
+    )
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rprint(f"[dim][{now}][/dim] [yellow]Search/tool error (skipping): {e}[/yellow]")
     return f"No results available (tool error: {e}). Continue with the next topic."
@@ -438,24 +639,47 @@ def build_graph(run_id: str | None = None):
     system_message = SystemMessage(_SYSTEM_PROMPT.format(today=today))
 
     model = ChatOllama(
-        model=MODEL_NAME,
-        base_url=OLLAMA_BASE_URL,
-        num_ctx=AGENT_NUM_CTX,
-        temperature=AGENT_TEMPERATURE,
+        model=MODEL_NAME, base_url=OLLAMA_BASE_URL, **AGENT_MODEL_KWARGS
     ).bind_tools(tools)
     tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
 
     def agent_node(state: MessagesState) -> dict:
         start = time.perf_counter()
-        response = model.invoke([system_message] + state["messages"])
+        messages = [system_message] + state["messages"]
+        try:
+            response = model.invoke(messages)
+        except Exception as e:
+            # Until this existed, a call that raised never reached _log_llm_call, so
+            # every parse failure was simply absent from the agent_step data — and the
+            # calls that did survive were the ones that worked. Every per-call figure
+            # in the report was computed over survivors only.
+            _log_llm_call(
+                run_id,
+                "agent_step",
+                MODEL_NAME,
+                None,
+                time.perf_counter() - start,
+                batch_index=_BATCH_CONTEXT.get().get("batch_index"),
+                success=False,
+                error=str(e),
+                error_type=type(e).__name__,
+                message_count=len(messages),
+                dump_path=_dump_failed_conversation(messages, tools),
+                **AGENT_MODEL_KWARGS,
+            )
+            # Re-raise: run() still logs the search_batch failure, so the batch-level
+            # and call-level records stay reconcilable.
+            raise
         _log_llm_call(
             run_id,
             "agent_step",
             MODEL_NAME,
             response,
             time.perf_counter() - start,
+            batch_index=_BATCH_CONTEXT.get().get("batch_index"),
             tool_call_count=len(getattr(response, "tool_calls", None) or []),
-            num_ctx=AGENT_NUM_CTX,
+            success=True,
+            **AGENT_MODEL_KWARGS,
         )
         return {"messages": [response]}
 
@@ -508,13 +732,7 @@ def judge_articles(topics: list[str], run_start: str) -> int:
     # "length" with empty .content — which fails open and keeps every article,
     # including the false positives this judge exists to catch. The judge only needs
     # short YES/NO tokens, so reasoning adds cost without adding judgment quality.
-    model = ChatOllama(
-        model=MODEL_NAME,
-        base_url=OLLAMA_BASE_URL,
-        reasoning=False,
-        num_predict=JUDGE_NUM_PREDICT,
-        temperature=JUDGE_TEMPERATURE,
-    )
+    model = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, **JUDGE_MODEL_KWARGS)
     to_delete: list[int] = []
     for i in range(0, len(rows), JUDGE_BATCH_SIZE):
         batch = rows[i : i + JUDGE_BATCH_SIZE]
@@ -542,6 +760,8 @@ def judge_articles(topics: list[str], run_start: str) -> int:
                 batch_size=len(batch),
                 success=False,
                 error=str(e),
+                error_type=type(e).__name__,
+                **JUDGE_MODEL_KWARGS,
             )
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             rprint(
@@ -558,7 +778,7 @@ def judge_articles(topics: list[str], run_start: str) -> int:
             batch_index=batch_index,
             batch_size=len(batch),
             success=True,
-            num_predict=JUDGE_NUM_PREDICT,
+            **JUDGE_MODEL_KWARGS,
         )
         verdicts = _parse_judge_verdicts(response.content)
         for n, (row_id, _title, _summary) in enumerate(batch, start=1):
@@ -597,15 +817,11 @@ def _invoke_summary_model(
     persisting a blank summary — the failure mode seen with oversized models that
     spill to CPU.
     """
+    kwargs = {**SUMMARY_MODEL_KWARGS, "num_ctx": num_ctx}
     start = time.perf_counter()
     try:
         response = ChatOllama(
-            model=model_name,
-            base_url=OLLAMA_BASE_URL,
-            num_ctx=num_ctx,
-            temperature=SUMMARY_TEMPERATURE,
-            top_k=SUMMARY_TOP_K,
-            top_p=SUMMARY_TOP_P,
+            model=model_name, base_url=OLLAMA_BASE_URL, **kwargs
         ).invoke(messages)
     except Exception as exc:
         _log_llm_call(
@@ -614,9 +830,10 @@ def _invoke_summary_model(
             model_name,
             None,
             time.perf_counter() - start,
-            num_ctx=num_ctx,
             success=False,
             error=str(exc),
+            error_type=type(exc).__name__,
+            **kwargs,
         )
         raise
     text = (response.content or "").strip()
@@ -626,8 +843,8 @@ def _invoke_summary_model(
         model_name,
         response,
         time.perf_counter() - start,
-        num_ctx=num_ctx,
         success=bool(text),
+        **kwargs,
     )
     if not text:
         raise ValueError(f"{model_name} returned an empty summary")
@@ -738,6 +955,11 @@ def run(topics: list[str]) -> tuple[int, str | None]:
         batch = topics[i : i + BATCH_SIZE]
         topic_list = ", ".join(batch)
         batch_start = time.perf_counter()
+        # Stamp every agent step and tool call in this batch with the batch it belongs
+        # to. A run spans ~64 batches; without this, a failed search_batch could not be
+        # traced back to the LLM calls and tool calls that produced it except by
+        # guessing from timestamp order.
+        _BATCH_CONTEXT.set({"run_id": run_start, "batch_index": i // BATCH_SIZE})
         try:
             app.invoke(
                 {
@@ -756,6 +978,11 @@ def run(topics: list[str]) -> tuple[int, str | None]:
                 topics=topic_list,
                 success=False,
                 error=str(e),
+                # Separates GraphRecursionError from ollama's ResponseError without
+                # string-matching the message — the distinction the report's old
+                # "every failure is the same failure" caption missed.
+                error_type=type(e).__name__,
+                model=MODEL_NAME,
             )
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             rprint(
@@ -770,6 +997,7 @@ def run(topics: list[str]) -> tuple[int, str | None]:
             batch_index=i // BATCH_SIZE,
             topics=topic_list,
             success=True,
+            model=MODEL_NAME,
         )
     with sqlite3.connect(DB_PATH) as conn:
         (new_count,) = conn.execute(
