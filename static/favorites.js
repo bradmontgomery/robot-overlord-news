@@ -85,7 +85,7 @@
     });
   }
 
-  function toggleFavorite(article, btn) {
+  function applyToggle(article) {
     var isFavorited = !!favorites[article.URL];
     if (isFavorited) {
       delete favorites[article.URL];
@@ -93,12 +93,17 @@
       favorites[article.URL] = article;
     }
     saveFavorites(favorites);
-    if (btn) setButtonState(btn, !isFavorited);
     syncNormalViewButton(article.URL, !isFavorited);
     updateCount();
     if (!document.getElementById("saved-view").hidden) {
       renderSavedView();
     }
+    return !isFavorited;
+  }
+
+  function toggleFavorite(article, btn) {
+    var nowFavorited = applyToggle(article);
+    if (btn) setButtonState(btn, nowFavorited);
   }
 
   function syncNormalViewButton(url, isFavorited) {
@@ -200,6 +205,20 @@
     document.getElementById("saved-view").hidden = true;
     document.getElementById("normal-view").hidden = false;
   }
+
+  window.RobotOverlordFavorites = {
+    isFavorite: function (url) {
+      return !!favorites[url];
+    },
+    toggle: function (article) {
+      return applyToggle(article);
+    },
+    list: function () {
+      return Object.keys(favorites).map(function (url) {
+        return favorites[url];
+      });
+    },
+  };
 
   document.addEventListener("DOMContentLoaded", function () {
     initButtons();

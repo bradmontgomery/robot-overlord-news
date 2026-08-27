@@ -333,23 +333,6 @@ main {
   border-color: var(--accent);
 }
 
-.search-count {
-  font-size: 0.8rem;
-  color: var(--text-muted);
-}
-
-mark {
-  background: var(--accent-light);
-  color: #1a1d27;
-  border-radius: 3px;
-  padding: 0 2px;
-}
-
-:root[data-theme="light"] mark {
-  background: #fde68a;
-  color: #1a1d27;
-}
-
 .filter-bar {
   display: flex;
   align-items: center;
@@ -534,8 +517,6 @@ mark {
   color: var(--text-muted);
 }
 
-.pagination.search-hidden { display: none; }
-
 .pagination {
   display: flex;
   flex-wrap: wrap;
@@ -650,7 +631,8 @@ mark {
 
 .presentation-prev,
 .presentation-next,
-.presentation-playpause {
+.presentation-playpause,
+.presentation-favorite-btn {
   background: none;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -659,15 +641,18 @@ mark {
   font-size: 1.2rem;
   cursor: pointer;
   color: var(--text);
-  transition: background 0.1s, border-color 0.1s;
+  transition: background 0.1s, border-color 0.1s, color 0.1s;
 }
 
 .presentation-prev:hover,
 .presentation-next:hover,
-.presentation-playpause:hover {
+.presentation-playpause:hover,
+.presentation-favorite-btn:hover {
   background: var(--surface2);
   border-color: var(--border-hover);
 }
+
+.presentation-favorite-btn.favorited { color: #ef4444; border-color: #ef4444; }
 
 .presentation-counter {
   font-size: 0.85rem;

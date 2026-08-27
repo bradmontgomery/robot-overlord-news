@@ -6,7 +6,7 @@
   <div class="active-filter">
     <span class="topic-dot" style="background:{{ topicColor .FilterTopic }}"></span>
     <strong>{{ .FilterTopic }}</strong>
-    <a href="/{{ if .FilterDate }}?date={{ .FilterDate }}{{ end }}" title="Clear filter">✕</a>
+    <a href="/{{ filterQuery "date" .FilterDate "q" .FilterQuery }}" title="Clear filter">✕</a>
   </div>
   {{ end }}
   <span class="results-count">
@@ -30,20 +30,20 @@
     {{ end }}
     <div class="article-meta">
       {{ range .Topics }}
-      <a class="topic-pill" href="/?topic={{ . }}{{ if $.FilterDate }}&date={{ $.FilterDate }}{{ end }}" style="background:{{ topicColor . }}">{{ . }}</a>
+      <a class="topic-pill" href="/{{ filterQuery "topic" . "date" $.FilterDate "q" $.FilterQuery }}" style="background:{{ topicColor . }}">{{ . }}</a>
       {{ end }}
       {{ if .PublishedOn }}<span class="published-on" title="Published on {{ .PublishedOn }}">{{ .PublishedOn }}</span>{{ end }}
       <span class="fetched-at" title="Article fetched on {{ formatTime .FetchedAt }}">{{ formatTime .FetchedAt }}</span>
     </div>
     <h3>
       {{ if .URL }}
-      <a class="search-title" href="{{ .URL }}" target="_blank" rel="noopener noreferrer">{{ if .Title }}{{ .Title }}{{ else }}(no title){{ end }}</a>
+      <a href="{{ .URL }}" target="_blank" rel="noopener noreferrer">{{ if .Title }}{{ .Title }}{{ else }}(no title){{ end }}</a>
       {{ else }}
-      <span class="search-title">{{ if .Title }}{{ .Title }}{{ else }}(no title){{ end }}</span>
+      <span>{{ if .Title }}{{ .Title }}{{ else }}(no title){{ end }}</span>
       {{ end }}
     </h3>
     {{ if .URL }}{{ with domain .URL }}<span class="article-domain">{{ . }}</span>{{ end }}{{ end }}
-    {{ if .Summary }}<p class="search-summary">{{ .Summary }}</p>{{ end }}
+    {{ if .Summary }}<p>{{ .Summary }}</p>{{ end }}
   </div>
   {{ end }}
 </div>
@@ -51,7 +51,7 @@
 {{ template "pagination" . }}
 {{ else }}
 <div class="no-articles">
-  <p>No articles found{{ if .FilterTopic }} for topic "{{ .FilterTopic }}"{{ end }}.</p>
+  <p>No articles found{{ if .FilterTopic }} for topic "{{ .FilterTopic }}"{{ end }}{{ if .FilterQuery }} matching "{{ .FilterQuery }}"{{ end }}.</p>
 </div>
 {{ end }}
 {{ end }}
@@ -63,9 +63,10 @@
   {{ $total := .TotalPages }}
   {{ $topic := .FilterTopic }}
   {{ $date := .FilterDate }}
+  {{ $q := .FilterQuery }}
 
   {{ if gt .CurrentPage 1 }}
-  <a href="?{{ if $topic }}topic={{ $topic }}&{{ end }}{{ if $date }}date={{ $date }}&{{ end }}page={{ sub $cur 1 }}">&larr;</a>
+  <a href="/{{ filterQuery "topic" $topic "date" $date "q" $q "page" (printf "%d" (sub $cur 1)) }}">&larr;</a>
   {{ end }}
 
   {{ range seq $total }}
@@ -74,7 +75,7 @@
     {{ if eq $p $cur }}
     <span class="current">{{ $p }}</span>
     {{ else }}
-    <a href="?{{ if $topic }}topic={{ $topic }}&{{ end }}{{ if $date }}date={{ $date }}&{{ end }}page={{ $p }}">{{ $p }}</a>
+    <a href="/{{ filterQuery "topic" $topic "date" $date "q" $q "page" (printf "%d" $p) }}">{{ $p }}</a>
     {{ end }}
   {{ else if or (eq $p 3) (eq $p (sub $total 2)) }}
   <span class="ellipsis">…</span>
@@ -82,7 +83,7 @@
   {{ end }}
 
   {{ if lt $cur $total }}
-  <a href="?{{ if $topic }}topic={{ $topic }}&{{ end }}{{ if $date }}date={{ $date }}&{{ end }}page={{ add $cur 1 }}">&rarr;</a>
+  <a href="/{{ filterQuery "topic" $topic "date" $date "q" $q "page" (printf "%d" (add $cur 1)) }}">&rarr;</a>
   {{ end }}
 </nav>
 {{ end }}
