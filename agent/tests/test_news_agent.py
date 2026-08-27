@@ -1111,6 +1111,10 @@ def test_summarize_day_uses_default_num_ctx(tmp_path):
     _, kwargs = mock_chat.call_args
     assert kwargs["model"] == news_agent.SUMMARY_MODEL_NAME
     assert kwargs["num_ctx"] == news_agent.SUMMARY_NUM_CTX
+    # Prose gets room to vary; top_k/top_p are pinned rather than left to the server.
+    assert kwargs["temperature"] == news_agent.SUMMARY_TEMPERATURE
+    assert kwargs["top_k"] == news_agent.SUMMARY_TOP_K
+    assert kwargs["top_p"] == news_agent.SUMMARY_TOP_P
 
 
 def test_summarize_day_model_and_num_ctx_override(tmp_path):
@@ -1519,6 +1523,9 @@ def test_build_graph_sets_the_agent_context_window():
     _, kwargs = mock_chat.call_args
     assert kwargs["num_ctx"] == news_agent.AGENT_NUM_CTX
     assert news_agent.AGENT_NUM_CTX > 4096
+    # Low, not greedy: stable tool selection with enough slack to escape a bad loop.
+    assert kwargs["temperature"] == news_agent.AGENT_TEMPERATURE
+    assert 0 < news_agent.AGENT_TEMPERATURE < 1
 
 
 def test_agent_step_metrics_record_the_context_window(tmp_path):
@@ -1565,3 +1572,5 @@ def test_judge_caps_output_instead_of_widening_the_context(tmp_path):
     assert kwargs["num_predict"] == news_agent.JUDGE_NUM_PREDICT
     # A wider window would only let a runaway burn more tokens before failing open.
     assert "num_ctx" not in kwargs
+    # Sampling entropy is pure downside for a YES/NO verdict.
+    assert kwargs["temperature"] == 0

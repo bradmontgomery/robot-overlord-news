@@ -64,6 +64,24 @@ JUDGE_BATCH_SIZE = 10
 # reasoning=False note in judge_articles). A bigger window would only let a runaway
 # burn more; capping it ends one in ~256 tokens instead of ~3000.
 JUDGE_NUM_PREDICT = 256
+# Sampling parameters. Ollama's own defaults (temperature 0.8, top_k 40, top_p 0.9)
+# are tuned for open-ended chat; these three call sites want different things.
+# The ReAct loop needs the same tool call for the same state, not variety — but not
+# pure greedy decoding either, which can lock a stuck loop into repeating one bad
+# search verbatim. 0.2 keeps tool selection stable with just enough slack to break
+# out. Note this is low temperature, not determinism: reproducing a run exactly
+# would also require pinning `seed`.
+AGENT_TEMPERATURE = 0.2
+# The judge emits a handful of YES/NO tokens and nothing else, so any sampling
+# entropy is pure downside — see the runaway described at JUDGE_NUM_PREDICT.
+JUDGE_TEMPERATURE = 0.0
+# The summary is prose meant to be read, so it gets room to vary word choice.
+# top_k/top_p are set explicitly at Ollama's defaults: at 0.5 the tail is live
+# (unlike the greedy judge, where they would be inert), so the values that shape
+# it belong in the source rather than in whatever the server happens to default to.
+SUMMARY_TEMPERATURE = 0.5
+SUMMARY_TOP_K = 40
+SUMMARY_TOP_P = 0.9
 DEFAULT_TOPICS = (
     "anthropic",  # AI companies
     "openai",
@@ -420,7 +438,10 @@ def build_graph(run_id: str | None = None):
     system_message = SystemMessage(_SYSTEM_PROMPT.format(today=today))
 
     model = ChatOllama(
-        model=MODEL_NAME, base_url=OLLAMA_BASE_URL, num_ctx=AGENT_NUM_CTX
+        model=MODEL_NAME,
+        base_url=OLLAMA_BASE_URL,
+        num_ctx=AGENT_NUM_CTX,
+        temperature=AGENT_TEMPERATURE,
     ).bind_tools(tools)
     tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
 
@@ -492,6 +513,7 @@ def judge_articles(topics: list[str], run_start: str) -> int:
         base_url=OLLAMA_BASE_URL,
         reasoning=False,
         num_predict=JUDGE_NUM_PREDICT,
+        temperature=JUDGE_TEMPERATURE,
     )
     to_delete: list[int] = []
     for i in range(0, len(rows), JUDGE_BATCH_SIZE):
@@ -578,7 +600,12 @@ def _invoke_summary_model(
     start = time.perf_counter()
     try:
         response = ChatOllama(
-            model=model_name, base_url=OLLAMA_BASE_URL, num_ctx=num_ctx
+            model=model_name,
+            base_url=OLLAMA_BASE_URL,
+            num_ctx=num_ctx,
+            temperature=SUMMARY_TEMPERATURE,
+            top_k=SUMMARY_TOP_K,
+            top_p=SUMMARY_TOP_P,
         ).invoke(messages)
     except Exception as exc:
         _log_llm_call(
