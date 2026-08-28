@@ -20,7 +20,7 @@ These are the review criteria. Changes that violate them get pushed back on, eve
 |---|---|
 | `main.go` | Entire app: handlers, SQL, template funcs. ~600 lines, intentionally one file. |
 | `templates/` | `base.html` (shell), `index.html`, `stats.html`, `histogram.html` (shared partial). |
-| `static/` | `style.css` + four vanilla JS files (favorites, theme, search, presentation). |
+| `static/` | `style.css` + three vanilla JS files (favorites, theme, presentation). |
 | `infrastructure/` | CloudFormation, systemd unit, nginx config. |
 | `scripts/sync-db.sh` | Rsyncs the local DB to prod and restarts the service. |
 

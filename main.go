@@ -6,6 +6,7 @@ import (
 	"embed"
 	"encoding/json"
 	"encoding/xml"
+	"fmt"
 	"html/template"
 	"log"
 	"math"
@@ -101,6 +102,7 @@ type PageData struct {
 	SourceCounts []NameCount
 	TotalCount   int
 	DailySummary string
+	FilterQuery  string
 }
 
 var db *sql.DB
@@ -181,6 +183,26 @@ func main() {
 			}
 			return string(b), nil
 		},
+		// filterQuery builds a "?k=v&..." query string from name/value
+		// pairs, skipping any pair whose value is empty. Used to carry the
+		// active topic/date/q filters (and page) across links without the
+		// ambiguous-URL-context errors html/template raises on branching
+		// href="...{{if}}...{{end}}" constructions.
+		"filterQuery": func(pairs ...string) (string, error) {
+			if len(pairs)%2 != 0 {
+				return "", fmt.Errorf("filterQuery: odd number of args")
+			}
+			v := url.Values{}
+			for i := 0; i+1 < len(pairs); i += 2 {
+				if pairs[i+1] != "" {
+					v.Set(pairs[i], pairs[i+1])
+				}
+			}
+			if len(v) == 0 {
+				return "", nil
+			}
+			return "?" + v.Encode(), nil
+		},
 	}
 
 	indexTmpl, err = template.New("").Funcs(funcMap).ParseFS(content,
@@ -215,6 +237,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 
 	topic := r.URL.Query().Get("topic")
 	dateFilter := r.URL.Query().Get("date")
+	q := r.URL.Query().Get("q")
 	pageStr := r.URL.Query().Get("page")
 	page := 1
 	if p, err := strconv.Atoi(pageStr); err == nil && p > 1 {
@@ -246,7 +269,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		dailyCounts = nil
 	}
 
-	total, articles, err := getArticles(topic, dateFilter, page)
+	total, articles, err := getArticles(topic, dateFilter, q, page)
 	if err != nil {
 		http.Error(w, "db error", 500)
 		log.Println("getArticles:", err)
@@ -265,6 +288,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		TotalPages:   totalPages,
 		FilterTopic:  topic,
 		FilterDate:   dateFilter,
+		FilterQuery:  q,
 		RecentDates:  recentDates,
 		DailyCounts:  dailyCounts,
 		TotalCount:   total,
@@ -339,6 +363,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 func handlePresent(w http.ResponseWriter, r *http.Request) {
 	topic := r.URL.Query().Get("topic")
 	dateFilter := r.URL.Query().Get("date")
+	q := r.URL.Query().Get("q")
 	pageStr := r.URL.Query().Get("page")
 
 	var articles []Article
@@ -349,9 +374,9 @@ func handlePresent(w http.ResponseWriter, r *http.Request) {
 		if p, perr := strconv.Atoi(pageStr); perr == nil && p > 1 {
 			page = p
 		}
-		_, articles, err = getArticles(topic, dateFilter, page)
+		_, articles, err = getArticles(topic, dateFilter, q, page)
 	} else {
-		articles, err = getAllArticles(topic, dateFilter)
+		articles, err = getAllArticles(topic, dateFilter, q)
 	}
 
 	if err != nil {
@@ -630,22 +655,31 @@ func splitTopics(raw string) []string {
 }
 
 // articleFilter builds the WHERE clause (without the "WHERE" keyword) and its
-// bind args for the optional topic/date filters shared by getArticles and
-// getAllArticles. Returns an empty clause when neither filter is set.
-func articleFilter(topic, date string) (string, []interface{}) {
+// bind args for the optional topic/date/search filters shared by getArticles,
+// getAllArticles, and getFeedArticles. Returns an empty clause when none of
+// the filters are set.
+func articleFilter(topic, date, q string) (string, []interface{}) {
 	const topicFilter = `',' || topic || ',' LIKE '%,' || ? || ',%'`
 	const dateFilter = `DATE(fetched_at) = ?`
+	const searchFilter = `(title LIKE '%' || ? || '%' OR summary LIKE '%' || ? || '%')`
 
-	switch {
-	case topic != "" && date != "":
-		return topicFilter + ` AND ` + dateFilter, []interface{}{topic, date}
-	case topic != "":
-		return topicFilter, []interface{}{topic}
-	case date != "":
-		return dateFilter, []interface{}{date}
-	default:
-		return "", nil
+	var clauses []string
+	var args []interface{}
+
+	if topic != "" {
+		clauses = append(clauses, topicFilter)
+		args = append(args, topic)
 	}
+	if date != "" {
+		clauses = append(clauses, dateFilter)
+		args = append(args, date)
+	}
+	if q != "" {
+		clauses = append(clauses, searchFilter)
+		args = append(args, q, q)
+	}
+
+	return strings.Join(clauses, " AND "), args
 }
 
 func scanArticles(rows *sql.Rows) ([]Article, error) {
@@ -662,10 +696,10 @@ func scanArticles(rows *sql.Rows) ([]Article, error) {
 	return articles, rows.Err()
 }
 
-func getArticles(topic, date string, page int) (int, []Article, error) {
+func getArticles(topic, date, q string, page int) (int, []Article, error) {
 	offset := (page - 1) * pageSize
 
-	clause, args := articleFilter(topic, date)
+	clause, args := articleFilter(topic, date, q)
 	where := ""
 	if clause != "" {
 		where = ` WHERE ` + clause
@@ -690,8 +724,8 @@ func getArticles(topic, date string, page int) (int, []Article, error) {
 // getAllArticles returns every article matching the topic/date filter, with
 // no pagination limit. Used by presentation mode when no page has been
 // explicitly selected.
-func getAllArticles(topic, date string) ([]Article, error) {
-	clause, args := articleFilter(topic, date)
+func getAllArticles(topic, date, q string) ([]Article, error) {
+	clause, args := articleFilter(topic, date, q)
 	where := ""
 	if clause != "" {
 		where = ` WHERE ` + clause
@@ -712,7 +746,7 @@ func getAllArticles(topic, date string) ([]Article, error) {
 // an RSS item with an empty link and guid is invalid, and the data contains a
 // few such rows.
 func getFeedArticles(topic, date string, limit int) ([]Article, error) {
-	clause, args := articleFilter(topic, date)
+	clause, args := articleFilter(topic, date, "")
 	where := ` WHERE COALESCE(url,'') != ''`
 	if clause != "" {
 		where += ` AND (` + clause + `)`

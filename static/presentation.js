@@ -1,8 +1,6 @@
 (function () {
   "use strict";
 
-  var FAVORITES_KEY = "robotOverlordFavorites";
-
   function domain(rawURL) {
     try {
       var host = new URL(rawURL).hostname;
@@ -17,16 +15,6 @@
     var d = new Date(s);
     if (isNaN(d.getTime())) return s;
     return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
-  }
-
-  function loadFavorites() {
-    try {
-      var raw = localStorage.getItem(FAVORITES_KEY);
-      var map = raw ? JSON.parse(raw) : {};
-      return Object.keys(map).map(function (url) { return map[url]; });
-    } catch (e) {
-      return [];
-    }
   }
 
   function savedViewActive() {
@@ -47,12 +35,12 @@
 
   function getArticlesForPresentation() {
     if (savedViewActive()) {
-      return Promise.resolve(loadFavorites());
+      return Promise.resolve(window.RobotOverlordFavorites.list());
     }
     return fetchNormalArticles();
   }
 
-  var AUTOPLAY_INTERVAL_MS = 8000;
+  var AUTOPLAY_INTERVAL_MS = 10000;
 
   var overlay = null;
   var articles = [];
@@ -116,6 +104,27 @@
     progressRAF = requestAnimationFrame(function () { tickProgress(Date.now()); });
   }
 
+  function updateFavoriteButton() {
+    var btn = overlay.querySelector(".presentation-favorite-btn");
+    if (!btn) return;
+    if (articles.length === 0) {
+      btn.hidden = true;
+      return;
+    }
+    btn.hidden = false;
+    var isFavorited = window.RobotOverlordFavorites.isFavorite(articles[index].URL);
+    btn.textContent = isFavorited ? "♥" : "♡";
+    btn.classList.toggle("favorited", isFavorited);
+    btn.setAttribute("aria-label", isFavorited ? "Remove from saved" : "Save article");
+    btn.title = isFavorited ? "Remove from saved" : "Save article";
+  }
+
+  function toggleCurrentFavorite() {
+    if (articles.length === 0) return;
+    window.RobotOverlordFavorites.toggle(articles[index]);
+    updateFavoriteButton();
+  }
+
   function renderSlide() {
     var titleEl = overlay.querySelector(".presentation-title");
     var summaryEl = overlay.querySelector(".presentation-summary");
@@ -135,6 +144,7 @@
       prevBtn.hidden = true;
       nextBtn.hidden = true;
       updatePlayPauseButton();
+      updateFavoriteButton();
       return;
     }
 
@@ -151,6 +161,7 @@
     prevBtn.hidden = false;
     nextBtn.hidden = false;
     updatePlayPauseButton();
+    updateFavoriteButton();
   }
 
   function stopAutoplay() {
@@ -222,6 +233,7 @@
       '<div class="presentation-controls">' +
       '<button class="presentation-prev" type="button" aria-label="Previous article">&larr;</button>' +
       '<button class="presentation-playpause" type="button" aria-label="Pause autoplay">⏸</button>' +
+      '<button class="presentation-favorite-btn" type="button" aria-label="Save article">♡</button>' +
       '<span class="presentation-counter"></span>' +
       '<button class="presentation-next" type="button" aria-label="Next article">&rarr;</button>' +
       "</div>";
@@ -230,6 +242,7 @@
     el.querySelector(".presentation-prev").addEventListener("click", showPrev);
     el.querySelector(".presentation-next").addEventListener("click", showNext);
     el.querySelector(".presentation-playpause").addEventListener("click", togglePlayPause);
+    el.querySelector(".presentation-favorite-btn").addEventListener("click", toggleCurrentFavorite);
 
     return el;
   }

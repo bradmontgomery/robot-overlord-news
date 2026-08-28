@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Robot Overlord News{{ if .FilterTopic }} — {{ .FilterTopic }}{{ else if .FilterDate }} — {{ formatDate .FilterDate }}{{ end }}</title>
+  <title>Robot Overlord News{{ if .FilterTopic }} — {{ .FilterTopic }}{{ else if .FilterDate }} — {{ formatDate .FilterDate }}{{ end }}{{ if .FilterQuery }} — search: {{ .FilterQuery }}{{ end }}</title>
   <script>
     (function () {
       var t = localStorage.getItem("robotOverlordTheme");
@@ -29,7 +29,7 @@
     <ul class="topic-list">
       {{ range .RecentDates }}
       <li>
-        <a href="/?date={{ . }}{{ if $.FilterTopic }}&topic={{ $.FilterTopic }}{{ end }}" {{ if eq . $.FilterDate }}class="active"{{ end }}>
+        <a href="/{{ filterQuery "date" . "topic" $.FilterTopic "q" $.FilterQuery }}" {{ if eq . $.FilterDate }}class="active"{{ end }}>
           {{ formatDate . }}
         </a>
       </li>
@@ -44,13 +44,13 @@
     <h2 class="sidebar-section-gap">Topics</h2>
     <ul class="topic-list">
       <li>
-        <a href="/" {{ if and (eq .FilterTopic "") (eq .FilterDate "") }}class="active"{{ end }}>
+        <a href="/" {{ if and (eq .FilterTopic "") (eq .FilterDate "") (eq .FilterQuery "") }}class="active"{{ end }}>
           <span class="topic-dot" style="background:#8892b0"></span>All topics
         </a>
       </li>
       {{ range .Topics }}
       <li>
-        <a href="/?topic={{ . }}{{ if $.FilterDate }}&date={{ $.FilterDate }}{{ end }}" {{ if eq . $.FilterTopic }}class="active"{{ end }} title="{{ . }}">
+        <a href="/{{ filterQuery "topic" . "date" $.FilterDate "q" $.FilterQuery }}" {{ if eq . $.FilterTopic }}class="active"{{ end }} title="{{ . }}">
           <span class="topic-dot" style="background:{{ topicColor . }}"></span>{{ . }}
         </a>
       </li>
@@ -59,17 +59,17 @@
   </aside>
 
   <main>
-    <div class="search-bar">
-      <input type="search" id="article-search" class="search-input" placeholder="Search articles on this page..." aria-label="Search articles" autocomplete="off">
-      <span id="search-count" class="search-count" hidden></span>
-    </div>
+    <form class="search-bar" method="get" action="/">
+      {{ if .FilterTopic }}<input type="hidden" name="topic" value="{{ .FilterTopic }}">{{ end }}
+      {{ if .FilterDate }}<input type="hidden" name="date" value="{{ .FilterDate }}">{{ end }}
+      <input type="search" id="article-search" name="q" class="search-input" placeholder="Search titles and summaries..." aria-label="Search articles" autocomplete="off" value="{{ .FilterQuery }}">
+    </form>
     <div id="normal-view">{{ template "content" . }}</div>
     <div id="saved-view" class="articles" hidden></div>
   </main>
 </div>
 <script src="/static/favorites.js" defer></script>
 <script src="/static/theme.js" defer></script>
-<script src="/static/search.js" defer></script>
 <script src="/static/presentation.js" defer></script>
 </body>
 </html>
