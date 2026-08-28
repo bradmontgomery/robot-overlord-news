@@ -390,7 +390,9 @@ def test_capped_judge_runaways_still_count_as_runaways(two_cohorts):
 
 def test_cohort_stats_survive_a_cohort_with_no_runs():
     """agent_step records can exist for a run whose `run` record never landed."""
-    stats = mr._cohort_stats([_llm()], None, {"2026-07-28T03:29:53+00:00"})
+    stats = mr._cohort_stats(
+        [_llm()], (None, None, None, None), {"2026-07-28T03:29:53+00:00"}
+    )
 
     assert stats["runs"] == 0
     assert stats["median_wall_s"] == 0.0
@@ -439,3 +441,266 @@ def test_render_falls_back_when_there_are_no_agent_steps():
 
     assert page.count("<svg") == 3
     assert 'table class="cohort"' not in page
+
+
+# ---------------------------------------------------------------------------
+# tool instrumentation and config cohorts
+# ---------------------------------------------------------------------------
+
+
+def _tool(tool="duckduckgo_results_json", elapsed=1.5, **extra):
+    return {
+        "type": "tool_call",
+        "run_id": "2026-07-28T03:29:53+00:00",
+        "batch_index": 0,
+        "tool": tool,
+        "elapsed_s": elapsed,
+        **extra,
+    }
+
+
+def test_tool_rows_separate_empty_results_from_errors():
+    """A quiet news day and a failing backend must never share a column."""
+    records = [
+        _tool(success=True, result_count=5),
+        _tool(success=True, result_count=0),
+        _tool(success=False, error="boom", error_type="DDGSException"),
+        _tool(tool="store_result", success=True, outcome="stored"),
+    ]
+
+    rows = {r["tool"]: r for r in mr.summarize(records)["tools"]}
+
+    search = rows["duckduckgo_results_json"]
+    assert search["calls"] == 3
+    assert search["errors"] == 1
+    assert search["empty"] == 1
+    assert rows["store_result"]["errors"] == 0
+
+
+def test_tool_error_rate_has_a_denominator():
+    """An error count alone cannot say whether a failure rate is rising."""
+    records = [_tool(success=True, result_count=3) for _ in range(9)]
+    records.append(_tool(success=False, error="x", error_type="DDGSException"))
+
+    k = mr.summarize(records)["kpis"]
+
+    assert k["tool_calls"] == 10
+    assert k["tool_error_pct"] == pytest.approx(10.0)
+
+
+def test_batch_failures_exclude_tool_and_llm_failures():
+    """The KPI counts batches; counting every `success: false` would triple-count."""
+    records = [
+        _step("search_batch", topics="a", success=False, error_type="ResponseError"),
+        _llm(success=False, error_type="ResponseError"),
+        _tool(success=False, error="boom", error_type="DDGSException"),
+    ]
+
+    assert mr.summarize(records)["kpis"]["failures"] == 1
+
+
+def test_error_classes_prefer_error_type():
+    records = [
+        _step("search_batch", topics="a", success=False, error_type="ResponseError"),
+        _step("search_batch", topics="a", success=False, error_type="ResponseError"),
+        _step("search_batch", topics="a", success=False,
+              error_type="GraphRecursionError"),
+    ]
+
+    assert mr.summarize(records)["error_classes"] == [
+        ("ResponseError", 2),
+        ("GraphRecursionError", 1),
+    ]
+
+
+def test_error_classes_collapse_line_numbers_for_legacy_records():
+    """Records predating error_type would otherwise scatter into one-off rows."""
+    records = [
+        _step("search_batch", topics="a", success=False,
+              error="XML syntax error on line 17: element <function> closed"),
+        _step("search_batch", topics="a", success=False,
+              error="XML syntax error on line 16: element <function> closed"),
+    ]
+
+    classes = mr.summarize(records)["error_classes"]
+
+    assert len(classes) == 1
+    assert classes[0][1] == 2
+
+
+def test_error_classes_tolerate_a_failure_with_no_message():
+    records = [_step("search_batch", topics="a", success=False)]
+
+    assert mr.summarize(records)["error_classes"] == [("unknown", 1)]
+
+
+def test_cohorts_split_on_sampling_params_not_just_context():
+    """A temperature change must show as a step change, not be averaged away."""
+    old_run = "2026-07-28T03:00:00+00:00"
+    new_run = "2026-08-27T03:00:00+00:00"
+    records = [
+        _llm(run_id=old_run, num_ctx=16384),
+        _step("run", run_id=old_run, new_articles=10),
+        _llm(run_id=new_run, num_ctx=16384, temperature=0.2),
+        _step("run", run_id=new_run, new_articles=10),
+    ]
+
+    cohorts = mr.summarize(records)["cohorts"]
+
+    assert [c["label"] for c in cohorts] == [
+        "num_ctx 16,384",
+        "num_ctx 16,384 · temp 0.2",
+    ]
+    # Absence dates a run to before the setting was logged — no backfill needed.
+    assert cohorts[0]["config"]["temperature"] is None
+
+
+def test_config_label_names_every_logged_sampling_param():
+    label = mr._config_label((49152, 0.5, 0.9, 40))
+
+    assert label == "num_ctx 49,152 · temp 0.5 · top_p 0.9 · top_k 40"
+
+
+def test_render_derives_the_failure_caption_from_the_records():
+    """The old caption asserted one cause directly above a list contradicting it."""
+    records = [
+        _step("search_batch", topics="a", success=False, error_type="ResponseError"),
+        _step("search_batch", topics="a", success=False,
+              error_type="GraphRecursionError"),
+        _step("run", new_articles=1),
+        _tool(success=True, result_count=2),
+    ]
+
+    page = mr.render_html(mr.summarize(records))
+
+    assert "Every failure is the same failure" not in page
+    assert "are not" in page
+    assert "What the tools actually did" in page
+    assert "failed batches" in page
+
+
+# ---------------------------------------------------------------------------
+# invented-label visibility
+# ---------------------------------------------------------------------------
+
+
+def _store(dropped=None, outcome="stored", **extra):
+    return _tool(tool="store_result", success=True, outcome=outcome,
+                 dropped=dropped or [], **extra)
+
+
+def test_dropped_labels_are_counted_not_silently_repaired():
+    """store_result discards invented labels; the discard has to stay visible."""
+    records = [
+        _store(),
+        _store(dropped=["ai coding"]),
+        _store(dropped=["ai coding", "ai security"]),
+        _store(dropped=["ollama", "local llm"], outcome="rejected"),
+    ]
+
+    d = mr.summarize(records)["dropped_labels"]
+
+    assert d["calls"] == 4
+    assert d["with_dropped"] == 3
+    assert d["with_dropped_pct"] == pytest.approx(75.0)
+    assert d["rejected"] == 1
+    assert d["mentions"] == 5
+    assert d["distinct"] == 4
+    assert d["labels"][0] == ("ai coding", 2)
+
+
+def test_unvalidated_stores_are_excluded_from_the_denominator():
+    """Calls logged before the check existed carry no `dropped` key."""
+    legacy = _tool(tool="store_result", success=True, outcome="stored")
+    legacy.pop("dropped", None)
+    records = [legacy, legacy, _store(dropped=["ai coding"])]
+
+    d = mr.summarize(records)["dropped_labels"]
+
+    # 1 validated call, 1 with a drop — not 3 calls and a reassuring 33%.
+    assert d["calls"] == 1
+    assert d["unvalidated"] == 2
+    assert d["with_dropped_pct"] == pytest.approx(100.0)
+
+
+def test_page_says_when_calls_predate_the_check():
+    legacy = _tool(tool="store_result", success=True, outcome="stored")
+    records = [legacy, _store(), _step("run", new_articles=1)]
+
+    page = mr.render_html(mr.summarize(records))
+
+    assert "predate the check and are excluded" in page
+
+
+def test_dropped_labels_ignore_other_tools():
+    records = [_tool(success=True, result_count=3), _store()]
+
+    assert mr.summarize(records)["dropped_labels"]["calls"] == 1
+
+
+def test_dropped_kpi_reaches_the_page():
+    records = [_store(dropped=["ai coding"]), _store(), _step("run", new_articles=1)]
+
+    page = mr.render_html(mr.summarize(records))
+
+    assert "Labels the agent invented" in page
+    assert "stores with an invented label" in page
+    assert "ai coding" in page
+
+
+def test_clean_runs_say_so_rather_than_hiding_the_figure():
+    """A silent repair and a well-behaved model must not render identically."""
+    records = [_store(), _store(), _step("run", new_articles=1)]
+
+    page = mr.render_html(mr.summarize(records))
+
+    assert "None of the 2 validated store_result calls" in page
+
+
+def test_dropped_figure_absent_when_store_result_was_never_called():
+    """Historical records predate the tool logging entirely."""
+    records = [_llm(), _step("run", new_articles=1)]
+
+    assert "Labels the agent invented" not in mr.render_html(mr.summarize(records))
+
+
+def test_dropped_figure_absent_when_nothing_was_validated():
+    """All-legacy data must not render a 0% rate over unexamined calls."""
+    legacy = _tool(tool="store_result", success=True, outcome="stored")
+    records = [legacy, legacy, _step("run", new_articles=1)]
+
+    page = mr.render_html(mr.summarize(records))
+
+    assert "Labels the agent invented" not in page
+    # The KPI must not report a reassuring 0% either.
+    assert "stores checked for invented labels" in page
+    assert "stores with an invented label" not in page
+
+
+def test_yield_chart_flags_runs_counted_before_pruning():
+    """Old runs report found totals, new ones report what survived — say so."""
+    old_run = _step("run", run_id="2026-07-01T00:00:00+00:00", new_articles=40)
+    new_run = _step("run", run_id="2026-08-27T00:00:00+00:00", new_articles=30,
+                    articles_found=40, articles_pruned=10)
+
+    summary = mr.summarize([old_run, new_run])
+    page = mr.render_html(summary)
+
+    assert summary["pre_prune_runs"] == 1
+    assert "counted articles before the judge pruned them" in page
+
+
+def test_yield_chart_says_nothing_when_every_run_is_post_prune():
+    records = [_step("run", new_articles=30, articles_found=40, articles_pruned=10)]
+
+    page = mr.render_html(mr.summarize(records))
+
+    assert "counted articles before the judge pruned" not in page
+
+
+def test_yield_chart_flags_an_all_legacy_file():
+    records = [_step("run", new_articles=40)]
+
+    page = mr.render_html(mr.summarize(records))
+
+    assert "these are found totals, not what remained stored" in page

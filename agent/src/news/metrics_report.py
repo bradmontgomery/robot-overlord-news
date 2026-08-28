@@ -20,12 +20,17 @@ every run that came before it.
 
 Aggregation (`summarize`) is pure and separate from rendering so the numbers can
 be tested without parsing HTML.
+
+Note on file size: the agent also logs one `tool_call` record per tool invocation,
+which roughly doubles the rate news_metrics.jsonl grows (~40 MB as of Aug 2026).
+There is no rotation yet; it will eventually need some.
 """
 
 import argparse
 import html
 import json
 import os
+import re
 import statistics
 import sys
 from collections import Counter, defaultdict
@@ -172,6 +177,9 @@ def _run_rows(records: list[dict]) -> list[dict]:
             "wall_s": r.get("elapsed_s") or 0.0,
             "new_articles": r.get("new_articles") or 0,
             "topics": r.get("topics") or 0,
+            # Absent on runs that counted before judging — see `pre_prune_runs`.
+            "found": r.get("articles_found"),
+            "pruned": r.get("articles_pruned"),
         }
         for r in _steps(records, "run")
     ]
@@ -179,23 +187,57 @@ def _run_rows(records: list[dict]) -> list[dict]:
     return rows
 
 
-def _run_cohorts(records: list[dict]) -> dict[str, int | None]:
-    """Map each run_id to the agent context window that run used.
+# Every model setting that shapes agent output, in label order. A run is grouped by
+# the tuple of these, so changing any one of them shows up as a step change rather
+# than being averaged against every run that came before it.
+CONFIG_FIELDS = ("num_ctx", "temperature", "top_p", "top_k")
 
-    `num_ctx` is only logged from the point the agent started setting it, so its
-    absence dates a run to the era of Ollama's 4096-token default. That makes it
-    the pre/post marker for a config change, with no backfill needed.
+
+def _config_key(record: dict) -> tuple:
+    """The config a record ran under, as a hashable key.
+
+    Must be a tuple, not a dict: `_cohorts` uses it as a dict key.
     """
-    cohorts: dict[str, int | None] = {}
+    return tuple(record.get(field) for field in CONFIG_FIELDS)
+
+
+def _config_label(key: tuple) -> str:
+    """Human label naming only the settings actually logged.
+
+    A missing value dates a run to before that setting was recorded — the same way an
+    absent `num_ctx` already dates one to Ollama's 4096 default. So old runs keep their
+    old label and no backfill is needed.
+    """
+    num_ctx, temperature, top_p, top_k = key
+    parts = [
+        f"num_ctx {num_ctx:,}" if num_ctx else f"num_ctx {CONTEXT_CEILING:,} (default)"
+    ]
+    for name, value in (("temp", temperature), ("top_p", top_p), ("top_k", top_k)):
+        if value is not None:
+            parts.append(f"{name} {value:g}")
+    return " · ".join(parts)
+
+
+def _run_cohorts(records: list[dict]) -> dict[str, tuple]:
+    """Map each run_id to the agent model config that run used.
+
+    A setting is only logged from the point the agent started setting it, so its
+    absence dates a run to the era before it. That makes the config tuple the pre/post
+    marker for a config change, with no backfill needed.
+    """
+    cohorts: dict[str, tuple] = {}
     for r in _llm_calls(records, "agent_step"):
         run_id = r.get("run_id") or ""
-        if cohorts.get(run_id) is None:
-            cohorts[run_id] = r.get("num_ctx")
+        # First write wins — one config per run. Spelled as a membership test because
+        # None is a legitimate value inside the key, not just a missing-entry sentinel.
+        if run_id not in cohorts:
+            cohorts[run_id] = _config_key(r)
     return cohorts
 
 
-def _cohort_stats(records: list[dict], num_ctx: int | None, run_ids: set) -> dict:
+def _cohort_stats(records: list[dict], config: tuple, run_ids: set) -> dict:
     """The signals worth comparing across a config change, for one cohort."""
+    num_ctx = config[0]
     sub = [r for r in records if r.get("run_id") in run_ids]
     agent = _llm_calls(sub, "agent_step")
     judge = _llm_calls(sub, "judge_batch")
@@ -216,7 +258,8 @@ def _cohort_stats(records: list[dict], num_ctx: int | None, run_ids: set) -> dic
 
     return {
         "num_ctx": num_ctx,
-        "label": f"num_ctx {num_ctx:,}" if num_ctx else f"num_ctx {CONTEXT_CEILING:,} (default)",
+        "config": dict(zip(CONFIG_FIELDS, config)),
+        "label": _config_label(config),
         "runs": len(runs),
         "agent_calls": len(agent),
         "truncated": len(truncated),
@@ -240,12 +283,105 @@ def _cohort_stats(records: list[dict], num_ctx: int | None, run_ids: set) -> dic
 def _cohorts(records: list[dict]) -> list[dict]:
     """One entry per distinct agent config, oldest first."""
     by_run = _run_cohorts(records)
-    groups: dict[int | None, set] = defaultdict(set)
-    for run_id, num_ctx in by_run.items():
-        groups[num_ctx].add(run_id)
-    stats = [_cohort_stats(records, ctx, ids) for ctx, ids in groups.items()]
+    groups: dict[tuple, set] = defaultdict(set)
+    for run_id, config in by_run.items():
+        groups[config].add(run_id)
+    stats = [_cohort_stats(records, cfg, ids) for cfg, ids in groups.items()]
     stats.sort(key=lambda c: c["first_run"])
     return stats
+
+
+def _tool_rows(records: list[dict]) -> list[dict]:
+    """Per-tool call counts, errors and empty results, busiest first.
+
+    Empty results and errors are counted separately and stay separate all the way to
+    the rendered table. "The search backend failed" and "there is no news for this
+    topic" are different facts, and pooling them is what made the failure picture
+    unreadable in the first place.
+    """
+    by_tool = defaultdict(list)
+    for r in records:
+        if r.get("type") == "tool_call":
+            by_tool[r.get("tool") or "unknown"].append(r)
+    rows = []
+    for tool, calls in by_tool.items():
+        errors = [r for r in calls if r.get("success") is False]
+        empty = [
+            r
+            for r in calls
+            if r.get("success") is not False and r.get("result_count") == 0
+        ]
+        rows.append({
+            "tool": tool,
+            "calls": len(calls),
+            "errors": len(errors),
+            "error_pct": _pct(len(errors), len(calls)),
+            "empty": len(empty),
+            "empty_pct": _pct(len(empty), len(calls)),
+            "median_s": _median([r.get("elapsed_s") or 0.0 for r in calls]),
+        })
+    rows.sort(key=lambda row: row["calls"], reverse=True)
+    return rows
+
+
+def _dropped_labels(records: list[dict]) -> dict:
+    """How often store_result was handed a label that was not one of its batch topics.
+
+    The agent invents topic labels — spelling variants, phrases lifted out of the
+    prompt's own wording, and topics recalled from earlier batches. store_result now
+    resolves or discards them, which fixes the data but would hide the behaviour if
+    the discards were not counted. Surfacing the rate keeps a silent repair visible.
+    """
+    stores = [
+        r
+        for r in records
+        if r.get("type") == "tool_call" and r.get("tool") == "store_result"
+    ]
+    # Only calls that actually carry `dropped` were validated. Records logged before
+    # store_result started checking have no such key, and counting them in the
+    # denominator would report a reassuring 0% over calls nobody ever inspected —
+    # the same survivor bias that made the agent_step numbers meaningless.
+    calls = [r for r in stores if "dropped" in r]
+    labels: Counter = Counter()
+    with_dropped = 0
+    for r in calls:
+        dropped = r.get("dropped") or []
+        if dropped:
+            with_dropped += 1
+            labels.update(dropped)
+    rejected = sum(1 for r in calls if r.get("outcome") == "rejected")
+    return {
+        "unvalidated": len(stores) - len(calls),
+        "calls": len(calls),
+        "with_dropped": with_dropped,
+        "with_dropped_pct": _pct(with_dropped, len(calls)),
+        "rejected": rejected,
+        "rejected_pct": _pct(rejected, len(calls)),
+        "mentions": sum(labels.values()),
+        "distinct": len(labels),
+        "labels": labels.most_common(15),
+    }
+
+
+def _error_classes(failures: list[dict]) -> list[tuple]:
+    """Group failures into classes, commonest first.
+
+    Prefers the recorded `error_type`. Older records predate it, so they fall back to
+    the message prefix with digits collapsed — otherwise "XML syntax error on line 17"
+    and "...on line 16" read as two unrelated failures and a single dominant cause
+    scatters into dozens of one-off rows.
+    """
+    counts: Counter = Counter()
+    for r in failures:
+        label = r.get("error_type")
+        if not label:
+            # A failure can be recorded with no message at all, so take the first line
+            # defensively rather than indexing into a possibly empty split.
+            prefix = (r.get("error") or "").split("(status")[0].strip()
+            first_line = prefix.splitlines()[0] if prefix else ""
+            label = re.sub(r"\d+", "N", first_line)[:70] or "unknown"
+        counts[label] += 1
+    return counts.most_common()
 
 
 def summarize(records: list[dict]) -> dict:
@@ -269,7 +405,11 @@ def summarize(records: list[dict]) -> dict:
 
     judged = sum(r.get("articles_judged") or 0 for r in _steps(records, "judge_articles"))
     deleted = sum(r.get("articles_deleted") or 0 for r in _steps(records, "judge_articles"))
-    failures = [r for r in records if r.get("success") is False]
+    # Batch-level failures: the model's tool-call syntax was rejected before any tool
+    # ran. Distinct from tool_call failures, where a tool ran and raised.
+    failures = [r for r in _steps(records, "search_batch") if r.get("success") is False]
+    tool_rows = _tool_rows(records)
+    dropped = _dropped_labels(records)
     cohorts = _cohorts(records)
     # Headline truncation is the *current* config's rate, not the all-time average.
     # Pooling them would let a fixed pile of old failures drag a working fix down
@@ -288,6 +428,15 @@ def summarize(records: list[dict]) -> dict:
             "current_runs": current["runs"] if current else 0,
             "search_share_pct": step_share[0]["pct"] if step_share else 0.0,
             "failures": len(failures),
+            "tool_calls": sum(r["calls"] for r in tool_rows),
+            "tool_errors": sum(r["errors"] for r in tool_rows),
+            "tool_error_pct": _pct(
+                sum(r["errors"] for r in tool_rows),
+                sum(r["calls"] for r in tool_rows),
+            ),
+            "dropped_pct": dropped["with_dropped_pct"],
+            "dropped_distinct": dropped["distinct"],
+            "dropped_validated": dropped["calls"],
             "judged": judged,
             "deleted": deleted,
             "new_articles": sum(r["new_articles"] for r in runs),
@@ -298,9 +447,17 @@ def summarize(records: list[dict]) -> dict:
         "step_share": step_share,
         "topics": topics,
         "runs": runs,
+        # `new_articles` used to be counted before judge_articles deleted anything, so
+        # older runs report a yield inflated by whatever the judge then removed
+        # (~24% of judged articles, historically). Absence of `articles_found` is what
+        # marks those runs; the chart says so rather than quietly mixing the two.
+        "pre_prune_runs": sum(1 for r in runs if r["found"] is None),
         "errors": Counter(
             (r.get("error") or "").split("(status")[0].strip() for r in failures
         ).most_common(),
+        "error_classes": _error_classes(failures),
+        "tools": tool_rows,
+        "dropped_labels": dropped,
         "topics_with_failures": sum(1 for r in topics if r["failures"]),
     }
 
@@ -657,9 +814,29 @@ def render_html(summary: dict) -> str:
         _kpi(f'{k["median_wall_s"] / 60:.1f} min', "median run duration"),
         _kpi(f'{k["search_share_pct"]:.1f}%', "of wall time in search"),
         _kpi(f'{k["current_trunc_pct"]:.1f}%',
-             f'agent steps truncated — {k["current_label"]}, {k["current_runs"]} runs',
+             f'agent steps truncated — {k["current_label"]}, {k["current_runs"]} '
+             f'{"run" if k["current_runs"] == 1 else "runs"}',
              alert=k["current_trunc_pct"] > 1),
-        _kpi(str(k["failures"]), "failed searches", alert=bool(k["failures"])),
+        # "failed batches", not "failed searches": these count batches the model's
+        # tool-call syntax killed before any search ran. Mislabelling them as searches
+        # is what seeded the conclusion that the search backend was at fault.
+        _kpi(str(k["failures"]), "failed batches", alert=bool(k["failures"])),
+        _kpi(
+            f'{k["tool_error_pct"]:.1f}%',
+            f'tool calls failed — {k["tool_calls"]:,} calls',
+            alert=k["tool_error_pct"] > 1,
+        ),
+        # "—" rather than 0% when nothing has been validated: a rate over calls that
+        # were never inspected reads as reassurance and is worth less than nothing.
+        _kpi(
+            f'{k["dropped_pct"]:.1f}%' if k["dropped_validated"] else "—",
+            (
+                f'stores with an invented label — {k["dropped_distinct"]} distinct'
+                if k["dropped_validated"]
+                else "stores checked for invented labels"
+            ),
+            alert=k["dropped_pct"] > 1,
+        ),
         _kpi(f'{k["new_articles"]}', "new articles stored"),
     ])
 
@@ -708,6 +885,105 @@ def render_html(summary: dict) -> str:
     err_rows = "".join(
         f'<li>{count}× <code>{_esc(msg[:80])}</code></li>' for msg, count in summary["errors"][:4]
     )
+
+    # Derived from the records, not asserted. The previous caption here was a hardcoded
+    # claim that every failure was malformed tool-call XML, sitting directly above a
+    # list that showed otherwise.
+    classes = summary["error_classes"]
+    if classes:
+        top_label, top_count = classes[0]
+        rest = sum(c for _, c in classes[1:])
+        failure_caption = (
+            f'{top_count:,} of {k["failures"]:,} batch failures are '
+            f'<code>{_esc(top_label)}</code>'
+            + (
+                f', and {rest:,} are not — across {len(classes) - 1} other '
+                f'{"class" if len(classes) == 2 else "classes"}, listed below. '
+                f'These are different bugs and want different fixes.'
+                if rest
+                else '. Every recorded failure falls in this one class.'
+            )
+        )
+    else:
+        failure_caption = "No batch failures recorded."
+
+    dropped = summary["dropped_labels"]
+    dropped_figure = ""
+    if dropped["calls"]:
+        if dropped["mentions"]:
+            dropped_caption = (
+                f'{dropped["with_dropped"]:,} of {dropped["calls"]:,} store_result '
+                f'calls ({dropped["with_dropped_pct"]:.1f}%) named a label that was not '
+                f'one of the batch\'s topics — {dropped["mentions"]:,} mentions across '
+                f'{dropped["distinct"]} distinct labels. '
+                f'{dropped["rejected"]:,} calls ({dropped["rejected_pct"]:.1f}%) had no '
+                f'valid label left and stored nothing.'
+            )
+        else:
+            dropped_caption = (
+                f'None of the {dropped["calls"]:,} validated store_result calls named '
+                f'a label outside its batch. Counted rather than assumed — the agent '
+                f'used to invent labels, and a silent repair would look identical.'
+            )
+        if dropped["unvalidated"]:
+            dropped_caption += (
+                f' {dropped["unvalidated"]:,} earlier calls predate the check and are '
+                f'excluded — they were never inspected, so counting them here would '
+                f'report a clean rate over unexamined data.'
+            )
+        label_table = _table(
+            ["invented label", "times"],
+            [[label, f"{count:,}"] for label, count in dropped["labels"]],
+            {1},
+        ) if dropped["labels"] else ""
+        dropped_figure = f"""
+<figure>
+  <figcaption>
+    <div class="t">Labels the agent invented</div>
+    <div class="d">{dropped_caption} <code>store_result</code> resolves spelling
+      variants back onto the batch\'s topics and discards the rest, so these never
+      reach the database — but the discard is counted here, because a repair that
+      leaves no trace looks exactly like a model that never misbehaved.</div>
+  </figcaption>
+  <div class="scroll">{label_table}</div>
+</figure>"""
+
+    # Named explicitly rather than left implicit: the two eras are not comparable,
+    # and a reader has no way to see that from the bars alone.
+    pre = summary["pre_prune_runs"]
+    yield_note = ""
+    if pre and pre < len(runs):
+        yield_note = (
+            f' <b>The first {pre} of these {len(runs)} runs counted articles before '
+            f'the judge pruned them</b>, so their bars are inflated by whatever it '
+            f'then deleted — historically about a quarter. Later runs count after '
+            f'judging and show what the run actually left in the database.'
+        )
+    elif pre:
+        yield_note = (
+            ' Every run here counted articles before the judge pruned them, so these '
+            'are found totals, not what remained stored.'
+        )
+
+    tools = summary["tools"]
+    tool_figure = ""
+    if tools:
+        tool_figure = f"""
+<figure>
+  <figcaption>
+    <div class="t">What the tools actually did</div>
+    <div class="d">One record per tool invocation. <b>Empty</b> means the tool ran and
+      returned nothing — there was no news. <b>Errors</b> means the tool raised. They
+      are counted separately on purpose: pooling them cannot distinguish a failing
+      backend from a quiet news day.</div>
+  </figcaption>
+  <div class="scroll">{_table(
+      ["tool", "calls", "errors", "error %", "empty", "empty %", "median s"],
+      [[r["tool"], f'{r["calls"]:,}', r["errors"], f'{r["error_pct"]:.1f}%',
+        r["empty"], f'{r["empty_pct"]:.1f}%', f'{r["median_s"]:.2f}']
+       for r in tools],
+      {1, 2, 3, 4, 5, 6})}</div>
+</figure>"""
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -761,7 +1037,7 @@ def render_html(summary: dict) -> str:
     <div class="t">Cost is flat, yield is not</div>
     <div class="d">Every run searches the same topics for roughly the same time,
       but how many new articles come back varies more than twofold. Both axes
-      start at zero.</div>
+      start at zero.{yield_note}</div>
   </figcaption>
   {svg_runs_chart(runs)}
   {_details("Show data table", _table(
@@ -770,12 +1046,13 @@ def render_html(summary: dict) -> str:
       {1, 2}))}
 </figure>
 
+{tool_figure}
+{dropped_figure}
+
 <figure>
   <figcaption>
-    <div class="t">Every failure is the same failure</div>
-    <div class="d">All {k["failures"]} failed searches are malformed tool-call XML
-      from <code>qwen3.5:latest</code> — the model CLAUDE.md recommends <em>because</em>
-      gemma emits bad tool-call XML. Worth revisiting that note.</div>
+    <div class="t">How the batches failed</div>
+    <div class="d">{failure_caption}</div>
   </figcaption>
   <ul class="legend" style="display:block">{err_rows}</ul>
 </figure>

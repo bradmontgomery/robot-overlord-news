@@ -13,6 +13,7 @@ Graph:
 """
 
 import argparse
+import contextvars
 import json
 import os
 import re
@@ -21,8 +22,9 @@ import time
 from datetime import datetime, timezone
 from typing import Literal
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, SystemMessage, messages_to_dict
+from langchain_core.tools import StructuredTool, tool
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
@@ -64,6 +66,48 @@ JUDGE_BATCH_SIZE = 10
 # reasoning=False note in judge_articles). A bigger window would only let a runaway
 # burn more; capping it ends one in ~256 tokens instead of ~3000.
 JUDGE_NUM_PREDICT = 256
+# Sampling parameters. Ollama's own defaults (temperature 0.8, top_k 40, top_p 0.9)
+# are tuned for open-ended chat; these three call sites want different things.
+# The ReAct loop needs the same tool call for the same state, not variety — but not
+# pure greedy decoding either, which can lock a stuck loop into repeating one bad
+# search verbatim. 0.2 keeps tool selection stable with just enough slack to break
+# out. Note this is low temperature, not determinism: reproducing a run exactly
+# would also require pinning `seed`.
+AGENT_TEMPERATURE = 0.2
+# The judge emits a handful of YES/NO tokens and nothing else, so any sampling
+# entropy is pure downside — see the runaway described at JUDGE_NUM_PREDICT.
+JUDGE_TEMPERATURE = 0.0
+# The summary is prose meant to be read, so it gets room to vary word choice.
+# top_k/top_p are set explicitly at Ollama's defaults: at 0.5 the tail is live
+# (unlike the greedy judge, where they would be inert), so the values that shape
+# it belong in the source rather than in whatever the server happens to default to.
+SUMMARY_TEMPERATURE = 0.5
+SUMMARY_TOP_K = 40
+SUMMARY_TOP_P = 0.9
+# Every knob that shapes a model's output, defined once and used twice: to build the
+# ChatOllama and to stamp the metrics record. Passing the same dict to both makes it
+# structurally impossible for the logged config to drift from the config actually used,
+# which is what lets metrics_report.py cohort runs by config and trust the answer.
+AGENT_MODEL_KWARGS = {"num_ctx": AGENT_NUM_CTX, "temperature": AGENT_TEMPERATURE}
+JUDGE_MODEL_KWARGS = {
+    "num_predict": JUDGE_NUM_PREDICT,
+    "temperature": JUDGE_TEMPERATURE,
+    "reasoning": False,
+}
+# num_ctx is per-call for the summary (see summarize_day), so it is merged in there
+# rather than fixed here.
+SUMMARY_MODEL_KWARGS = {
+    "temperature": SUMMARY_TEMPERATURE,
+    "top_k": SUMMARY_TOP_K,
+    "top_p": SUMMARY_TOP_P,
+}
+# Where agent-step failures dump the conversation that produced them. Ollama discards
+# the malformed completion server-side (its ResponseError carries only a message and a
+# status code), so the inputs are the only recoverable evidence — dumping them is what
+# makes a failure replayable. Kept out of the metrics file because a failing prompt runs
+# to ~4k tokens; the JSONL records only the path.
+FAILURE_DIR = os.getenv("NEWS_FAILURE_DIR", "news_failures")
+FAILURE_KEEP = int(os.getenv("NEWS_FAILURE_KEEP", "50"))
 DEFAULT_TOPICS = (
     "anthropic",  # AI companies
     "openai",
@@ -169,8 +213,8 @@ For each topic:
 
 Rules for the `topic` field — keep topics tight so they stay easy to group:
 - Reuse the SAME short label the user gave you. Do not expand the label or invent longer wording,
-  and do NOT turn the label into a descriptive phrase. You may shorten or make the label more succint.
-- Labels are lowercase and one or two words each (e.g. "anthropic", "local llm", "ai coding").
+  and do NOT turn the label into a descriptive phrase.
+- Labels are lowercase (e.g. "anthropic", "local llm", "ai coding").
 - Multiple labels on a news article are allowed: if one article is genuinely relevant to several of the
   provided topics, set topic to a comma-separated list of those labels
   (e.g. "anthropic, claude code"). Otherwise use the single matching label.
@@ -229,6 +273,94 @@ def _write_metric(record: dict) -> None:
     record["logged_at"] = datetime.now(timezone.utc).isoformat()
     with open(METRICS_PATH, "a") as f:
         f.write(json.dumps(record) + "\n")
+
+
+# Which run and which topic batch is currently executing. build_graph() is called once
+# per run but invoked once per batch, so batch_index cannot be closed over — and tools
+# receive only their own arguments, so it cannot be threaded through the graph state
+# either. A ContextVar reaches both the agent node and the tool wrappers with one
+# mechanism, and stays correct if the loop is ever made async.
+_BATCH_CONTEXT: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "news_batch_context", default={}
+)
+
+
+def _log_tool_call(tool_name: str, elapsed_s: float, **extra) -> None:
+    """Record one tool invocation — success or failure.
+
+    Without this, a tool failure existed only in stdout: `_handle_tool_error` printed
+    and returned a string to the model, writing nothing. Logging every call (not only
+    failures) is what supplies the denominator — an error count alone cannot say
+    whether a failure rate is rising or falling.
+    """
+    ctx = _BATCH_CONTEXT.get()
+    _write_metric(
+        {
+            "type": "tool_call",
+            "run_id": ctx.get("run_id"),
+            "batch_index": ctx.get("batch_index"),
+            "tool": tool_name,
+            "elapsed_s": round(elapsed_s, 3),
+            **extra,
+        }
+    )
+
+
+def _dump_failed_conversation(messages: list, tools: list | None = None) -> str | None:
+    """Serialize *messages* to FAILURE_DIR and return the path, or None on failure.
+
+    Written in langchain's own `messages_to_dict` form so a dump round-trips through
+    `messages_from_dict` straight back into a model call — the point is a case that can
+    be replayed against Ollama, not a log line to read.
+
+    The tool schemas are captured too, and they are not optional for the failure this
+    exists to diagnose: the XML errors come from Ollama parsing a *tool call*, so a
+    replay that skips `.bind_tools()` will not reproduce them. Replay with:
+
+        model = ChatOllama(model=d["model"], base_url=..., **d["model_kwargs"])
+        model.bind_tools(d["tools"]).invoke(messages_from_dict(d["messages"]))
+
+    Never raises: a failure while recording a failure must not mask the original error.
+    """
+    ctx = _BATCH_CONTEXT.get()
+    run_id = (ctx.get("run_id") or "adhoc").replace(":", "").replace("+", "")
+    # Nanoseconds, not milliseconds: consecutive failures in one batch land inside the
+    # same millisecond and would overwrite each other.
+    name = f"{run_id}-batch{ctx.get('batch_index')}-{time.time_ns()}.json"
+    try:
+        os.makedirs(FAILURE_DIR, exist_ok=True)
+        path = os.path.join(FAILURE_DIR, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "model": MODEL_NAME,
+                    "base_url": OLLAMA_BASE_URL,
+                    "model_kwargs": AGENT_MODEL_KWARGS,
+                    "tools": [convert_to_openai_tool(t) for t in tools or []],
+                    "messages": messages_to_dict(messages),
+                },
+                fh,
+            )
+    except Exception:
+        return None
+    # Pruning happens after the path is secured. A file vanishing between scandir and
+    # remove (two runs overlapping) must not throw away a dump that was written fine.
+    try:
+        _prune_failure_dumps()
+    except Exception:
+        pass
+    return path
+
+
+def _prune_failure_dumps() -> None:
+    """Keep only the newest FAILURE_KEEP dumps; ~12% of batches fail, so this grows."""
+    entries = sorted(
+        (e for e in os.scandir(FAILURE_DIR) if e.is_file()),
+        key=lambda e: e.stat().st_mtime,
+        reverse=True,
+    )
+    for entry in entries[FAILURE_KEEP:]:
+        os.remove(entry.path)
 
 
 def _llm_perf_fields(response) -> dict:
@@ -338,10 +470,65 @@ def init_db(path: str) -> None:
             conn.execute("ALTER TABLE news_summaries ADD COLUMN model_name TEXT")
 
 
-def _normalize_topic(topic: str) -> str:
-    """Lowercase and trim each comma-separated topic label so the same topic
-    (e.g. "Nvidia" vs "nvidia") always collapses to one row in GROUP BY topic."""
-    return ", ".join(part.strip().lower() for part in topic.split(","))
+def _canonical(label: str) -> str:
+    """Fold a label to a comparison key: lowercase, alphanumerics only.
+
+    Collapses the spelling variants the model actually produced — "zai"/"z.ai",
+    "huggingface"/"hugging face", "space x"/"spacex", "vibe-coding"/"vibe coding",
+    "meta-llama"/"meta llama" — onto one key each, so they resolve back to the
+    configured topic instead of forking the vocabulary.
+    """
+    return re.sub(r"[^a-z0-9]+", "", label.lower())
+
+
+def _resolve_topic(label: str, allowed: list[str]) -> str | None:
+    """Map *label* onto one of *allowed*, or None if it is not one of them.
+
+    Matches on the canonical form, then retries with a trailing "s" added or removed
+    to absorb "coding agent" vs "coding agents" and "llms" vs "llm".
+    """
+    key = _canonical(label)
+    if not key:
+        return None
+    by_key = {_canonical(a): a for a in allowed}
+    candidates = [key, key.rstrip("s"), key + "s"]
+    # "mistral ai" / "moonshot ai" / "microsoft ai" are the company topic with the
+    # industry tacked on. Only for multi-word labels: a bare "ai" is not a topic, and
+    # stripping it from a single-word label would maul "z.ai".
+    words = label.lower().split()
+    if len(words) > 1 and words[-1] == "ai":
+        candidates.append(_canonical(" ".join(words[:-1])))
+    for candidate in candidates:
+        if candidate in by_key:
+            return by_key[candidate]
+    return None
+
+
+def _normalize_topic(topic: str, allowed: list[str] | None = None) -> tuple[str, list]:
+    """Return ``(normalized_topic, dropped_labels)`` for a comma-separated *topic*.
+
+    Labels are lowercased and trimmed, then — when *allowed* is supplied — resolved
+    back onto the batch's own topics. Anything that will not resolve is dropped and
+    returned, because the agent invents labels in three ways the prompt cannot prevent:
+    spelling variants, phrases lifted out of the prompt's own wording ("ai industry
+    strategy"), and topics carried over from earlier batches in the conversation.
+    Restricting to the batch catches all three at the boundary.
+
+    With no *allowed* set (an ad-hoc call outside a run) nothing is dropped.
+    """
+    labels = [part.strip().lower() for part in topic.split(",") if part.strip()]
+    if allowed is None:
+        return ", ".join(labels), []
+
+    kept: list[str] = []
+    dropped: list[str] = []
+    for label in labels:
+        resolved = _resolve_topic(label, allowed)
+        if resolved is None:
+            dropped.append(label)
+        elif resolved not in kept:
+            kept.append(resolved)
+    return ", ".join(kept), dropped
 
 
 @tool
@@ -351,44 +538,141 @@ def store_result(
     """Store a single news article to the database.
 
     Args:
-        topic: short topic label(s) this article belongs to — reuse the user's
-            lowercase one-or-two-word label; for an article spanning several
+        topic: topic label(s) this article belongs to — reuse a label from the topics
+            you were given for this batch; for an article spanning several of those
             topics, a comma-separated list (e.g. "anthropic, claude code") is fine
         title: article headline
         url: article URL
         summary: brief 1-2 sentence summary
         published_on: publication date in YYYY-MM-DD format if known, else omit
     """
+    start = time.perf_counter()
+    # Validate against this batch's own topics, not the whole configured list: a run
+    # only ever shows the model two topics at a time, so a label from another batch is
+    # recalled from earlier in the conversation, not chosen from what was asked.
+    allowed = _BATCH_CONTEXT.get().get("topics")
+    normalized, dropped = _normalize_topic(topic, allowed)
+    if not normalized:
+        # Nothing usable survived. Refuse the write and name the valid labels rather
+        # than storing a row nothing can group by — 4 rows in the existing DB have an
+        # empty topic, and 702 distinct invented labels came in through this door.
+        _log_tool_call(
+            "store_result",
+            time.perf_counter() - start,
+            success=True,
+            outcome="rejected",
+            dropped=dropped,
+        )
+        valid = ", ".join(allowed or [])
+        return (
+            f"Not stored: {topic!r} is not one of this batch's topics. "
+            f"Use one of: {valid}."
+        )
     fetched_at = datetime.now(timezone.utc).isoformat()
     pub_date = published_on.strip() or None
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            "INSERT OR IGNORE INTO news_results"
-            " (topic, title, url, summary, fetched_at, published_on, model_name)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                _normalize_topic(topic),
-                title,
-                url,
-                summary,
-                fetched_at,
-                pub_date,
-                MODEL_NAME,
-            ),
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO news_results"
+                " (topic, title, url, summary, fetched_at, published_on, model_name)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    normalized,
+                    title,
+                    url,
+                    summary,
+                    fetched_at,
+                    pub_date,
+                    MODEL_NAME,
+                ),
+            )
+    except Exception as e:
+        # Without this, a locked or missing database would raise before the success
+        # log below and store_result's error rate would sit at a structural 0% —
+        # exactly the blind spot this instrumentation exists to close.
+        _log_tool_call(
+            "store_result",
+            time.perf_counter() - start,
+            success=False,
+            error=str(e),
+            error_type=type(e).__name__,
         )
-    if cursor.rowcount:
+        raise
+    # The rowcount branch already knew whether this was a new article or a duplicate;
+    # it just threw the fact away. Recording it separates "the agent found nothing new"
+    # from "the agent stopped calling store_result".
+    stored = bool(cursor.rowcount)
+    _log_tool_call(
+        "store_result",
+        time.perf_counter() - start,
+        success=True,
+        outcome="stored" if stored else "duplicate",
+        topic=normalized,
+        # Recorded even on an otherwise successful store, so the report can show how
+        # often labels are being invented rather than the fact being silently fixed.
+        dropped=dropped,
+    )
+    if stored:
         return f"Stored: {title}"
     return f"Skipped (duplicate URL): {title}"
+
+
+def _instrument_tool(underlying):
+    """Wrap a tool so every call is logged, without changing what the model sees.
+
+    name, description and args_schema are copied verbatim, so the schema bound to the
+    model is identical to the unwrapped tool's. That matters: renaming the search tool
+    could change tool-call reliability by itself, which would confound the very failure
+    rate this instrumentation exists to measure.
+
+    Exceptions are logged and re-raised, leaving ToolNode's existing `_handle_tool_error`
+    recovery path intact.
+    """
+
+    def call(**kwargs):
+        start = time.perf_counter()
+        try:
+            result = underlying.invoke(kwargs)
+        except Exception as e:
+            _log_tool_call(
+                underlying.name,
+                time.perf_counter() - start,
+                success=False,
+                error=str(e),
+                error_type=type(e).__name__,
+                **kwargs,
+            )
+            raise
+        # A search that returns zero results is not an error, and until now it was
+        # indistinguishable from one that was never called. Counting it separately is
+        # the difference between "the backend is failing" and "there is no news".
+        _log_tool_call(
+            underlying.name,
+            time.perf_counter() - start,
+            success=True,
+            result_count=len(result) if isinstance(result, (list, tuple)) else None,
+            **kwargs,
+        )
+        return result
+
+    return StructuredTool.from_function(
+        func=call,
+        name=underlying.name,
+        description=underlying.description,
+        args_schema=underlying.args_schema,
+    )
 
 
 def _make_search_tool():
     if os.getenv("TAVILY_API_KEY"):
         from langchain_community.tools.tavily_search import TavilySearchResults
 
-        return TavilySearchResults(max_results=5)
+        return _instrument_tool(TavilySearchResults(max_results=5))
     from langchain_community.tools import DuckDuckGoSearchResults
 
-    return DuckDuckGoSearchResults(backend="news", output_format="list", max_results=5)
+    return _instrument_tool(
+        DuckDuckGoSearchResults(backend="news", output_format="list", max_results=5)
+    )
 
 
 def _handle_tool_error(e: Exception) -> str:
@@ -398,6 +682,20 @@ def _handle_tool_error(e: Exception) -> str:
     DuckDuckGo ``DDGSException: No results found.``), so an empty search for one
     topic is logged and treated as "no results" instead of crashing the run.
     """
+    # A cross-check, not the primary record: _instrument_tool already logged this call
+    # with its name and arguments, which ToolNode's handler signature cannot see. Kept
+    # as the safety net for any tool that is not wrapped. Rates come from `tool_call`
+    # records; counting both types would double-count every wrapped failure.
+    _write_metric(
+        {
+            "type": "tool_error",
+            "run_id": _BATCH_CONTEXT.get().get("run_id"),
+            "batch_index": _BATCH_CONTEXT.get().get("batch_index"),
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "handled_by": "ToolNode",
+        }
+    )
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rprint(f"[dim][{now}][/dim] [yellow]Search/tool error (skipping): {e}[/yellow]")
     return f"No results available (tool error: {e}). Continue with the next topic."
@@ -420,21 +718,47 @@ def build_graph(run_id: str | None = None):
     system_message = SystemMessage(_SYSTEM_PROMPT.format(today=today))
 
     model = ChatOllama(
-        model=MODEL_NAME, base_url=OLLAMA_BASE_URL, num_ctx=AGENT_NUM_CTX
+        model=MODEL_NAME, base_url=OLLAMA_BASE_URL, **AGENT_MODEL_KWARGS
     ).bind_tools(tools)
     tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
 
     def agent_node(state: MessagesState) -> dict:
         start = time.perf_counter()
-        response = model.invoke([system_message] + state["messages"])
+        messages = [system_message] + state["messages"]
+        try:
+            response = model.invoke(messages)
+        except Exception as e:
+            # Until this existed, a call that raised never reached _log_llm_call, so
+            # every parse failure was simply absent from the agent_step data — and the
+            # calls that did survive were the ones that worked. Every per-call figure
+            # in the report was computed over survivors only.
+            _log_llm_call(
+                run_id,
+                "agent_step",
+                MODEL_NAME,
+                None,
+                time.perf_counter() - start,
+                batch_index=_BATCH_CONTEXT.get().get("batch_index"),
+                success=False,
+                error=str(e),
+                error_type=type(e).__name__,
+                message_count=len(messages),
+                dump_path=_dump_failed_conversation(messages, tools),
+                **AGENT_MODEL_KWARGS,
+            )
+            # Re-raise: run() still logs the search_batch failure, so the batch-level
+            # and call-level records stay reconcilable.
+            raise
         _log_llm_call(
             run_id,
             "agent_step",
             MODEL_NAME,
             response,
             time.perf_counter() - start,
+            batch_index=_BATCH_CONTEXT.get().get("batch_index"),
             tool_call_count=len(getattr(response, "tool_calls", None) or []),
-            num_ctx=AGENT_NUM_CTX,
+            success=True,
+            **AGENT_MODEL_KWARGS,
         )
         return {"messages": [response]}
 
@@ -470,6 +794,10 @@ def judge_articles(topics: list[str], run_start: str) -> int:
     that article is kept (fail-open) rather than deleted, so a malformed local-model
     response never silently destroys data.
 
+    Prints how many articles it judged and how many it kept. Both numbers are needed
+    to read a run: the judge deletes rows that were already counted as "found", so
+    the found count alone overstates what actually ended up stored.
+
     Returns the count of removed rows.
     """
     judge_start = time.perf_counter()
@@ -487,12 +815,7 @@ def judge_articles(topics: list[str], run_start: str) -> int:
     # "length" with empty .content — which fails open and keeps every article,
     # including the false positives this judge exists to catch. The judge only needs
     # short YES/NO tokens, so reasoning adds cost without adding judgment quality.
-    model = ChatOllama(
-        model=MODEL_NAME,
-        base_url=OLLAMA_BASE_URL,
-        reasoning=False,
-        num_predict=JUDGE_NUM_PREDICT,
-    )
+    model = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, **JUDGE_MODEL_KWARGS)
     to_delete: list[int] = []
     for i in range(0, len(rows), JUDGE_BATCH_SIZE):
         batch = rows[i : i + JUDGE_BATCH_SIZE]
@@ -520,6 +843,8 @@ def judge_articles(topics: list[str], run_start: str) -> int:
                 batch_size=len(batch),
                 success=False,
                 error=str(e),
+                error_type=type(e).__name__,
+                **JUDGE_MODEL_KWARGS,
             )
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             rprint(
@@ -536,7 +861,7 @@ def judge_articles(topics: list[str], run_start: str) -> int:
             batch_index=batch_index,
             batch_size=len(batch),
             success=True,
-            num_predict=JUDGE_NUM_PREDICT,
+            **JUDGE_MODEL_KWARGS,
         )
         verdicts = _parse_judge_verdicts(response.content)
         for n, (row_id, _title, _summary) in enumerate(batch, start=1):
@@ -549,12 +874,23 @@ def judge_articles(topics: list[str], run_start: str) -> int:
             conn.execute(
                 f"DELETE FROM news_results WHERE id IN ({placeholders})", to_delete
             )
+    kept = len(rows) - len(to_delete)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    noun = "article" if len(rows) == 1 else "articles"
+    rprint(
+        f"[dim][{now}][/dim] Judged {len(rows)} {noun}: "
+        f"[bold green]{kept} kept[/bold green], "
+        f"[yellow]{len(to_delete)} removed as off-topic[/yellow]"
+    )
     _log_step(
         run_start,
         "judge_articles",
         time.perf_counter() - judge_start,
         articles_judged=len(rows),
         articles_deleted=len(to_delete),
+        # Derivable from the two above, but logged explicitly so the kept count never
+        # has to be recomputed differently by each reader of the metrics.
+        articles_kept=kept,
     )
     return len(to_delete)
 
@@ -575,10 +911,11 @@ def _invoke_summary_model(
     persisting a blank summary — the failure mode seen with oversized models that
     spill to CPU.
     """
+    kwargs = {**SUMMARY_MODEL_KWARGS, "num_ctx": num_ctx}
     start = time.perf_counter()
     try:
         response = ChatOllama(
-            model=model_name, base_url=OLLAMA_BASE_URL, num_ctx=num_ctx
+            model=model_name, base_url=OLLAMA_BASE_URL, **kwargs
         ).invoke(messages)
     except Exception as exc:
         _log_llm_call(
@@ -587,9 +924,10 @@ def _invoke_summary_model(
             model_name,
             None,
             time.perf_counter() - start,
-            num_ctx=num_ctx,
             success=False,
             error=str(exc),
+            error_type=type(exc).__name__,
+            **kwargs,
         )
         raise
     text = (response.content or "").strip()
@@ -599,8 +937,8 @@ def _invoke_summary_model(
         model_name,
         response,
         time.perf_counter() - start,
-        num_ctx=num_ctx,
         success=bool(text),
+        **kwargs,
     )
     if not text:
         raise ValueError(f"{model_name} returned an empty summary")
@@ -711,6 +1049,13 @@ def run(topics: list[str]) -> tuple[int, str | None]:
         batch = topics[i : i + BATCH_SIZE]
         topic_list = ", ".join(batch)
         batch_start = time.perf_counter()
+        # Stamp every agent step and tool call in this batch with the batch it belongs
+        # to. A run spans ~64 batches; without this, a failed search_batch could not be
+        # traced back to the LLM calls and tool calls that produced it except by
+        # guessing from timestamp order.
+        _BATCH_CONTEXT.set(
+            {"run_id": run_start, "batch_index": i // BATCH_SIZE, "topics": batch}
+        )
         try:
             app.invoke(
                 {
@@ -729,6 +1074,11 @@ def run(topics: list[str]) -> tuple[int, str | None]:
                 topics=topic_list,
                 success=False,
                 error=str(e),
+                # Separates GraphRecursionError from ollama's ResponseError without
+                # string-matching the message — the distinction the report's old
+                # "every failure is the same failure" caption missed.
+                error_type=type(e).__name__,
+                model=MODEL_NAME,
             )
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             rprint(
@@ -743,12 +1093,20 @@ def run(topics: list[str]) -> tuple[int, str | None]:
             batch_index=i // BATCH_SIZE,
             topics=topic_list,
             success=True,
+            model=MODEL_NAME,
         )
+    with sqlite3.connect(DB_PATH) as conn:
+        (found_count,) = conn.execute(
+            "SELECT COUNT(*) FROM news_results WHERE fetched_at >= ?", (run_start,)
+        ).fetchone()
+    judge_articles(topics, run_start)
+    # Count again after judging. The judge deletes rows the first count already
+    # included — historically ~24% of them — so counting only before it reported a
+    # yield about a third higher than what the run actually left in the database.
     with sqlite3.connect(DB_PATH) as conn:
         (new_count,) = conn.execute(
             "SELECT COUNT(*) FROM news_results WHERE fetched_at >= ?", (run_start,)
         ).fetchone()
-    judge_articles(topics, run_start)
     summary = summarize_day(today, run_id=run_start)
     _log_step(
         run_start,
@@ -756,6 +1114,11 @@ def run(topics: list[str]) -> tuple[int, str | None]:
         time.perf_counter() - run_loop_start,
         topics=len(topics),
         new_articles=new_count,
+        # Logged alongside, because `new_articles` changed meaning here: records
+        # without `articles_found` predate the fix and hold the pre-prune total. Its
+        # presence is what lets the report tell the two eras apart.
+        articles_found=found_count,
+        articles_pruned=found_count - new_count,
     )
     return new_count, summary
 
@@ -766,7 +1129,9 @@ def _print_summary(new_count: int, topics: list[str]) -> None:
     if new_count:
         noun = "article" if new_count == 1 else "articles"
         rprint(
-            f"[dim][{now}][/dim] [bold green]{new_count} new {noun} found[/bold green] for: {topic_str}"
+            # "stored", not "found": this count is taken after the judge prunes, so it
+            # is what survived, not what the search turned up.
+            f"[dim][{now}][/dim] [bold green]{new_count} new {noun} stored[/bold green] for: {topic_str}"
         )
     else:
         rprint(f"[dim][{now}][/dim] [yellow]No new articles[/yellow] for: {topic_str}")
