@@ -213,8 +213,8 @@ For each topic:
 
 Rules for the `topic` field — keep topics tight so they stay easy to group:
 - Reuse the SAME short label the user gave you. Do not expand the label or invent longer wording,
-  and do NOT turn the label into a descriptive phrase. You may shorten or make the label more succint.
-- Labels are lowercase and one or two words each (e.g. "anthropic", "local llm", "ai coding").
+  and do NOT turn the label into a descriptive phrase.
+- Labels are lowercase (e.g. "anthropic", "local llm", "ai coding").
 - Multiple labels on a news article are allowed: if one article is genuinely relevant to several of the
   provided topics, set topic to a comma-separated list of those labels
   (e.g. "anthropic, claude code"). Otherwise use the single matching label.
@@ -470,10 +470,65 @@ def init_db(path: str) -> None:
             conn.execute("ALTER TABLE news_summaries ADD COLUMN model_name TEXT")
 
 
-def _normalize_topic(topic: str) -> str:
-    """Lowercase and trim each comma-separated topic label so the same topic
-    (e.g. "Nvidia" vs "nvidia") always collapses to one row in GROUP BY topic."""
-    return ", ".join(part.strip().lower() for part in topic.split(","))
+def _canonical(label: str) -> str:
+    """Fold a label to a comparison key: lowercase, alphanumerics only.
+
+    Collapses the spelling variants the model actually produced — "zai"/"z.ai",
+    "huggingface"/"hugging face", "space x"/"spacex", "vibe-coding"/"vibe coding",
+    "meta-llama"/"meta llama" — onto one key each, so they resolve back to the
+    configured topic instead of forking the vocabulary.
+    """
+    return re.sub(r"[^a-z0-9]+", "", label.lower())
+
+
+def _resolve_topic(label: str, allowed: list[str]) -> str | None:
+    """Map *label* onto one of *allowed*, or None if it is not one of them.
+
+    Matches on the canonical form, then retries with a trailing "s" added or removed
+    to absorb "coding agent" vs "coding agents" and "llms" vs "llm".
+    """
+    key = _canonical(label)
+    if not key:
+        return None
+    by_key = {_canonical(a): a for a in allowed}
+    candidates = [key, key.rstrip("s"), key + "s"]
+    # "mistral ai" / "moonshot ai" / "microsoft ai" are the company topic with the
+    # industry tacked on. Only for multi-word labels: a bare "ai" is not a topic, and
+    # stripping it from a single-word label would maul "z.ai".
+    words = label.lower().split()
+    if len(words) > 1 and words[-1] == "ai":
+        candidates.append(_canonical(" ".join(words[:-1])))
+    for candidate in candidates:
+        if candidate in by_key:
+            return by_key[candidate]
+    return None
+
+
+def _normalize_topic(topic: str, allowed: list[str] | None = None) -> tuple[str, list]:
+    """Return ``(normalized_topic, dropped_labels)`` for a comma-separated *topic*.
+
+    Labels are lowercased and trimmed, then — when *allowed* is supplied — resolved
+    back onto the batch's own topics. Anything that will not resolve is dropped and
+    returned, because the agent invents labels in three ways the prompt cannot prevent:
+    spelling variants, phrases lifted out of the prompt's own wording ("ai industry
+    strategy"), and topics carried over from earlier batches in the conversation.
+    Restricting to the batch catches all three at the boundary.
+
+    With no *allowed* set (an ad-hoc call outside a run) nothing is dropped.
+    """
+    labels = [part.strip().lower() for part in topic.split(",") if part.strip()]
+    if allowed is None:
+        return ", ".join(labels), []
+
+    kept: list[str] = []
+    dropped: list[str] = []
+    for label in labels:
+        resolved = _resolve_topic(label, allowed)
+        if resolved is None:
+            dropped.append(label)
+        elif resolved not in kept:
+            kept.append(resolved)
+    return ", ".join(kept), dropped
 
 
 @tool
@@ -483,8 +538,8 @@ def store_result(
     """Store a single news article to the database.
 
     Args:
-        topic: short topic label(s) this article belongs to — reuse the user's
-            lowercase one-or-two-word label; for an article spanning several
+        topic: topic label(s) this article belongs to — reuse a label from the topics
+            you were given for this batch; for an article spanning several of those
             topics, a comma-separated list (e.g. "anthropic, claude code") is fine
         title: article headline
         url: article URL
@@ -492,6 +547,27 @@ def store_result(
         published_on: publication date in YYYY-MM-DD format if known, else omit
     """
     start = time.perf_counter()
+    # Validate against this batch's own topics, not the whole configured list: a run
+    # only ever shows the model two topics at a time, so a label from another batch is
+    # recalled from earlier in the conversation, not chosen from what was asked.
+    allowed = _BATCH_CONTEXT.get().get("topics")
+    normalized, dropped = _normalize_topic(topic, allowed)
+    if not normalized:
+        # Nothing usable survived. Refuse the write and name the valid labels rather
+        # than storing a row nothing can group by — 4 rows in the existing DB have an
+        # empty topic, and 702 distinct invented labels came in through this door.
+        _log_tool_call(
+            "store_result",
+            time.perf_counter() - start,
+            success=True,
+            outcome="rejected",
+            dropped=dropped,
+        )
+        valid = ", ".join(allowed or [])
+        return (
+            f"Not stored: {topic!r} is not one of this batch's topics. "
+            f"Use one of: {valid}."
+        )
     fetched_at = datetime.now(timezone.utc).isoformat()
     pub_date = published_on.strip() or None
     try:
@@ -501,7 +577,7 @@ def store_result(
                 " (topic, title, url, summary, fetched_at, published_on, model_name)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
-                    _normalize_topic(topic),
+                    normalized,
                     title,
                     url,
                     summary,
@@ -531,7 +607,10 @@ def store_result(
         time.perf_counter() - start,
         success=True,
         outcome="stored" if stored else "duplicate",
-        topic=_normalize_topic(topic),
+        topic=normalized,
+        # Recorded even on an otherwise successful store, so the report can show how
+        # often labels are being invented rather than the fact being silently fixed.
+        dropped=dropped,
     )
     if stored:
         return f"Stored: {title}"
@@ -715,6 +794,10 @@ def judge_articles(topics: list[str], run_start: str) -> int:
     that article is kept (fail-open) rather than deleted, so a malformed local-model
     response never silently destroys data.
 
+    Prints how many articles it judged and how many it kept. Both numbers are needed
+    to read a run: the judge deletes rows that were already counted as "found", so
+    the found count alone overstates what actually ended up stored.
+
     Returns the count of removed rows.
     """
     judge_start = time.perf_counter()
@@ -791,12 +874,23 @@ def judge_articles(topics: list[str], run_start: str) -> int:
             conn.execute(
                 f"DELETE FROM news_results WHERE id IN ({placeholders})", to_delete
             )
+    kept = len(rows) - len(to_delete)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    noun = "article" if len(rows) == 1 else "articles"
+    rprint(
+        f"[dim][{now}][/dim] Judged {len(rows)} {noun}: "
+        f"[bold green]{kept} kept[/bold green], "
+        f"[yellow]{len(to_delete)} removed as off-topic[/yellow]"
+    )
     _log_step(
         run_start,
         "judge_articles",
         time.perf_counter() - judge_start,
         articles_judged=len(rows),
         articles_deleted=len(to_delete),
+        # Derivable from the two above, but logged explicitly so the kept count never
+        # has to be recomputed differently by each reader of the metrics.
+        articles_kept=kept,
     )
     return len(to_delete)
 
@@ -959,7 +1053,9 @@ def run(topics: list[str]) -> tuple[int, str | None]:
         # to. A run spans ~64 batches; without this, a failed search_batch could not be
         # traced back to the LLM calls and tool calls that produced it except by
         # guessing from timestamp order.
-        _BATCH_CONTEXT.set({"run_id": run_start, "batch_index": i // BATCH_SIZE})
+        _BATCH_CONTEXT.set(
+            {"run_id": run_start, "batch_index": i // BATCH_SIZE, "topics": batch}
+        )
         try:
             app.invoke(
                 {

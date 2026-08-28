@@ -321,6 +321,45 @@ def _tool_rows(records: list[dict]) -> list[dict]:
     return rows
 
 
+def _dropped_labels(records: list[dict]) -> dict:
+    """How often store_result was handed a label that was not one of its batch topics.
+
+    The agent invents topic labels — spelling variants, phrases lifted out of the
+    prompt's own wording, and topics recalled from earlier batches. store_result now
+    resolves or discards them, which fixes the data but would hide the behaviour if
+    the discards were not counted. Surfacing the rate keeps a silent repair visible.
+    """
+    stores = [
+        r
+        for r in records
+        if r.get("type") == "tool_call" and r.get("tool") == "store_result"
+    ]
+    # Only calls that actually carry `dropped` were validated. Records logged before
+    # store_result started checking have no such key, and counting them in the
+    # denominator would report a reassuring 0% over calls nobody ever inspected —
+    # the same survivor bias that made the agent_step numbers meaningless.
+    calls = [r for r in stores if "dropped" in r]
+    labels: Counter = Counter()
+    with_dropped = 0
+    for r in calls:
+        dropped = r.get("dropped") or []
+        if dropped:
+            with_dropped += 1
+            labels.update(dropped)
+    rejected = sum(1 for r in calls if r.get("outcome") == "rejected")
+    return {
+        "unvalidated": len(stores) - len(calls),
+        "calls": len(calls),
+        "with_dropped": with_dropped,
+        "with_dropped_pct": _pct(with_dropped, len(calls)),
+        "rejected": rejected,
+        "rejected_pct": _pct(rejected, len(calls)),
+        "mentions": sum(labels.values()),
+        "distinct": len(labels),
+        "labels": labels.most_common(15),
+    }
+
+
 def _error_classes(failures: list[dict]) -> list[tuple]:
     """Group failures into classes, commonest first.
 
@@ -367,6 +406,7 @@ def summarize(records: list[dict]) -> dict:
     # ran. Distinct from tool_call failures, where a tool ran and raised.
     failures = [r for r in _steps(records, "search_batch") if r.get("success") is False]
     tool_rows = _tool_rows(records)
+    dropped = _dropped_labels(records)
     cohorts = _cohorts(records)
     # Headline truncation is the *current* config's rate, not the all-time average.
     # Pooling them would let a fixed pile of old failures drag a working fix down
@@ -391,6 +431,9 @@ def summarize(records: list[dict]) -> dict:
                 sum(r["errors"] for r in tool_rows),
                 sum(r["calls"] for r in tool_rows),
             ),
+            "dropped_pct": dropped["with_dropped_pct"],
+            "dropped_distinct": dropped["distinct"],
+            "dropped_validated": dropped["calls"],
             "judged": judged,
             "deleted": deleted,
             "new_articles": sum(r["new_articles"] for r in runs),
@@ -406,6 +449,7 @@ def summarize(records: list[dict]) -> dict:
         ).most_common(),
         "error_classes": _error_classes(failures),
         "tools": tool_rows,
+        "dropped_labels": dropped,
         "topics_with_failures": sum(1 for r in topics if r["failures"]),
     }
 
@@ -774,6 +818,17 @@ def render_html(summary: dict) -> str:
             f'tool calls failed — {k["tool_calls"]:,} calls',
             alert=k["tool_error_pct"] > 1,
         ),
+        # "—" rather than 0% when nothing has been validated: a rate over calls that
+        # were never inspected reads as reassurance and is worth less than nothing.
+        _kpi(
+            f'{k["dropped_pct"]:.1f}%' if k["dropped_validated"] else "—",
+            (
+                f'stores with an invented label — {k["dropped_distinct"]} distinct'
+                if k["dropped_validated"]
+                else "stores checked for invented labels"
+            ),
+            alert=k["dropped_pct"] > 1,
+        ),
         _kpi(f'{k["new_articles"]}', "new articles stored"),
     ])
 
@@ -843,6 +898,47 @@ def render_html(summary: dict) -> str:
         )
     else:
         failure_caption = "No batch failures recorded."
+
+    dropped = summary["dropped_labels"]
+    dropped_figure = ""
+    if dropped["calls"]:
+        if dropped["mentions"]:
+            dropped_caption = (
+                f'{dropped["with_dropped"]:,} of {dropped["calls"]:,} store_result '
+                f'calls ({dropped["with_dropped_pct"]:.1f}%) named a label that was not '
+                f'one of the batch\'s topics — {dropped["mentions"]:,} mentions across '
+                f'{dropped["distinct"]} distinct labels. '
+                f'{dropped["rejected"]:,} calls ({dropped["rejected_pct"]:.1f}%) had no '
+                f'valid label left and stored nothing.'
+            )
+        else:
+            dropped_caption = (
+                f'None of the {dropped["calls"]:,} validated store_result calls named '
+                f'a label outside its batch. Counted rather than assumed — the agent '
+                f'used to invent labels, and a silent repair would look identical.'
+            )
+        if dropped["unvalidated"]:
+            dropped_caption += (
+                f' {dropped["unvalidated"]:,} earlier calls predate the check and are '
+                f'excluded — they were never inspected, so counting them here would '
+                f'report a clean rate over unexamined data.'
+            )
+        label_table = _table(
+            ["invented label", "times"],
+            [[label, f"{count:,}"] for label, count in dropped["labels"]],
+            {1},
+        ) if dropped["labels"] else ""
+        dropped_figure = f"""
+<figure>
+  <figcaption>
+    <div class="t">Labels the agent invented</div>
+    <div class="d">{dropped_caption} <code>store_result</code> resolves spelling
+      variants back onto the batch\'s topics and discards the rest, so these never
+      reach the database — but the discard is counted here, because a repair that
+      leaves no trace looks exactly like a model that never misbehaved.</div>
+  </figcaption>
+  <div class="scroll">{label_table}</div>
+</figure>"""
 
     tools = summary["tools"]
     tool_figure = ""
@@ -926,6 +1022,7 @@ def render_html(summary: dict) -> str:
 </figure>
 
 {tool_figure}
+{dropped_figure}
 
 <figure>
   <figcaption>

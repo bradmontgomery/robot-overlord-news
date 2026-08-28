@@ -1842,3 +1842,231 @@ def test_pruning_failure_does_not_discard_a_good_dump(monkeypatch):
     path = news_agent._dump_failed_conversation([HumanMessage(content="x")])
 
     assert path is not None and os.path.exists(path)
+
+
+# ---------------------------------------------------------------------------
+# topic validation — the DB grew 776 distinct labels from a list of 74
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_folds_spelling_variants():
+    from news.agent import _canonical
+
+    assert _canonical("Z.AI") == _canonical("zai")
+    assert _canonical("hugging face") == _canonical("HuggingFace")
+    assert _canonical("vibe-coding") == _canonical("vibe coding")
+
+
+@pytest.mark.parametrize("label,expected", [
+    ("Anthropic", "anthropic"),          # case only
+    ("z.ai", "z.ai"),                    # exact
+    ("zai", "z.ai"),                     # punctuation dropped
+    ("coding agent", "coding agents"),   # plural
+    ("llms", "llm"),                     # plural the other way
+    ("space x", "spacex"),               # spacing
+    ("mistral ai", "mistral"),           # company + industry suffix
+    ("ai coding", None),                 # invented
+    ("ai", None),                        # too generic to be a topic
+    ("", None),
+])
+def test_resolve_topic(label, expected):
+    from news.agent import _resolve_topic
+
+    allowed = ["anthropic", "z.ai", "coding agents", "llm", "spacex", "mistral"]
+    assert _resolve_topic(label, allowed) == expected
+
+
+def test_normalize_topic_drops_invented_labels_and_keeps_the_rest():
+    from news.agent import _normalize_topic
+
+    normalized, dropped = _normalize_topic(
+        "Anthropic, ai coding, claude code", ["anthropic", "claude code"]
+    )
+
+    assert normalized == "anthropic, claude code"
+    assert dropped == ["ai coding"]
+
+
+def test_normalize_topic_deduplicates_after_resolving():
+    """"zai" and "z.ai" in one call must not produce the same label twice."""
+    from news.agent import _normalize_topic
+
+    normalized, _ = _normalize_topic("zai, z.ai", ["z.ai"])
+
+    assert normalized == "z.ai"
+
+
+def test_normalize_topic_is_permissive_without_a_batch():
+    """An ad-hoc call outside a run has no allowed set and must not drop anything."""
+    from news.agent import _normalize_topic
+
+    assert _normalize_topic("Anything Goes, Here") == ("anything goes, here", [])
+
+
+def _store(news_agent, db_file, topic, url="http://a.com"):
+    with patch.object(news_agent, "DB_PATH", db_file):
+        return news_agent.store_result.invoke(
+            {"topic": topic, "title": "T", "url": url, "summary": "S"}
+        )
+
+
+def test_store_result_rejects_a_topic_outside_the_batch(tmp_path):
+    """A label from another batch is recalled from the conversation, not chosen."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "topics.db")
+    news_agent.init_db(db_file)
+    news_agent._BATCH_CONTEXT.set(
+        {"run_id": "r", "batch_index": 0, "topics": ["anthropic", "openai"]}
+    )
+
+    reply = _store(news_agent, db_file, "ollama, local llm")
+
+    assert "Not stored" in reply and "anthropic, openai" in reply
+    with sqlite3.connect(db_file) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM news_results").fetchone()[0] == 0
+    calls = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("type") == "tool_call"
+    ]
+    assert calls[-1]["outcome"] == "rejected"
+    assert calls[-1]["dropped"] == ["ollama", "local llm"]
+
+
+def test_store_result_keeps_valid_labels_and_records_the_dropped_one(tmp_path):
+    """A mixed call stores the article; only the invented label is discarded."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "topics.db")
+    news_agent.init_db(db_file)
+    news_agent._BATCH_CONTEXT.set(
+        {"run_id": "r", "batch_index": 0, "topics": ["anthropic", "claude code"]}
+    )
+
+    reply = _store(news_agent, db_file, "Anthropic, ai industry strategy")
+
+    assert reply.startswith("Stored")
+    with sqlite3.connect(db_file) as conn:
+        assert conn.execute("SELECT topic FROM news_results").fetchone()[0] == "anthropic"
+    calls = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("type") == "tool_call"
+    ]
+    # Logged even on a successful store, so the invention rate stays measurable
+    # instead of being silently repaired.
+    assert calls[-1]["dropped"] == ["ai industry strategy"]
+
+
+def test_store_result_resolves_a_spelling_variant_to_the_batch_topic(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "topics.db")
+    news_agent.init_db(db_file)
+    news_agent._BATCH_CONTEXT.set({"run_id": "r", "batch_index": 0, "topics": ["z.ai"]})
+
+    assert _store(news_agent, db_file, "zai").startswith("Stored")
+    with sqlite3.connect(db_file) as conn:
+        assert conn.execute("SELECT topic FROM news_results").fetchone()[0] == "z.ai"
+
+
+def test_run_puts_the_batch_topics_in_the_context(tmp_path):
+    """store_result can only validate if run() tells it what was asked for."""
+    from news import agent as news_agent
+
+    seen = {}
+
+    def _capture(*a, **k):
+        seen.update(news_agent._BATCH_CONTEXT.get())
+        return {"messages": []}
+
+    mock_app = MagicMock()
+    mock_app.invoke.side_effect = _capture
+    with patch.object(news_agent, "DB_PATH", str(tmp_path / "run.db")), \
+         patch.object(news_agent, "build_graph", return_value=mock_app), \
+         patch.object(news_agent, "judge_articles", return_value=0), \
+         patch.object(news_agent, "summarize_day", return_value=None):
+        news_agent.run(["anthropic", "openai"])
+
+    assert seen["topics"] == ["anthropic", "openai"]
+
+
+# ---------------------------------------------------------------------------
+# judge_articles reporting — found vs kept
+# ---------------------------------------------------------------------------
+
+
+def _judge_db(tmp_path, n, run_start):
+    """A DB holding *n* articles fetched at run_start."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge_report.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        for i in range(n):
+            conn.execute(
+                "INSERT INTO news_results (topic, title, url, summary, fetched_at)"
+                " VALUES (?,?,?,?,?)",
+                ("ai", f"Title {i}", f"http://a.com/{i}", "S", run_start),
+            )
+    return db_file
+
+
+def test_judge_articles_reports_found_and_kept(tmp_path):
+    """The found count alone overstates what ends up stored."""
+    from news import agent as news_agent
+
+    run_start = "2026-08-27T10:00:00+00:00"
+    db_file = _judge_db(tmp_path, 3, run_start)
+    mock_model = MagicMock()
+    mock_model.invoke.return_value = MagicMock(content="1: YES\n2: NO\n3: YES")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model), \
+         patch("news.agent.rprint") as mock_print:
+        deleted = news_agent.judge_articles(["ai"], run_start)
+
+    output = mock_print.call_args[0][0]
+    assert "Judged 3 articles" in output
+    assert "2 kept" in output
+    assert "1 removed as off-topic" in output
+    assert deleted == 1
+
+
+def test_judge_articles_logs_the_kept_count(tmp_path):
+    from news import agent as news_agent
+
+    run_start = "2026-08-27T10:00:00+00:00"
+    db_file = _judge_db(tmp_path, 2, run_start)
+    mock_model = MagicMock()
+    mock_model.invoke.return_value = MagicMock(content="1: YES\n2: NO")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model):
+        news_agent.judge_articles(["ai"], run_start)
+
+    steps = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("step") == "judge_articles"
+    ]
+    assert steps[-1]["articles_judged"] == 2
+    assert steps[-1]["articles_deleted"] == 1
+    assert steps[-1]["articles_kept"] == 1
+
+
+def test_judge_articles_reports_a_single_article_in_the_singular(tmp_path):
+    from news import agent as news_agent
+
+    run_start = "2026-08-27T10:00:00+00:00"
+    db_file = _judge_db(tmp_path, 1, run_start)
+    mock_model = MagicMock()
+    mock_model.invoke.return_value = MagicMock(content="1: YES")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model), \
+         patch("news.agent.rprint") as mock_print:
+        news_agent.judge_articles(["ai"], run_start)
+
+    assert "Judged 1 article:" in mock_print.call_args[0][0]

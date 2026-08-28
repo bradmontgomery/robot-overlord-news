@@ -577,3 +577,101 @@ def test_render_derives_the_failure_caption_from_the_records():
     assert "are not" in page
     assert "What the tools actually did" in page
     assert "failed batches" in page
+
+
+# ---------------------------------------------------------------------------
+# invented-label visibility
+# ---------------------------------------------------------------------------
+
+
+def _store(dropped=None, outcome="stored", **extra):
+    return _tool(tool="store_result", success=True, outcome=outcome,
+                 dropped=dropped or [], **extra)
+
+
+def test_dropped_labels_are_counted_not_silently_repaired():
+    """store_result discards invented labels; the discard has to stay visible."""
+    records = [
+        _store(),
+        _store(dropped=["ai coding"]),
+        _store(dropped=["ai coding", "ai security"]),
+        _store(dropped=["ollama", "local llm"], outcome="rejected"),
+    ]
+
+    d = mr.summarize(records)["dropped_labels"]
+
+    assert d["calls"] == 4
+    assert d["with_dropped"] == 3
+    assert d["with_dropped_pct"] == pytest.approx(75.0)
+    assert d["rejected"] == 1
+    assert d["mentions"] == 5
+    assert d["distinct"] == 4
+    assert d["labels"][0] == ("ai coding", 2)
+
+
+def test_unvalidated_stores_are_excluded_from_the_denominator():
+    """Calls logged before the check existed carry no `dropped` key."""
+    legacy = _tool(tool="store_result", success=True, outcome="stored")
+    legacy.pop("dropped", None)
+    records = [legacy, legacy, _store(dropped=["ai coding"])]
+
+    d = mr.summarize(records)["dropped_labels"]
+
+    # 1 validated call, 1 with a drop — not 3 calls and a reassuring 33%.
+    assert d["calls"] == 1
+    assert d["unvalidated"] == 2
+    assert d["with_dropped_pct"] == pytest.approx(100.0)
+
+
+def test_page_says_when_calls_predate_the_check():
+    legacy = _tool(tool="store_result", success=True, outcome="stored")
+    records = [legacy, _store(), _step("run", new_articles=1)]
+
+    page = mr.render_html(mr.summarize(records))
+
+    assert "predate the check and are excluded" in page
+
+
+def test_dropped_labels_ignore_other_tools():
+    records = [_tool(success=True, result_count=3), _store()]
+
+    assert mr.summarize(records)["dropped_labels"]["calls"] == 1
+
+
+def test_dropped_kpi_reaches_the_page():
+    records = [_store(dropped=["ai coding"]), _store(), _step("run", new_articles=1)]
+
+    page = mr.render_html(mr.summarize(records))
+
+    assert "Labels the agent invented" in page
+    assert "stores with an invented label" in page
+    assert "ai coding" in page
+
+
+def test_clean_runs_say_so_rather_than_hiding_the_figure():
+    """A silent repair and a well-behaved model must not render identically."""
+    records = [_store(), _store(), _step("run", new_articles=1)]
+
+    page = mr.render_html(mr.summarize(records))
+
+    assert "None of the 2 validated store_result calls" in page
+
+
+def test_dropped_figure_absent_when_store_result_was_never_called():
+    """Historical records predate the tool logging entirely."""
+    records = [_llm(), _step("run", new_articles=1)]
+
+    assert "Labels the agent invented" not in mr.render_html(mr.summarize(records))
+
+
+def test_dropped_figure_absent_when_nothing_was_validated():
+    """All-legacy data must not render a 0% rate over unexamined calls."""
+    legacy = _tool(tool="store_result", success=True, outcome="stored")
+    records = [legacy, legacy, _step("run", new_articles=1)]
+
+    page = mr.render_html(mr.summarize(records))
+
+    assert "Labels the agent invented" not in page
+    # The KPI must not report a reassuring 0% either.
+    assert "stores checked for invented labels" in page
+    assert "stores with an invented label" not in page
