@@ -813,7 +813,7 @@ def test_print_summary_new_articles():
 
     mock_print.assert_called_once()
     output = mock_print.call_args[0][0]
-    assert "3 new articles found" in output
+    assert "3 new articles stored" in output
     assert "AI, climate" in output
 
 
@@ -824,7 +824,7 @@ def test_print_summary_singular():
         news_agent._print_summary(1, ["AI"])
 
     output = mock_print.call_args[0][0]
-    assert "1 new article found" in output
+    assert "1 new article stored" in output
     assert "articles" not in output
 
 
@@ -2070,3 +2070,55 @@ def test_judge_articles_reports_a_single_article_in_the_singular(tmp_path):
         news_agent.judge_articles(["ai"], run_start)
 
     assert "Judged 1 article:" in mock_print.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# yield accounting — new_articles must reflect what survived judging
+# ---------------------------------------------------------------------------
+
+
+def test_run_counts_articles_after_judging(tmp_path):
+    """The judge deletes rows the first count included; counting once overstated."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "yield.db")
+    news_agent.init_db(db_file)
+
+    def _fake_invoke(*a, **k):
+        """Stand in for the agent loop: store three articles for this run."""
+        with sqlite3.connect(db_file) as conn:
+            for i in range(3):
+                conn.execute(
+                    "INSERT INTO news_results (topic, title, url, summary, fetched_at)"
+                    " VALUES (?,?,?,?,?)",
+                    ("anthropic", f"T{i}", f"http://a.com/{i}", "S",
+                     datetime.now(timezone.utc).isoformat()),
+                )
+        return {"messages": []}
+
+    def _fake_judge(topics, run_start):
+        """Prune two of the three, the way the real judge does."""
+        with sqlite3.connect(db_file) as conn:
+            conn.execute(
+                "DELETE FROM news_results WHERE url IN ('http://a.com/1','http://a.com/2')"
+            )
+        return 2
+
+    mock_app = MagicMock()
+    mock_app.invoke.side_effect = _fake_invoke
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "build_graph", return_value=mock_app), \
+         patch.object(news_agent, "judge_articles", side_effect=_fake_judge), \
+         patch.object(news_agent, "summarize_day", return_value=None):
+        new_count, _ = news_agent.run(["anthropic"])
+
+    # 3 found, 2 pruned, 1 actually left in the database.
+    assert new_count == 1
+
+    run_records = [
+        r for r in _read_metrics(news_agent.METRICS_PATH) if r.get("step") == "run"
+    ]
+    assert run_records[-1]["new_articles"] == 1
+    # Both numbers are logged: articles_found also dates the record to after the fix.
+    assert run_records[-1]["articles_found"] == 3
+    assert run_records[-1]["articles_pruned"] == 2

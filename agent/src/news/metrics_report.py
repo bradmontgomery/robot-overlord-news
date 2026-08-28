@@ -177,6 +177,9 @@ def _run_rows(records: list[dict]) -> list[dict]:
             "wall_s": r.get("elapsed_s") or 0.0,
             "new_articles": r.get("new_articles") or 0,
             "topics": r.get("topics") or 0,
+            # Absent on runs that counted before judging — see `pre_prune_runs`.
+            "found": r.get("articles_found"),
+            "pruned": r.get("articles_pruned"),
         }
         for r in _steps(records, "run")
     ]
@@ -444,6 +447,11 @@ def summarize(records: list[dict]) -> dict:
         "step_share": step_share,
         "topics": topics,
         "runs": runs,
+        # `new_articles` used to be counted before judge_articles deleted anything, so
+        # older runs report a yield inflated by whatever the judge then removed
+        # (~24% of judged articles, historically). Absence of `articles_found` is what
+        # marks those runs; the chart says so rather than quietly mixing the two.
+        "pre_prune_runs": sum(1 for r in runs if r["found"] is None),
         "errors": Counter(
             (r.get("error") or "").split("(status")[0].strip() for r in failures
         ).most_common(),
@@ -940,6 +948,23 @@ def render_html(summary: dict) -> str:
   <div class="scroll">{label_table}</div>
 </figure>"""
 
+    # Named explicitly rather than left implicit: the two eras are not comparable,
+    # and a reader has no way to see that from the bars alone.
+    pre = summary["pre_prune_runs"]
+    yield_note = ""
+    if pre and pre < len(runs):
+        yield_note = (
+            f' <b>The first {pre} of these {len(runs)} runs counted articles before '
+            f'the judge pruned them</b>, so their bars are inflated by whatever it '
+            f'then deleted — historically about a quarter. Later runs count after '
+            f'judging and show what the run actually left in the database.'
+        )
+    elif pre:
+        yield_note = (
+            ' Every run here counted articles before the judge pruned them, so these '
+            'are found totals, not what remained stored.'
+        )
+
     tools = summary["tools"]
     tool_figure = ""
     if tools:
@@ -1012,7 +1037,7 @@ def render_html(summary: dict) -> str:
     <div class="t">Cost is flat, yield is not</div>
     <div class="d">Every run searches the same topics for roughly the same time,
       but how many new articles come back varies more than twofold. Both axes
-      start at zero.</div>
+      start at zero.{yield_note}</div>
   </figcaption>
   {svg_runs_chart(runs)}
   {_details("Show data table", _table(

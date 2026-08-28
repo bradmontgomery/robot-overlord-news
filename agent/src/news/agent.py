@@ -1096,10 +1096,17 @@ def run(topics: list[str]) -> tuple[int, str | None]:
             model=MODEL_NAME,
         )
     with sqlite3.connect(DB_PATH) as conn:
-        (new_count,) = conn.execute(
+        (found_count,) = conn.execute(
             "SELECT COUNT(*) FROM news_results WHERE fetched_at >= ?", (run_start,)
         ).fetchone()
     judge_articles(topics, run_start)
+    # Count again after judging. The judge deletes rows the first count already
+    # included — historically ~24% of them — so counting only before it reported a
+    # yield about a third higher than what the run actually left in the database.
+    with sqlite3.connect(DB_PATH) as conn:
+        (new_count,) = conn.execute(
+            "SELECT COUNT(*) FROM news_results WHERE fetched_at >= ?", (run_start,)
+        ).fetchone()
     summary = summarize_day(today, run_id=run_start)
     _log_step(
         run_start,
@@ -1107,6 +1114,11 @@ def run(topics: list[str]) -> tuple[int, str | None]:
         time.perf_counter() - run_loop_start,
         topics=len(topics),
         new_articles=new_count,
+        # Logged alongside, because `new_articles` changed meaning here: records
+        # without `articles_found` predate the fix and hold the pre-prune total. Its
+        # presence is what lets the report tell the two eras apart.
+        articles_found=found_count,
+        articles_pruned=found_count - new_count,
     )
     return new_count, summary
 
@@ -1117,7 +1129,9 @@ def _print_summary(new_count: int, topics: list[str]) -> None:
     if new_count:
         noun = "article" if new_count == 1 else "articles"
         rprint(
-            f"[dim][{now}][/dim] [bold green]{new_count} new {noun} found[/bold green] for: {topic_str}"
+            # "stored", not "found": this count is taken after the judge prunes, so it
+            # is what survived, not what the search turned up.
+            f"[dim][{now}][/dim] [bold green]{new_count} new {noun} stored[/bold green] for: {topic_str}"
         )
     else:
         rprint(f"[dim][{now}][/dim] [yellow]No new articles[/yellow] for: {topic_str}")

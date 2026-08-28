@@ -675,3 +675,32 @@ def test_dropped_figure_absent_when_nothing_was_validated():
     # The KPI must not report a reassuring 0% either.
     assert "stores checked for invented labels" in page
     assert "stores with an invented label" not in page
+
+
+def test_yield_chart_flags_runs_counted_before_pruning():
+    """Old runs report found totals, new ones report what survived — say so."""
+    old_run = _step("run", run_id="2026-07-01T00:00:00+00:00", new_articles=40)
+    new_run = _step("run", run_id="2026-08-27T00:00:00+00:00", new_articles=30,
+                    articles_found=40, articles_pruned=10)
+
+    summary = mr.summarize([old_run, new_run])
+    page = mr.render_html(summary)
+
+    assert summary["pre_prune_runs"] == 1
+    assert "counted articles before the judge pruned them" in page
+
+
+def test_yield_chart_says_nothing_when_every_run_is_post_prune():
+    records = [_step("run", new_articles=30, articles_found=40, articles_pruned=10)]
+
+    page = mr.render_html(mr.summarize(records))
+
+    assert "counted articles before the judge pruned" not in page
+
+
+def test_yield_chart_flags_an_all_legacy_file():
+    records = [_step("run", new_articles=40)]
+
+    page = mr.render_html(mr.summarize(records))
+
+    assert "these are found totals, not what remained stored" in page
