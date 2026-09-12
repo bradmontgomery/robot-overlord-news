@@ -80,7 +80,20 @@ sudo certbot --nginx -d robot-overlord.news
 ```
 
 Certbot will modify `/etc/nginx/conf.d/news.conf` to add HTTPS and an HTTP→HTTPS redirect.
-It sets up auto-renewal via a systemd timer — no action needed to keep the cert current.
+It sets up a renewal *service*, but **not a working timer** — see below.
+
+**Enable the renewal timer. It is not automatic.** On Amazon Linux 2023 the certbot package
+ships `certbot-renew.timer` **disabled**, so nothing ever renews and the cert silently expires
+90 days later. This took the site down on 2026-09-12:
+
+```bash
+sudo systemctl enable --now certbot-renew.timer
+systemctl list-timers '*certbot*'
+```
+
+`NEXT` and `LEFT` must be populated. `0 timers listed` means it did not take.
+
+The timer fires daily; certbot only acts once the cert is inside its 30-day renewal window.
 
 Verify HTTPS is working:
 
