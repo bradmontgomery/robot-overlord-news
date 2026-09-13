@@ -139,6 +139,35 @@ aside h2.sidebar-section-gap {
   text-overflow: ellipsis;
 }
 
+.topic-list-badged a {
+  display: flex;
+  align-items: center;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.topic-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topic-count-badge {
+  flex-shrink: 0;
+  margin-left: 6px;
+  min-width: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--surface2);
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  line-height: 16px;
+  text-align: center;
+}
+
 .topic-list a:hover,
 .topic-list a.active {
   background: var(--surface2);

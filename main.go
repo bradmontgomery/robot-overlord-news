@@ -90,19 +90,20 @@ type rssGUID struct {
 }
 
 type PageData struct {
-	Articles     []Article
-	Topics       []string
-	CurrentPage  int
-	TotalPages   int
-	FilterTopic  string
-	FilterDate   string
-	RecentDates  []string
-	DailyCounts  []DayCount
-	TopicCounts  []NameCount
-	SourceCounts []NameCount
-	TotalCount   int
-	DailySummary string
-	FilterQuery  string
+	Articles       []Article
+	Topics         []NameCount
+	AllTopicsCount int
+	CurrentPage    int
+	TotalPages     int
+	FilterTopic    string
+	FilterDate     string
+	RecentDates    []string
+	DailyCounts    []DayCount
+	TopicCounts    []NameCount
+	SourceCounts   []NameCount
+	TotalCount     int
+	DailySummary   string
+	FilterQuery    string
 }
 
 var db *sql.DB
@@ -256,10 +257,17 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		dailySummary = ""
 	}
 
-	topics, err := getTopics()
+	topics, err := getTopics(dateFilter, q)
 	if err != nil {
 		http.Error(w, "db error", 500)
 		log.Println("getTopics:", err)
+		return
+	}
+
+	allTopicsCount, err := getFilteredTotalCount(dateFilter, q)
+	if err != nil {
+		http.Error(w, "db error", 500)
+		log.Println("getFilteredTotalCount:", err)
 		return
 	}
 
@@ -282,17 +290,18 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := PageData{
-		Articles:     articles,
-		Topics:       topics,
-		CurrentPage:  page,
-		TotalPages:   totalPages,
-		FilterTopic:  topic,
-		FilterDate:   dateFilter,
-		FilterQuery:  q,
-		RecentDates:  recentDates,
-		DailyCounts:  dailyCounts,
-		TotalCount:   total,
-		DailySummary: dailySummary,
+		Articles:       articles,
+		Topics:         topics,
+		AllTopicsCount: allTopicsCount,
+		CurrentPage:    page,
+		TotalPages:     totalPages,
+		FilterTopic:    topic,
+		FilterDate:     dateFilter,
+		FilterQuery:    q,
+		RecentDates:    recentDates,
+		DailyCounts:    dailyCounts,
+		TotalCount:     total,
+		DailySummary:   dailySummary,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -307,7 +316,7 @@ const statsDays = 10
 // the last statsDays days: the daily histogram plus per-topic and
 // per-source (FQDN) counts.
 func handleStats(w http.ResponseWriter, r *http.Request) {
-	topics, err := getTopics()
+	topics, err := getTopics("", "")
 	if err != nil {
 		http.Error(w, "db error", 500)
 		log.Println("getTopics:", err)
@@ -342,12 +351,13 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := PageData{
-		Topics:       topics,
-		TotalCount:   total,
-		RecentDates:  lastNDates(5),
-		DailyCounts:  dailyCounts,
-		TopicCounts:  topicCounts,
-		SourceCounts: sourceCounts,
+		Topics:         topics,
+		AllTopicsCount: total,
+		TotalCount:     total,
+		RecentDates:    lastNDates(5),
+		DailyCounts:    dailyCounts,
+		TopicCounts:    topicCounts,
+		SourceCounts:   sourceCounts,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -516,8 +526,17 @@ func handleRSS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func getTopics() ([]string, error) {
-	rows, err := db.Query(`SELECT topic FROM news_results`)
+// getTopics returns per-topic article counts for the sidebar menu, honoring
+// the same date/search filters as getArticles (but never the topic filter
+// itself, since that would zero out every topic but the selected one).
+func getTopics(date, q string) ([]NameCount, error) {
+	clause, args := articleFilter("", date, q)
+	where := ""
+	if clause != "" {
+		where = ` WHERE ` + clause
+	}
+
+	rows, err := db.Query(`SELECT topic FROM news_results`+where, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -537,12 +556,7 @@ func getTopics() ([]string, error) {
 		return nil, err
 	}
 
-	nc := sortedNameCounts(counts)
-	topics := make([]string, len(nc))
-	for i, t := range nc {
-		topics[i] = t.Name
-	}
-	return topics, nil
+	return sortedNameCounts(counts), nil
 }
 
 // sortedNameCounts converts a name->count map into a slice sorted by count
@@ -621,6 +635,20 @@ func getSourceCounts(days int) ([]NameCount, error) {
 func getTotalCount() (int, error) {
 	var total int
 	err := db.QueryRow(`SELECT COUNT(*) FROM news_results`).Scan(&total)
+	return total, err
+}
+
+// getFilteredTotalCount returns the distinct article count under the
+// date/search filters, for the "All topics" sidebar badge. Topic tallies
+// can't be summed for this since one article can list multiple topics.
+func getFilteredTotalCount(date, q string) (int, error) {
+	clause, args := articleFilter("", date, q)
+	where := ""
+	if clause != "" {
+		where = ` WHERE ` + clause
+	}
+	var total int
+	err := db.QueryRow(`SELECT COUNT(*) FROM news_results`+where, args...).Scan(&total)
 	return total, err
 }
 

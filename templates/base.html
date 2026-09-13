@@ -42,16 +42,20 @@
     </ul>
 
     <h2 class="sidebar-section-gap">Topics</h2>
-    <ul class="topic-list">
+    <ul class="topic-list topic-list-badged">
       <li>
         <a href="/" {{ if and (eq .FilterTopic "") (eq .FilterDate "") (eq .FilterQuery "") }}class="active"{{ end }}>
-          <span class="topic-dot" style="background:#8892b0"></span>All topics
+          <span class="topic-dot" style="background:#8892b0"></span>
+          <span class="topic-name">All topics</span>
+          <span class="topic-count-badge">{{ .AllTopicsCount }}</span>
         </a>
       </li>
       {{ range .Topics }}
       <li>
-        <a href="/{{ filterQuery "topic" . "date" $.FilterDate "q" $.FilterQuery }}" {{ if eq . $.FilterTopic }}class="active"{{ end }} title="{{ . }}">
-          <span class="topic-dot" style="background:{{ topicColor . }}"></span>{{ . }}
+        <a href="/{{ filterQuery "topic" .Name "date" $.FilterDate "q" $.FilterQuery }}" {{ if eq .Name $.FilterTopic }}class="active"{{ end }} title="{{ .Name }}">
+          <span class="topic-dot" style="background:{{ topicColor .Name }}"></span>
+          <span class="topic-name">{{ .Name }}</span>
+          <span class="topic-count-badge">{{ .Count }}</span>
         </a>
       </li>
       {{ end }}
