@@ -15,10 +15,10 @@
 </div>
 
 {{ if .DailySummary }}
-<div class="daily-summary">
-  <h2>Daily Briefing</h2>
+<details class="daily-summary"{{ if not .FilterQuery }} open{{ end }}>
+  <summary><h2>Daily Briefing</h2></summary>
   <div class="daily-summary-body">{{ markdown .DailySummary }}</div>
-</div>
+</details>
 {{ end }}
 
 {{ if .Articles }}
