@@ -491,6 +491,25 @@ main {
   margin-bottom: 0.6rem;
 }
 
+.daily-summary summary {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+  list-style: none;
+  color: var(--accent-light);
+}
+.daily-summary summary::-webkit-details-marker { display: none; }
+.daily-summary summary::before {
+  content: "▸";
+  font-size: 0.75rem;
+  transition: transform 0.15s;
+}
+.daily-summary[open] summary::before { transform: rotate(90deg); }
+.daily-summary summary h2 { min-width: 0; margin-bottom: 0; }
+.daily-summary[open] summary { margin-bottom: 0.6rem; }
+.daily-summary:not([open]) { padding-top: 0.6rem; padding-bottom: 0.6rem; }
+
 .daily-summary p {
   font-size: 0.9rem;
   color: var(--text);
