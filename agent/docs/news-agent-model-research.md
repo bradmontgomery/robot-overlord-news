@@ -6,6 +6,11 @@ ruled out for a stated reason.
 
 ## The three workloads
 
+> **Note:** the relevance judge described below (chat model, `reasoning=False`, `num_predict=256`,
+> `N: YES/NO` parsing) has been retired. `judge_articles` now asks a Noul decision model
+> (`nimble:latest`, `TYPESAFE_DEFAULT_MODEL`) one yes/no question per article and deletes articles
+> scoring below `JUDGE_THRESHOLD`. The judge-specific sections here are historical.
+
 `src/news/agent.py` runs three distinct LLM jobs, two of which share one env var:
 
 | Workload | Code | Model | Config | Skill required |

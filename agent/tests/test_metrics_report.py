@@ -43,7 +43,8 @@ def records():
         _llm(tokens=3800, done="length", total=4096),
         _llm(tokens=1200),
         _llm(tokens=4100, done="length", total=4096),
-        # judge_batch also truncates (no num_ctx); summarize_primary never does.
+        # A legacy judge_batch record from before the Noul judge: ignored, not a crash.
+        # summarize_primary never truncates.
         _llm(step="judge_batch", tokens=3900, done="length", total=4096),
         _llm(step="summarize_primary", tokens=1800, total=2200, num_ctx=49152),
         # An oversized prompt that must land in the overflow bin.
@@ -102,7 +103,7 @@ def test_truncation_by_step_shows_num_ctx_only_where_set(records):
 
     assert by_step["agent_step"]["truncated"] == 2
     assert by_step["agent_step"]["num_ctx"] is None
-    assert by_step["judge_batch"]["truncated"] == 1
+    assert "judge_batch" not in by_step  # retired step; legacy records are ignored
     # The one step that sets num_ctx is the one that never truncates.
     assert by_step["summarize_primary"]["truncated"] == 0
     assert by_step["summarize_primary"]["num_ctx"] == 49152
@@ -301,31 +302,23 @@ def test_module_runs_as_a_script(tmp_path, records, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _judge(run_id, output, done, **extra):
-    return _llm(step="judge_batch", tokens=1050, total=1050 + output, done=done,
-                run_id=run_id, success=True, **extra)
-
-
 @pytest.fixture
 def two_cohorts():
     """One run per era, shaped like the real before/after.
 
-    Pre-change: prompts capped below 4,096, responses cut off there, an unbounded
-    judge runaway. Post-change: prompts above the old ceiling, nothing cut off, a
-    judge runaway bounded at exactly the cap.
+    Pre-change: prompts capped below 4,096, responses cut off there. Post-change:
+    prompts above the old ceiling, nothing cut off.
     """
     pre, post = "2026-07-28T03:00:00+00:00", "2026-07-30T01:00:00+00:00"
     return [
         # --- num_ctx unset: Ollama's 4096 default ---
         _llm(tokens=2000, total=2400, run_id=pre, tool_call_count=1),
         _llm(tokens=3800, total=4096, done="length", run_id=pre, tool_call_count=0),
-        _judge(pre, 2900, "length"),
         {"type": "step", "run_id": pre, "step": "run", "elapsed_s": 730.0,
          "topics": 65, "new_articles": 22},
         # --- num_ctx raised to 16384 ---
         _llm(tokens=5200, total=5600, num_ctx=16384, run_id=post, tool_call_count=2),
         _llm(tokens=2000, total=2400, num_ctx=16384, run_id=post, tool_call_count=2),
-        _judge(post, 256, "length", num_predict=256),
         {"type": "step", "run_id": post, "step": "run", "elapsed_s": 660.0,
          "topics": 65, "new_articles": 24},
     ]
@@ -376,18 +369,6 @@ def test_prompts_above_the_old_ceiling_are_counted(two_cohorts):
     assert post["prompts_over_ceiling"] == 1
 
 
-def test_capped_judge_runaways_still_count_as_runaways(two_cohorts):
-    """A cap bounds a runaway's cost; it does not prevent it.
-
-    The capped call stops at exactly num_predict, so a `>` test would report zero
-    and make the cap look like a cure.
-    """
-    pre, post = mr.summarize(two_cohorts)["cohorts"]
-
-    assert post["judge_runaways"] == 1
-    assert pre["judge_runaways"] == 1
-
-
 def test_cohort_stats_survive_a_cohort_with_no_runs():
     """agent_step records can exist for a run whose `run` record never landed."""
     stats = mr._cohort_stats(
@@ -435,7 +416,7 @@ def test_ceiling_note_stays_scoped_to_the_cohort_it_describes(two_cohorts):
 
 def test_render_falls_back_when_there_are_no_agent_steps():
     """No agent_step records means no cohorts, but the page must still render."""
-    records = [_llm(step="judge_batch"), _step("run", 10.0, new_articles=1)]
+    records = [_llm(step="judge_decision"), _step("run", 10.0, new_articles=1)]
 
     page = mr.render_html(mr.summarize(records))
 

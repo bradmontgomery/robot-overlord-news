@@ -51,11 +51,6 @@ PIPELINE_STEPS = ("search_topic", "judge_articles", "summarize_day")
 
 # Buckets in the sequential ramp used for per-topic cost (--ramp-1 … --ramp-N).
 RAMP_STEPS = 4
-# Mirrors JUDGE_NUM_PREDICT in agent.py. A judge verdict is ~41 tokens; anything
-# past this was a runaway, and capping bounds its cost rather than preventing it —
-# so a capped runaway still reports done_reason "length". Counting those as
-# "truncated" alongside real agent truncations would blend two unlike things.
-JUDGE_OUTPUT_CAP = 256
 
 
 # --------------------------------------------------------------------------
@@ -125,7 +120,7 @@ def _token_bins(calls: list[dict]) -> list[dict]:
 def _truncation_by_step(records: list[dict]) -> list[dict]:
     """Per-step truncation counts — the evidence that num_ctx is the cause."""
     rows = []
-    for step in ("agent_step", "judge_batch", "summarize_primary"):
+    for step in ("agent_step", "summarize_primary"):
         calls = _llm_calls(records, step)
         if not calls:
             continue
@@ -240,7 +235,6 @@ def _cohort_stats(records: list[dict], config: tuple, run_ids: set) -> dict:
     num_ctx = config[0]
     sub = [r for r in records if r.get("run_id") in run_ids]
     agent = _llm_calls(sub, "agent_step")
-    judge = _llm_calls(sub, "judge_batch")
     llm = _llm_calls(sub)
     runs = _run_rows(sub)
 
@@ -250,11 +244,6 @@ def _cohort_stats(records: list[dict], config: tuple, run_ids: set) -> dict:
     # Prompts above the old default are only possible once the window is raised —
     # the one signal that says whether inputs were being clipped, not just outputs.
     over = [r for r in agent if (r.get("input_tokens") or 0) > CONTEXT_CEILING]
-    # `>=`, not `>`: a capped runaway stops at exactly num_predict, so a `>` test
-    # would report zero runaways the moment the cap starts working and make the
-    # cap look like a cure rather than a bound. No legitimate verdict comes close
-    # (the largest observed is 152 tokens).
-    runaways = [r for r in judge if (r.get("output_tokens") or 0) >= JUDGE_OUTPUT_CAP]
 
     return {
         "num_ctx": num_ctx,
@@ -267,8 +256,6 @@ def _cohort_stats(records: list[dict], config: tuple, run_ids: set) -> dict:
         "truncated_no_tool": sum(1 for r in truncated if r.get("tool_call_count") == 0),
         "prompts_over_ceiling": len(over),
         "mean_tool_calls": (sum(tool_counts) / len(tool_counts)) if tool_counts else 0.0,
-        "judge_runaways": len(runaways),
-        "judge_runaway_s": sum(r.get("elapsed_s") or 0.0 for r in runaways),
         "load_stall_pct": _pct(len(stalls), len(llm)),
         "median_wall_s": _median([r["wall_s"] for r in runs]),
         "steps_per_run": _median(list(Counter(r.get("run_id") for r in agent).values())),
@@ -775,8 +762,6 @@ COHORT_METRICS = (
     ("prompts above 4,096 tokens", "prompts_over_ceiling", lambda v: f"{v:,.0f}", False),
     ("mean tool calls per step", "mean_tool_calls", lambda v: f"{v:.2f}", False),
     ("agent steps per run (median)", "steps_per_run", lambda v: f"{v:,.0f}", None),
-    ("judge runaways (≥256 tokens out)", "judge_runaways", lambda v: f"{v:,.0f}", True),
-    ("…seconds burned on them", "judge_runaway_s", lambda v: f"{v:,.0f}s", True),
     ("model load stalls >1s", "load_stall_pct", lambda v: f"{v:.1f}%", True),
     ("median run duration", "median_wall_s", lambda v: f"{v / 60:.1f} min", None),
 )

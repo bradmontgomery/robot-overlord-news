@@ -30,6 +30,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from rich import print as rprint
 from rich.markdown import Markdown
+from typesafe_sdk import Noul, TypeSafeClient
 
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen3.5:latest")
 SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL", "ministral-3:8b")
@@ -49,17 +50,12 @@ AGENT_NUM_CTX = int(os.getenv("NEWS_NUM_CTX", "16384"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 DB_PATH = os.getenv("NEWS_DB_PATH", "news_results.db")
 METRICS_PATH = os.getenv("NEWS_METRICS_PATH", "news_metrics.jsonl")
-# Articles judged per LLM call in judge_articles(). 10 articles' title+summary is
-# ~500-700 tokens, comfortably inside the model's default 4096-token context; cuts
-# judge_articles' call count ~10x versus one call per article.
-JUDGE_BATCH_SIZE = 10
-# Hard cap on judge output. The judge is not context-starved — its prompts peak at
-# ~1.2k tokens, well inside the 4096 default — but its output is bimodal: 41 tokens
-# for a normal verdict, or a runaway that burns every remaining token and stops at
-# the limit with empty .content, which fails open and keeps every article (see the
-# reasoning=False note in judge_articles). A bigger window would only let a runaway
-# burn more; capping it ends one in ~256 tokens instead of ~3000.
-JUDGE_NUM_PREDICT = 256
+# Relevance judge: a Noul decision model served by Ollama at /v1/systemone (see
+# judge_articles). TYPESAFE_BASE_URL / TYPESAFE_API_KEY are read by the SDK itself.
+JUDGE_MODEL = os.getenv("TYPESAFE_DEFAULT_MODEL", "nimble:latest")
+# A Noul answer is a probability (0 = no, 1 = yes). Articles scoring below this are
+# deleted; everything at or above it is kept.
+JUDGE_THRESHOLD = float(os.getenv("JUDGE_THRESHOLD", "0.5"))
 # Sampling parameters. Ollama's own defaults (temperature 0.8, top_k 40, top_p 0.9)
 # are tuned for open-ended chat; these three call sites want different things.
 # The ReAct loop needs the same tool call for the same state, not variety — but not
@@ -68,9 +64,6 @@ JUDGE_NUM_PREDICT = 256
 # out. Note this is low temperature, not determinism: reproducing a run exactly
 # would also require pinning `seed`.
 AGENT_TEMPERATURE = 0.2
-# The judge emits a handful of YES/NO tokens and nothing else, so any sampling
-# entropy is pure downside — see the runaway described at JUDGE_NUM_PREDICT.
-JUDGE_TEMPERATURE = 0.0
 # The summary is prose meant to be read, so it gets room to vary word choice.
 # top_k/top_p are set explicitly at Ollama's defaults: at 0.5 the tail is live
 # (unlike the greedy judge, where they would be inert), so the values that shape
@@ -83,11 +76,6 @@ SUMMARY_TOP_P = 0.9
 # structurally impossible for the logged config to drift from the config actually used,
 # which is what lets metrics_report.py cohort runs by config and trust the answer.
 AGENT_MODEL_KWARGS = {"num_ctx": AGENT_NUM_CTX, "temperature": AGENT_TEMPERATURE}
-JUDGE_MODEL_KWARGS = {
-    "num_predict": JUDGE_NUM_PREDICT,
-    "temperature": JUDGE_TEMPERATURE,
-    "reasoning": False,
-}
 # num_ctx is per-call for the summary (see summarize_day), so it is merged in there
 # rather than fixed here.
 SUMMARY_MODEL_KWARGS = {
@@ -208,27 +196,27 @@ or invent details not present in the articles.
 and no questions to the reader.
 """
 
-_JUDGE_SYSTEM_PROMPT = """\
-You are a relevance judge for an AI/ML technology news digest. You will be given a \
-numbered list of articles and a set of topics (companies, products, models, or \
-concepts from the AI industry). For EACH numbered article, decide YES only if it is \
-BOTH:
-  1. genuinely about artificial intelligence / machine learning technology
-     (a model, AI product/feature, AI research, AI tooling, AI company, or AI industry strategy), AND
-  2. relevant to at least one of the given topics.
-
-Many topics are company names (e.g. "nvidia", "microsoft", "google", "spacex") that \
-also generate large volumes of ordinary corporate, financial, or product news with no \
-AI angle — stock price moves, earnings, unrelated product launches, layoffs, legal/
-antitrust rulings, rocket launches, gaming, or general company gossip. Answer NO for \
-those even though the company name matches the topic. Only answer YES when the AI/ML \
-angle is actually present in the title or summary.
-
-Respond with exactly one line per article, in this format and no other text:
-N: YES
-N: NO
-
-where N is the article's number. Do not add explanations, headers, or commentary."""
+# One yes/no question asked of each article. The instructions carry the rule; the
+# criteria spell out what a yes and a no mean.
+JUDGE_QUESTION = Noul(
+    instructions=(
+        "Is this article genuinely about artificial intelligence / machine learning "
+        "technology AND relevant to at least one of the given topics?"
+    ),
+    criteria={
+        "true": (
+            "About a model, AI product/feature, AI research, AI tooling, an AI company, "
+            "or AI industry strategy, and relevant to a topic."
+        ),
+        "false": (
+            "No AI/ML angle in the title or summary. Many topics are company names "
+            '(e.g. "nvidia", "microsoft", "google", "spacex") that also generate '
+            "ordinary corporate, financial, or product news — stock moves, earnings, "
+            "unrelated launches, layoffs, legal rulings, rocket launches, gaming, "
+            "gossip. Those are false even though the company name matches."
+        ),
+    },
+)
 
 SEARCH_PROMPT = """Search for *recent* news for this topic group (labels separated by
 commas): {topic_list}
@@ -754,28 +742,13 @@ def build_graph(run_id: str | None = None):
     return graph.compile()
 
 
-_JUDGE_LINE_RE = re.compile(r"(\d+)\s*[:.)]\s*(YES|NO)", re.IGNORECASE)
-
-
-def _parse_judge_verdicts(response_text: str) -> dict[int, str]:
-    """Parse a judge response into {article_number: "YES"|"NO"}.
-
-    If an article number appears more than once (e.g. a reasoning model restates
-    it before its final answer), the LAST occurrence wins.
-    """
-    verdicts: dict[int, str] = {}
-    for number, verdict in _JUDGE_LINE_RE.findall(response_text):
-        verdicts[int(number)] = verdict.upper()
-    return verdicts
-
-
 def judge_articles(topics: list[str], run_start: str) -> int:
     """Delete articles fetched since run_start that are irrelevant to topics.
 
-    Articles are judged in batches of JUDGE_BATCH_SIZE per LLM call. If a batch's
-    response can't be parsed for a given article, or the LLM call itself fails,
-    that article is kept (fail-open) rather than deleted, so a malformed local-model
-    response never silently destroys data.
+    Each article is one Noul question to the judge model: it answers with a probability
+    that the article is relevant, and rows scoring below JUDGE_THRESHOLD are deleted.
+    If a call fails, that article is kept (fail-open) rather than deleted, so an
+    unreachable or misbehaving model never silently destroys data.
 
     Prints how many articles it judged and how many it kept. Both numbers are needed
     to read a run: the judge deletes rows that were already counted as "found", so
@@ -793,62 +766,51 @@ def judge_articles(topics: list[str], run_start: str) -> int:
         return 0
 
     topic_str = ", ".join(topics)
-    # reasoning=False: qwen3.5 is a reasoning model and its <think> traces reliably
-    # blow past the response length limit on a 10-article batch, causing done_reason
-    # "length" with empty .content — which fails open and keeps every article,
-    # including the false positives this judge exists to catch. The judge only needs
-    # short YES/NO tokens, so reasoning adds cost without adding judgment quality.
-    model = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, **JUDGE_MODEL_KWARGS)
     to_delete: list[int] = []
-    for i in range(0, len(rows), JUDGE_BATCH_SIZE):
-        batch = rows[i : i + JUDGE_BATCH_SIZE]
-        articles = "\n\n".join(
-            f"{n}. Article title: {title}\nArticle summary: {summary}"
-            for n, (_, title, summary) in enumerate(batch, start=1)
-        )
-        batch_index = i // JUDGE_BATCH_SIZE
-        call_start = time.perf_counter()
-        try:
-            response = model.invoke(
-                [
-                    SystemMessage(_JUDGE_SYSTEM_PROMPT),
-                    HumanMessage(f"Topics: {topic_str}\n\n{articles}"),
-                ]
+    with TypeSafeClient(timeout=120) as client:
+        for row_id, title, summary in rows:
+            call_start = time.perf_counter()
+            try:
+                result = client.system_one(
+                    state={"title": title, "summary": summary, "topics": topic_str},
+                    questions={"is_relevant": JUDGE_QUESTION},
+                    model=JUDGE_MODEL,
+                )
+                noul = result.answers["is_relevant"].noul
+            except Exception as e:
+                _write_metric(
+                    {
+                        "type": "llm_call",
+                        "run_id": run_start,
+                        "step": "judge_decision",
+                        "model": JUDGE_MODEL,
+                        "elapsed_s": round(time.perf_counter() - call_start, 3),
+                        "success": False,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                    }
+                )
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                rprint(
+                    f"[dim][{now}][/dim] [yellow]Judge call failed (keeping article "
+                    f"unfiltered): {e}[/yellow]"
+                )
+                continue
+            _write_metric(
+                {
+                    "type": "llm_call",
+                    "run_id": run_start,
+                    "step": "judge_decision",
+                    "model": JUDGE_MODEL,
+                    "elapsed_s": round(time.perf_counter() - call_start, 3),
+                    "input_tokens": result.usage.input_tokens,
+                    "output_tokens": result.usage.output_tokens,
+                    "noul": noul,
+                    "threshold": JUDGE_THRESHOLD,
+                    "success": True,
+                }
             )
-        except Exception as e:
-            _log_llm_call(
-                run_start,
-                "judge_batch",
-                MODEL_NAME,
-                None,
-                time.perf_counter() - call_start,
-                batch_index=batch_index,
-                batch_size=len(batch),
-                success=False,
-                error=str(e),
-                error_type=type(e).__name__,
-                **JUDGE_MODEL_KWARGS,
-            )
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            rprint(
-                f"[dim][{now}][/dim] [yellow]Judge call failed (keeping batch "
-                f"unfiltered): {e}[/yellow]"
-            )
-            continue
-        _log_llm_call(
-            run_start,
-            "judge_batch",
-            MODEL_NAME,
-            response,
-            time.perf_counter() - call_start,
-            batch_index=batch_index,
-            batch_size=len(batch),
-            success=True,
-            **JUDGE_MODEL_KWARGS,
-        )
-        verdicts = _parse_judge_verdicts(response.content)
-        for n, (row_id, _title, _summary) in enumerate(batch, start=1):
-            if verdicts.get(n) == "NO":
+            if noul < JUDGE_THRESHOLD:
                 to_delete.append(row_id)
 
     if to_delete:
