@@ -49,12 +49,6 @@ AGENT_NUM_CTX = int(os.getenv("NEWS_NUM_CTX", "16384"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 DB_PATH = os.getenv("NEWS_DB_PATH", "news_results.db")
 METRICS_PATH = os.getenv("NEWS_METRICS_PATH", "news_metrics.jsonl")
-# Topics are searched in small batches. A single huge query crashes the news
-# backend ("Could not extract vqd"); just as important, once a batch fills the
-# context with many search results the local model stops following through on
-# the store_result step (empirically reliable at 2-3 topics, drops to zero
-# storing at 4+). Keep this small so every topic's articles actually get stored.
-BATCH_SIZE = 2
 # Articles judged per LLM call in judge_articles(). 10 articles' title+summary is
 # ~500-700 tokens, comfortably inside the model's default 4096-token context; cuts
 # judge_articles' call count ~10x versus one call per article.
@@ -109,95 +103,72 @@ SUMMARY_MODEL_KWARGS = {
 FAILURE_DIR = os.getenv("NEWS_FAILURE_DIR", "news_failures")
 FAILURE_KEEP = int(os.getenv("NEWS_FAILURE_KEEP", "50"))
 DEFAULT_TOPICS = (
-    "anthropic",  # AI companies
-    "openai",
+    "anthropic, claude, claude code, haiku, opus, sonnet, fable, mythos",
+    "openai, chatgpt, luna, sol, astra, terra, gpt-image, codex",
     "ollama",
-    "google",
-    "xai",
-    "spacex",
-    "z.ai",
-    "nvidia",
-    "microsoft",
+    "google, gemini, deepmind, gemma, veo, nano banana, antigravity",
+    "spacex, xai, grok, cursor",
+    "z.ai, glm, zhipu",
+    "nvidia, blackwell, nemotron, ai",
+    "microsoft, foundry, copilot, phi models",
     "perplexity",
-    "moonshot",
-    "minimax",
-    "hugging face",
+    "moonshot, kimi, kimi code",
+    "minimax, minimax code, minimax design",
+    "hugging face, transformers, sentence transformers",
     "groq",
-    "claude",  # Models
-    "gemini",
-    "chatgpt",
-    "gpt-5",
-    "nova",
-    "phi",
-    "sora",
-    "veo",
+    "amazon, bedrock, nova, kiro, trainium",
     "midjourney",
-    "stable diffusion",
-    "grok",
-    "deepseek",
-    "meta llama",
-    "glm",
-    "kimi",
-    "qwen",
-    "minimax",
-    "lfm",
-    "gemma",
-    "nemotron",
-    "mistral",
-    "cohere",
-    "llama",
-    "astra",
-    "fable",
-    "mistral",
-    "muse spark",
-    "claude code",  # tools, harnesses
-    "codex",
-    "muse code",
-    "opencode",
-    "cursor",
-    "langchain",
-    "copilot",
-    "kiro",
+    "thinking machines, inkling, tinker",
+    "stability.ai, stable diffusion, stable audio, stable video",
+    "deepseek, deepseek harness",
+    "meta.ai, muse spark, muse glimmer, muse agent, llama, muse code",
+    "alibaba, qwen, qwen code",
+    "liquid.ai, lfm",
+    "mistral ai, mistral studio, mistral forge, mistral vibe",
+    "cohere ai, command, north, compass, cohere labs",
+    "jev, typesafe.ai, systemone",
+    "opencode, opencode agent, opencode coding harness",
+    "langchain, langgraph, langsmith, langsmith fleet, deepagents",
+    "ai21, jamba",
     "openclaw",
-    "cline",
-    "windsurf",
-    "replit",
-    "zed",
-    "local llm",  # broader topics
-    "vllm",
-    "llamacpp",
-    "sglang",
-    "mlx",
-    "transformers",
-    "mcp",
-    "model context protocol",
-    "a2a",
-    "coding agents",
-    "ai harness",
-    "artificial intelligence",
-    "llm",
-    "large language model",
-    "foundation model",
-    "ai safety",
-    "ai policy",
-    "reasoning models",
-    "open weights",
-    "agi",
-    "vibe coding",
-    "rag",
+    "cline, cline agent",
+    "agent harness, goose, goose harness",
+    "pi harness, pi agent harness, omp, oh my pi harness",
+    "pydantic ai, pydantic agent",
+    "hermes, hermes agent, nous research",
+    "amp, amp harness, ampcode",
+    "maf, microsoft agent framework, microsoft agent harness",
+    "devin ai, devin, windsurf",
+    "lovable, lovable ai",
+    "base44",
+    "bolt, bolt ai",
+    "v0, vercel, replit",
+    "zed, zed ai",
+    "local llm",
+    "vllm, llamacpp, sglang",
+    "apple silicon, mlx, apple intelligence",
+    "mcp, model context protocol, a2a",
+    "artificial intelligence, ai, superintelligence",
+    "llm, large language model, foundation model, open weights",
+    "ai safety, ai policy, ai alignment, superintelligence, agi",
+    "vibe coding, ai coding, ai harness, ai coding harness, coding agents",
+    "rag, retrieval augmented generation, embedding, vector search, vector database, reranker",
+    "irregular, ai security",
+    "safe.ai, center for ai safety, METR, MIRI, Center for Human-Compatible AI (CHAI), allen institute for ai safety",
 )
 
 _SYSTEM_PROMPT = """\
 You are an AI/ML technology news research agent. Today's date is {today}.
 
-The user gives you one or more topics — companies, products, models, or concepts from
-the AI industry. Treat each provided topic as a short, fixed label.
+The user gives you one topic group: a set of related labels — companies, products,
+models, or concepts from the AI industry — separated by commas. Each label is an
+individual topic.
 
-For each topic:
-1. Search for recent news using the search tool. Use a SHORT query — just the
-   topic label itself (optionally add the word "news"). Search ONE topic per
-   query: never combine multiple topics into a single search, and never add
-   site: filters or URLs to the query. Both return zero results.
+For the group:
+1. Search for *recent* news using the search tool. Use ONE SHORT query: join the
+   group's labels with " OR " (optionally add the word "news"). If the group has many
+   labels, use its 3-4 most distinctive ones. Never add site: filters or URLs to the
+   query. Both return zero results.
 2. For each article found, only store it if it is genuinely about AI/ML technology
    (a model, AI product/feature, AI research, AI tooling, or AI industry strategy).
    Company topics like "nvidia", "microsoft", "google", or "spacex" also generate
@@ -205,21 +176,22 @@ For each topic:
    moves, earnings, unrelated product launches, layoffs, legal rulings, rocket
    launches, gaming. Skip those even though the company name matches the topic.
    For each article that passes this check, call store_result ONCE with:
-   - topic: the topic label(s) this article belongs to (see rules below)
+   - topic: the label(s) this article belongs to (see rules below)
    - title: article headline
    - url: article URL
-   - summary: 1-2 sentence summary of the article
+   - summary: 1-3 sentence summary of the article
    - published_on: publication date if visible in results (ISO format YYYY-MM-DD), else omit
 
 Rules for the `topic` field — keep topics tight so they stay easy to group:
-- Reuse the SAME short label the user gave you. Do not expand the label or invent longer wording,
-  and do NOT turn the label into a descriptive phrase.
-- Labels are lowercase (e.g. "anthropic", "local llm", "ai coding").
-- Multiple labels on a news article are allowed: if one article is genuinely relevant to several of the
-  provided topics, set topic to a comma-separated list of those labels
-  (e.g. "anthropic, claude code"). Otherwise use the single matching label.
+- Use ONLY individual labels from the groups you were given — never a whole group line.
+  Do not expand a label or invent longer wording, and do NOT turn a label into a
+  descriptive phrase.
+- Labels are lowercase (e.g. "anthropic", "local llm", "claude code").
+- Multiple labels on a news article are allowed: if one article is genuinely relevant to several
+  labels (from the same group or different ones), set topic to a comma-separated list of those
+  labels (e.g. "anthropic, claude code"). Otherwise use the single matching label.
 
-After you have searched and stored results for ALL topics, stop.
+After you have searched and stored results for the group, stop.
 """
 
 _SUMMARIZE_SYSTEM_PROMPT = """\
@@ -242,7 +214,7 @@ numbered list of articles and a set of topics (companies, products, models, or \
 concepts from the AI industry). For EACH numbered article, decide YES only if it is \
 BOTH:
   1. genuinely about artificial intelligence / machine learning technology
-     (a model, AI product/feature, AI research, AI tooling, or AI industry strategy), AND
+     (a model, AI product/feature, AI research, AI tooling, AI company, or AI industry strategy), AND
   2. relevant to at least one of the given topics.
 
 Many topics are company names (e.g. "nvidia", "microsoft", "google", "spacex") that \
@@ -258,14 +230,14 @@ N: NO
 
 where N is the article's number. Do not add explanations, headers, or commentary."""
 
-SEARCH_PROMPT = """Research recent news for these topics: {topic_list}.
+SEARCH_PROMPT = """Search for *recent* news for this topic group (labels separated by
+commas): {topic_list}
 
-Search each topic separately, using a short keyword query — just the topic label
-itself (optionally with the word "news"). Do NOT combine multiple topics into a
-single query, and do NOT add site: filters or URLs to the query; both return no
-results.
+Use one short query made from the group's labels joined by " OR " (optionally with the
+word "news"). Do NOT add site: filters or URLs to the query; both return no results.
+Store each article under the individual label(s) it matches, not the whole group.
 
-Cast a broad net and store every relevant, recent article you find.
+Cast a broad net and store every relevant, recent article you find. Today is {today}.
 """
 
 
@@ -275,13 +247,13 @@ def _write_metric(record: dict) -> None:
         f.write(json.dumps(record) + "\n")
 
 
-# Which run and which topic batch is currently executing. build_graph() is called once
-# per run but invoked once per batch, so batch_index cannot be closed over — and tools
+# Which run and which topic entry is currently executing. build_graph() is called once
+# per run but invoked once per topic entry, so topic_index cannot be closed over — and tools
 # receive only their own arguments, so it cannot be threaded through the graph state
 # either. A ContextVar reaches both the agent node and the tool wrappers with one
 # mechanism, and stays correct if the loop is ever made async.
-_BATCH_CONTEXT: contextvars.ContextVar[dict] = contextvars.ContextVar(
-    "news_batch_context", default={}
+_TOPIC_CONTEXT: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "news_topic_context", default={}
 )
 
 
@@ -293,12 +265,12 @@ def _log_tool_call(tool_name: str, elapsed_s: float, **extra) -> None:
     failures) is what supplies the denominator — an error count alone cannot say
     whether a failure rate is rising or falling.
     """
-    ctx = _BATCH_CONTEXT.get()
+    ctx = _TOPIC_CONTEXT.get()
     _write_metric(
         {
             "type": "tool_call",
             "run_id": ctx.get("run_id"),
-            "batch_index": ctx.get("batch_index"),
+            "topic_index": ctx.get("topic_index"),
             "tool": tool_name,
             "elapsed_s": round(elapsed_s, 3),
             **extra,
@@ -322,11 +294,11 @@ def _dump_failed_conversation(messages: list, tools: list | None = None) -> str 
 
     Never raises: a failure while recording a failure must not mask the original error.
     """
-    ctx = _BATCH_CONTEXT.get()
+    ctx = _TOPIC_CONTEXT.get()
     run_id = (ctx.get("run_id") or "adhoc").replace(":", "").replace("+", "")
-    # Nanoseconds, not milliseconds: consecutive failures in one batch land inside the
+    # Nanoseconds, not milliseconds: consecutive failures in one topic search land inside the
     # same millisecond and would overwrite each other.
-    name = f"{run_id}-batch{ctx.get('batch_index')}-{time.time_ns()}.json"
+    name = f"{run_id}-topic{ctx.get('topic_index')}-{time.time_ns()}.json"
     try:
         os.makedirs(FAILURE_DIR, exist_ok=True)
         path = os.path.join(FAILURE_DIR, name)
@@ -353,7 +325,7 @@ def _dump_failed_conversation(messages: list, tools: list | None = None) -> str 
 
 
 def _prune_failure_dumps() -> None:
-    """Keep only the newest FAILURE_KEEP dumps; ~12% of batches fail, so this grows."""
+    """Keep only the newest FAILURE_KEEP dumps; ~12% of topic searches fail, so this grows."""
     entries = sorted(
         (e for e in os.scandir(FAILURE_DIR) if e.is_file()),
         key=lambda e: e.stat().st_mtime,
@@ -504,15 +476,26 @@ def _resolve_topic(label: str, allowed: list[str]) -> str | None:
     return None
 
 
+def _split_labels(groups: list[str]) -> list[str]:
+    """Flatten comma-separated topic groups into unique, lowercased individual labels."""
+    labels: list[str] = []
+    for group in groups:
+        for part in group.split(","):
+            label = part.strip().lower()
+            if label and label not in labels:
+                labels.append(label)
+    return labels
+
+
 def _normalize_topic(topic: str, allowed: list[str] | None = None) -> tuple[str, list]:
     """Return ``(normalized_topic, dropped_labels)`` for a comma-separated *topic*.
 
     Labels are lowercased and trimmed, then — when *allowed* is supplied — resolved
-    back onto the batch's own topics. Anything that will not resolve is dropped and
+    back onto the topic entry's own labels. Anything that will not resolve is dropped and
     returned, because the agent invents labels in three ways the prompt cannot prevent:
     spelling variants, phrases lifted out of the prompt's own wording ("ai industry
-    strategy"), and topics carried over from earlier batches in the conversation.
-    Restricting to the batch catches all three at the boundary.
+    strategy"), and topics carried over from earlier topic entries in the conversation.
+    Restricting to the entry's labels catches all three at the boundary.
 
     With no *allowed* set (an ad-hoc call outside a run) nothing is dropped.
     """
@@ -539,7 +522,7 @@ def store_result(
 
     Args:
         topic: topic label(s) this article belongs to — reuse a label from the topics
-            you were given for this batch; for an article spanning several of those
+            you were given for this topic group; for an article spanning several of those
             topics, a comma-separated list (e.g. "anthropic, claude code") is fine
         title: article headline
         url: article URL
@@ -547,10 +530,10 @@ def store_result(
         published_on: publication date in YYYY-MM-DD format if known, else omit
     """
     start = time.perf_counter()
-    # Validate against this batch's own topics, not the whole configured list: a run
-    # only ever shows the model two topics at a time, so a label from another batch is
-    # recalled from earlier in the conversation, not chosen from what was asked.
-    allowed = _BATCH_CONTEXT.get().get("topics")
+    # Validate against this entry's own labels, not the whole configured list: the model
+    # only ever sees one entry at a time, so any other label is invented or recalled,
+    # not chosen from what was asked.
+    allowed = _TOPIC_CONTEXT.get().get("topics")
     normalized, dropped = _normalize_topic(topic, allowed)
     if not normalized:
         # Nothing usable survived. Refuse the write and name the valid labels rather
@@ -565,7 +548,7 @@ def store_result(
         )
         valid = ", ".join(allowed or [])
         return (
-            f"Not stored: {topic!r} is not one of this batch's topics. "
+            f"Not stored: {topic!r} is not one of this topic group's labels. "
             f"Use one of: {valid}."
         )
     fetched_at = datetime.now(timezone.utc).isoformat()
@@ -689,8 +672,8 @@ def _handle_tool_error(e: Exception) -> str:
     _write_metric(
         {
             "type": "tool_error",
-            "run_id": _BATCH_CONTEXT.get().get("run_id"),
-            "batch_index": _BATCH_CONTEXT.get().get("batch_index"),
+            "run_id": _TOPIC_CONTEXT.get().get("run_id"),
+            "topic_index": _TOPIC_CONTEXT.get().get("topic_index"),
             "error": str(e),
             "error_type": type(e).__name__,
             "handled_by": "ToolNode",
@@ -738,7 +721,7 @@ def build_graph(run_id: str | None = None):
                 MODEL_NAME,
                 None,
                 time.perf_counter() - start,
-                batch_index=_BATCH_CONTEXT.get().get("batch_index"),
+                topic_index=_TOPIC_CONTEXT.get().get("topic_index"),
                 success=False,
                 error=str(e),
                 error_type=type(e).__name__,
@@ -746,7 +729,7 @@ def build_graph(run_id: str | None = None):
                 dump_path=_dump_failed_conversation(messages, tools),
                 **AGENT_MODEL_KWARGS,
             )
-            # Re-raise: run() still logs the search_batch failure, so the batch-level
+            # Re-raise: run() still logs the search_topic failure, so the topic-level
             # and call-level records stay reconcilable.
             raise
         _log_llm_call(
@@ -755,7 +738,7 @@ def build_graph(run_id: str | None = None):
             MODEL_NAME,
             response,
             time.perf_counter() - start,
-            batch_index=_BATCH_CONTEXT.get().get("batch_index"),
+            topic_index=_TOPIC_CONTEXT.get().get("topic_index"),
             tool_call_count=len(getattr(response, "tool_calls", None) or []),
             success=True,
             **AGENT_MODEL_KWARGS,
@@ -1043,24 +1026,27 @@ def run(topics: list[str]) -> tuple[int, str | None]:
     run_start = datetime.now(timezone.utc).isoformat()
     today = run_start[:10]
     app = build_graph(run_id=run_start)
-    # Search topics in small batches: each invoke gets a fresh recursion budget,
-    # and a failed batch is logged without abandoning the remaining topics.
-    for i in range(0, len(topics), BATCH_SIZE):
-        batch = topics[i : i + BATCH_SIZE]
-        topic_list = ", ".join(batch)
-        batch_start = time.perf_counter()
-        # Stamp every agent step and tool call in this batch with the batch it belongs
-        # to. A run spans ~64 batches; without this, a failed search_batch could not be
-        # traced back to the LLM calls and tool calls that produced it except by
-        # guessing from timestamp order.
-        _BATCH_CONTEXT.set(
-            {"run_id": run_start, "batch_index": i // BATCH_SIZE, "topics": batch}
+    # Search one topic entry per invoke: each gets a fresh recursion budget, and a
+    # failed search is logged without abandoning the remaining topics.
+    for i, topic_list in enumerate(topics):
+        search_start = time.perf_counter()
+        # Stamp every agent step and tool call with the topic entry it belongs to, so a
+        # failed search_topic can be traced back to the LLM calls and tool calls that
+        # produced it.
+        _TOPIC_CONTEXT.set(
+            {
+                "run_id": run_start,
+                "topic_index": i,
+                "topics": _split_labels([topic_list]),
+            }
         )
         try:
             app.invoke(
                 {
                     "messages": [
-                        HumanMessage(SEARCH_PROMPT.format(topic_list=topic_list))
+                        HumanMessage(
+                            SEARCH_PROMPT.format(topic_list=topic_list, today=today)
+                        )
                     ]
                 },
                 config={"recursion_limit": 50},
@@ -1068,9 +1054,9 @@ def run(topics: list[str]) -> tuple[int, str | None]:
         except Exception as e:
             _log_step(
                 run_start,
-                "search_batch",
-                time.perf_counter() - batch_start,
-                batch_index=i // BATCH_SIZE,
+                "search_topic",
+                time.perf_counter() - search_start,
+                topic_index=i,
                 topics=topic_list,
                 success=False,
                 error=str(e),
@@ -1082,15 +1068,15 @@ def run(topics: list[str]) -> tuple[int, str | None]:
             )
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             rprint(
-                f"[dim][{now}][/dim] [red]News research failed for batch "
+                f"[dim][{now}][/dim] [red]News research failed for "
                 f"{topic_list}: {e}[/red]"
             )
             continue
         _log_step(
             run_start,
-            "search_batch",
-            time.perf_counter() - batch_start,
-            batch_index=i // BATCH_SIZE,
+            "search_topic",
+            time.perf_counter() - search_start,
+            topic_index=i,
             topics=topic_list,
             success=True,
             model=MODEL_NAME,

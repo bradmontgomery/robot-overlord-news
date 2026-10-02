@@ -49,11 +49,11 @@ def records():
         # An oversized prompt that must land in the overflow bin.
         _llm(tokens=16000, total=16500),
         # Searches: one healthy, one failed, one with no `topics` key at all.
-        _step("search_batch", 30.0, topics="anthropic, openai", success=True),
-        _step("search_batch", 20.0, topics="anthropic, openai", success=False,
+        _step("search_topic", 30.0, topics="anthropic, openai", success=True),
+        _step("search_topic", 20.0, topics="anthropic, openai", success=False,
               error="XML syntax error on line 17 (status code: -1)"),
-        _step("search_batch", 12.0, topics="rag", success=True),
-        _step("search_batch", 9.0, success=True),
+        _step("search_topic", 12.0, topics="rag", success=True),
+        _step("search_topic", 9.0, success=True),
         _step("judge_articles", 18.0, articles_judged=10, articles_deleted=3),
         _step("summarize_day", 12.0, used_model="ministral-3:8b", success=True),
         _step("run", 700.0, topics=65, new_articles=22),
@@ -134,9 +134,9 @@ def test_token_bins_split_and_fold_the_overflow(records):
 def test_step_share_is_measured_against_total_run_wall_time(records):
     share = {r["step"]: r for r in mr.summarize(records)["step_share"]}
 
-    # search_batch totals 71s against 1500s of run wall time.
-    assert share["search_batch"]["total_s"] == pytest.approx(71.0)
-    assert share["search_batch"]["pct"] == pytest.approx(100 * 71 / 1500)
+    # search_topic totals 71s against 1500s of run wall time.
+    assert share["search_topic"]["total_s"] == pytest.approx(71.0)
+    assert share["search_topic"]["pct"] == pytest.approx(100 * 71 / 1500)
     assert share["summarize_day"]["total_s"] == pytest.approx(12.0)
 
 
@@ -153,9 +153,9 @@ def test_topic_rows_are_sorted_slowest_first_and_skip_untagged(records):
 def test_failures_count_only_explicit_false_not_missing_success():
     """`success` is absent on most records; `not r.get(...)` would over-count."""
     records = [
-        _step("search_batch", topics="a", success=False),
-        _step("search_batch", topics="a", success=True),
-        _step("search_batch", topics="a"),  # no `success` key — not a failure
+        _step("search_topic", topics="a", success=False),
+        _step("search_topic", topics="a", success=True),
+        _step("search_topic", topics="a"),  # no `success` key — not a failure
         _llm(),  # llm_calls have no `success` either
     ]
 
@@ -230,7 +230,7 @@ def test_render_html_is_self_contained_and_carries_the_headline(records):
 
 
 def test_render_html_escapes_topic_text():
-    records = [_step("search_batch", topics="<script>x</script>", success=True),
+    records = [_step("search_topic", topics="<script>x</script>", success=True),
                _step("run", 10.0, new_articles=1)]
 
     page = mr.render_html(mr.summarize(records))
@@ -247,7 +247,7 @@ def test_render_html_omits_the_ceiling_note_when_nothing_truncates():
     assert "stopped at exactly" not in page
 
 
-def test_render_html_survives_a_run_with_no_topic_batches():
+def test_render_html_survives_a_run_with_no_topic_searches():
     records = [_llm(), _step("run", 10.0, new_articles=1)]
 
     assert "<svg" in mr.render_html(mr.summarize(records))
@@ -452,7 +452,7 @@ def _tool(tool="duckduckgo_results_json", elapsed=1.5, **extra):
     return {
         "type": "tool_call",
         "run_id": "2026-07-28T03:29:53+00:00",
-        "batch_index": 0,
+        "topic_index": 0,
         "tool": tool,
         "elapsed_s": elapsed,
         **extra,
@@ -488,10 +488,10 @@ def test_tool_error_rate_has_a_denominator():
     assert k["tool_error_pct"] == pytest.approx(10.0)
 
 
-def test_batch_failures_exclude_tool_and_llm_failures():
-    """The KPI counts batches; counting every `success: false` would triple-count."""
+def test_topic_failures_exclude_tool_and_llm_failures():
+    """The KPI counts topic searches; counting every `success: false` would triple-count."""
     records = [
-        _step("search_batch", topics="a", success=False, error_type="ResponseError"),
+        _step("search_topic", topics="a", success=False, error_type="ResponseError"),
         _llm(success=False, error_type="ResponseError"),
         _tool(success=False, error="boom", error_type="DDGSException"),
     ]
@@ -501,9 +501,9 @@ def test_batch_failures_exclude_tool_and_llm_failures():
 
 def test_error_classes_prefer_error_type():
     records = [
-        _step("search_batch", topics="a", success=False, error_type="ResponseError"),
-        _step("search_batch", topics="a", success=False, error_type="ResponseError"),
-        _step("search_batch", topics="a", success=False,
+        _step("search_topic", topics="a", success=False, error_type="ResponseError"),
+        _step("search_topic", topics="a", success=False, error_type="ResponseError"),
+        _step("search_topic", topics="a", success=False,
               error_type="GraphRecursionError"),
     ]
 
@@ -516,9 +516,9 @@ def test_error_classes_prefer_error_type():
 def test_error_classes_collapse_line_numbers_for_legacy_records():
     """Records predating error_type would otherwise scatter into one-off rows."""
     records = [
-        _step("search_batch", topics="a", success=False,
+        _step("search_topic", topics="a", success=False,
               error="XML syntax error on line 17: element <function> closed"),
-        _step("search_batch", topics="a", success=False,
+        _step("search_topic", topics="a", success=False,
               error="XML syntax error on line 16: element <function> closed"),
     ]
 
@@ -529,7 +529,7 @@ def test_error_classes_collapse_line_numbers_for_legacy_records():
 
 
 def test_error_classes_tolerate_a_failure_with_no_message():
-    records = [_step("search_batch", topics="a", success=False)]
+    records = [_step("search_topic", topics="a", success=False)]
 
     assert mr.summarize(records)["error_classes"] == [("unknown", 1)]
 
@@ -564,8 +564,8 @@ def test_config_label_names_every_logged_sampling_param():
 def test_render_derives_the_failure_caption_from_the_records():
     """The old caption asserted one cause directly above a list contradicting it."""
     records = [
-        _step("search_batch", topics="a", success=False, error_type="ResponseError"),
-        _step("search_batch", topics="a", success=False,
+        _step("search_topic", topics="a", success=False, error_type="ResponseError"),
+        _step("search_topic", topics="a", success=False,
               error_type="GraphRecursionError"),
         _step("run", new_articles=1),
         _tool(success=True, result_count=2),
@@ -576,7 +576,7 @@ def test_render_derives_the_failure_caption_from_the_records():
     assert "Every failure is the same failure" not in page
     assert "are not" in page
     assert "What the tools actually did" in page
-    assert "failed batches" in page
+    assert "failed topics" in page
 
 
 # ---------------------------------------------------------------------------

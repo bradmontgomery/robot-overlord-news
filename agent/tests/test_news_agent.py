@@ -14,11 +14,11 @@ def _isolate_metrics_path(tmp_path, monkeypatch):
 
     monkeypatch.setattr(news_agent, "METRICS_PATH", str(tmp_path / "metrics.jsonl"))
     monkeypatch.setattr(news_agent, "FAILURE_DIR", str(tmp_path / "failures"))
-    # The batch context is a ContextVar shared across the whole process; without this
+    # The topic context is a ContextVar shared across the whole process; without this
     # a run() test leaks its run_id into every test that follows.
-    token = news_agent._BATCH_CONTEXT.set({})
+    token = news_agent._TOPIC_CONTEXT.set({})
     yield
-    news_agent._BATCH_CONTEXT.reset(token)
+    news_agent._TOPIC_CONTEXT.reset(token)
 
 
 def _read_metrics(path) -> list[dict]:
@@ -617,8 +617,8 @@ def test_run_returns_count_of_new_articles(tmp_path):
     assert count == 1
 
 
-def test_run_batches_topics(tmp_path):
-    """Topics are searched in BATCH_SIZE-sized invokes, never one giant query."""
+def test_run_searches_one_topic_entry_per_invoke(tmp_path):
+    """Each topic entry gets its own invoke; entries are never combined."""
     from news import agent as news_agent
 
     db_file = str(tmp_path / "batch.db")
@@ -627,24 +627,22 @@ def test_run_batches_topics(tmp_path):
     topics = [f"topic{i}" for i in range(20)]
 
     with patch.object(news_agent, "DB_PATH", db_file), \
-         patch.object(news_agent, "BATCH_SIZE", 8), \
          patch("news.agent.build_graph", return_value=mock_app), \
          patch("news.agent.judge_articles") as mock_judge, \
          patch("news.agent.summarize_day") as mock_summarize:
         news_agent.run(topics)
 
-    # 20 topics / 8 per batch -> 3 invokes (8 + 8 + 4)
-    assert mock_app.invoke.call_count == 3
+    assert mock_app.invoke.call_count == 20
     first_prompt = mock_app.invoke.call_args_list[0].args[0]["messages"][0].content
-    assert "topic7" in first_prompt  # first batch
-    assert "topic8" not in first_prompt  # second batch not included in one query
+    assert "topic0" in first_prompt
+    assert "topic1" not in first_prompt  # other entries are not in the same prompt
     # judge + summarize still run once over the whole topic set
     mock_judge.assert_called_once()
     assert mock_judge.call_args[0][0] == topics
     mock_summarize.assert_called_once()
 
 
-def test_run_logs_run_and_search_batch_metrics(tmp_path):
+def test_run_logs_run_and_search_topic_metrics(tmp_path):
     from news import agent as news_agent
 
     db_file = str(tmp_path / "metrics_run.db")
@@ -653,7 +651,6 @@ def test_run_logs_run_and_search_batch_metrics(tmp_path):
     topics = [f"topic{i}" for i in range(20)]
 
     with patch.object(news_agent, "DB_PATH", db_file), \
-         patch.object(news_agent, "BATCH_SIZE", 8), \
          patch("news.agent.build_graph", return_value=mock_app), \
          patch("news.agent.judge_articles"), \
          patch("news.agent.summarize_day"):
@@ -664,13 +661,14 @@ def test_run_logs_run_and_search_batch_metrics(tmp_path):
     assert len(run_records) == 1
     assert run_records[0]["topics"] == 20
 
-    search_records = [r for r in records if r["type"] == "step" and r["step"] == "search_batch"]
-    assert len(search_records) == 3
+    search_records = [r for r in records if r["type"] == "step" and r["step"] == "search_topic"]
+    assert len(search_records) == 20
+    assert [r["topic_index"] for r in search_records] == list(range(20))
     assert all(r["success"] for r in search_records)
     assert {r["run_id"] for r in run_records + search_records} == {run_records[0]["run_id"]}
 
 
-def test_run_logs_failed_search_batch_metrics(tmp_path):
+def test_run_logs_failed_search_topic_metrics(tmp_path):
     from news import agent as news_agent
 
     db_file = str(tmp_path / "metrics_run_fail.db")
@@ -684,30 +682,29 @@ def test_run_logs_failed_search_batch_metrics(tmp_path):
         news_agent.run(["topic1"])
 
     records = _read_metrics(news_agent.METRICS_PATH)
-    search_records = [r for r in records if r["type"] == "step" and r["step"] == "search_batch"]
+    search_records = [r for r in records if r["type"] == "step" and r["step"] == "search_topic"]
     assert len(search_records) == 1
     assert search_records[0]["success"] is False
     assert "boom" in search_records[0]["error"]
 
 
-def test_run_continues_after_batch_failure(tmp_path):
-    """A failed batch is logged but the remaining batches still run."""
+def test_run_continues_after_search_failure(tmp_path):
+    """A failed search is logged but the remaining topics still run."""
     from news import agent as news_agent
 
     db_file = str(tmp_path / "batch_fail.db")
     mock_app = MagicMock()
     mock_app.invoke.side_effect = [RuntimeError("boom"), {}, {}]
-    topics = [f"topic{i}" for i in range(20)]
+    topics = [f"topic{i}" for i in range(3)]
 
     with patch.object(news_agent, "DB_PATH", db_file), \
-         patch.object(news_agent, "BATCH_SIZE", 8), \
          patch("news.agent.build_graph", return_value=mock_app), \
          patch("news.agent.judge_articles"), \
          patch("news.agent.summarize_day"), \
          patch("news.agent.rprint") as mock_print:
         count, _ = news_agent.run(topics)
 
-    assert mock_app.invoke.call_count == 3  # all batches attempted despite failure
+    assert mock_app.invoke.call_count == 3  # all topics attempted despite failure
     assert count == 0
     assert any("boom" in str(c.args[0]) for c in mock_print.call_args_list)
 
@@ -1718,7 +1715,7 @@ def test_agent_step_failure_dumps_a_replayable_conversation():
 
 
 def test_failure_dumps_are_pruned_to_the_newest_few(monkeypatch):
-    """~12% of batches fail, so the dump directory needs a ceiling."""
+    """~12% of topic searches fail, so the dump directory needs a ceiling."""
     from news import agent as news_agent
 
     monkeypatch.setattr(news_agent, "FAILURE_KEEP", 2)
@@ -1776,8 +1773,8 @@ def test_store_result_logs_stored_and_duplicate_outcomes(tmp_path):
     assert calls[0]["topic"] == "anthropic"
 
 
-def test_batch_context_stamps_agent_steps(monkeypatch):
-    """A run spans ~64 batches; without batch_index a failure cannot be traced back."""
+def test_topic_context_stamps_agent_steps(monkeypatch):
+    """A run spans ~50 topic searches; without topic_index a failure cannot be traced back."""
     from news import agent as news_agent
 
     response = AIMessage(content="done", usage_metadata={
@@ -1787,20 +1784,20 @@ def test_batch_context_stamps_agent_steps(monkeypatch):
     mock_model = MagicMock()
     mock_model.bind_tools.return_value = mock_bound
 
-    news_agent._BATCH_CONTEXT.set({"run_id": "run-ctx", "batch_index": 7})
+    news_agent._TOPIC_CONTEXT.set({"run_id": "run-ctx", "topic_index": 7})
     try:
         with patch("news.agent.ChatOllama", return_value=mock_model):
             graph = news_agent.build_graph(run_id="run-ctx")
             graph.invoke({"messages": [HumanMessage(content="hi")]})
     finally:
-        news_agent._BATCH_CONTEXT.set({})
+        news_agent._TOPIC_CONTEXT.set({})
 
     steps = [
         r
         for r in _read_metrics(news_agent.METRICS_PATH)
         if r.get("step") == "agent_step"
     ]
-    assert steps[-1]["batch_index"] == 7
+    assert steps[-1]["topic_index"] == 7
     assert steps[-1]["success"] is True
 
 
@@ -1896,11 +1893,20 @@ def test_normalize_topic_deduplicates_after_resolving():
     assert normalized == "z.ai"
 
 
-def test_normalize_topic_is_permissive_without_a_batch():
+def test_normalize_topic_is_permissive_without_an_entry():
     """An ad-hoc call outside a run has no allowed set and must not drop anything."""
     from news.agent import _normalize_topic
 
     assert _normalize_topic("Anything Goes, Here") == ("anything goes, here", [])
+
+
+def test_split_labels_flattens_groups_lowercased_and_deduplicated():
+    """Each comma-separated label in a group is its own topic, always lowercase."""
+    from news.agent import _split_labels
+
+    groups = ["anthropic, Claude Code, ", "ai safety, METR", "claude code"]
+
+    assert _split_labels(groups) == ["anthropic", "claude code", "ai safety", "metr"]
 
 
 def _store(news_agent, db_file, topic, url="http://a.com"):
@@ -1910,14 +1916,14 @@ def _store(news_agent, db_file, topic, url="http://a.com"):
         )
 
 
-def test_store_result_rejects_a_topic_outside_the_batch(tmp_path):
-    """A label from another batch is recalled from the conversation, not chosen."""
+def test_store_result_rejects_a_label_outside_the_topic_entry(tmp_path):
+    """A label from another topic entry is recalled from the conversation, not chosen."""
     from news import agent as news_agent
 
     db_file = str(tmp_path / "topics.db")
     news_agent.init_db(db_file)
-    news_agent._BATCH_CONTEXT.set(
-        {"run_id": "r", "batch_index": 0, "topics": ["anthropic", "openai"]}
+    news_agent._TOPIC_CONTEXT.set(
+        {"run_id": "r", "topic_index": 0, "topics": ["anthropic", "openai"]}
     )
 
     reply = _store(news_agent, db_file, "ollama, local llm")
@@ -1940,8 +1946,8 @@ def test_store_result_keeps_valid_labels_and_records_the_dropped_one(tmp_path):
 
     db_file = str(tmp_path / "topics.db")
     news_agent.init_db(db_file)
-    news_agent._BATCH_CONTEXT.set(
-        {"run_id": "r", "batch_index": 0, "topics": ["anthropic", "claude code"]}
+    news_agent._TOPIC_CONTEXT.set(
+        {"run_id": "r", "topic_index": 0, "topics": ["anthropic", "claude code"]}
     )
 
     reply = _store(news_agent, db_file, "Anthropic, ai industry strategy")
@@ -1959,26 +1965,26 @@ def test_store_result_keeps_valid_labels_and_records_the_dropped_one(tmp_path):
     assert calls[-1]["dropped"] == ["ai industry strategy"]
 
 
-def test_store_result_resolves_a_spelling_variant_to_the_batch_topic(tmp_path):
+def test_store_result_resolves_a_spelling_variant_to_the_entry_label(tmp_path):
     from news import agent as news_agent
 
     db_file = str(tmp_path / "topics.db")
     news_agent.init_db(db_file)
-    news_agent._BATCH_CONTEXT.set({"run_id": "r", "batch_index": 0, "topics": ["z.ai"]})
+    news_agent._TOPIC_CONTEXT.set({"run_id": "r", "topic_index": 0, "topics": ["z.ai"]})
 
     assert _store(news_agent, db_file, "zai").startswith("Stored")
     with sqlite3.connect(db_file) as conn:
         assert conn.execute("SELECT topic FROM news_results").fetchone()[0] == "z.ai"
 
 
-def test_run_puts_the_batch_topics_in_the_context(tmp_path):
+def test_run_puts_the_entry_labels_in_the_context(tmp_path):
     """store_result can only validate if run() tells it what was asked for."""
     from news import agent as news_agent
 
-    seen = {}
+    seen = []
 
     def _capture(*a, **k):
-        seen.update(news_agent._BATCH_CONTEXT.get())
+        seen.append(news_agent._TOPIC_CONTEXT.get()["topics"])
         return {"messages": []}
 
     mock_app = MagicMock()
@@ -1987,9 +1993,9 @@ def test_run_puts_the_batch_topics_in_the_context(tmp_path):
          patch.object(news_agent, "build_graph", return_value=mock_app), \
          patch.object(news_agent, "judge_articles", return_value=0), \
          patch.object(news_agent, "summarize_day", return_value=None):
-        news_agent.run(["anthropic", "openai"])
+        news_agent.run(["anthropic, Claude Code", "openai"])
 
-    assert seen["topics"] == ["anthropic", "openai"]
+    assert seen == [["anthropic", "claude code"], ["openai"]]
 
 
 # ---------------------------------------------------------------------------

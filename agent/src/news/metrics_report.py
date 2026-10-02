@@ -11,7 +11,7 @@ Layout:
   KPI row       runs, wall time, where the time goes, truncation, failures, yield
   Comparison    before/after table, when runs span more than one agent config
   Chart 1       input tokens vs truncation, one panel per config, shared scale
-  Chart 2       per-topic-batch cost, with an aligned failure-count panel
+  Chart 2       per-topic cost, with an aligned failure-count panel
   Chart 3       cost vs yield across runs (two panels, one shared x axis)
 
 Runs are grouped into cohorts by the `num_ctx` logged on their agent steps, so a
@@ -47,7 +47,7 @@ BIN_WIDTH = 500
 BIN_CAP = 5000
 
 # Steps that spend wall-clock time, in pipeline order, for the time-share tile.
-PIPELINE_STEPS = ("search_batch", "judge_articles", "summarize_day")
+PIPELINE_STEPS = ("search_topic", "judge_articles", "summarize_day")
 
 # Buckets in the sequential ramp used for per-topic cost (--ramp-1 … --ramp-N).
 RAMP_STEPS = 4
@@ -82,7 +82,7 @@ def _llm_calls(records: list[dict], step: str | None = None) -> list[dict]:
     """LLM-call records, optionally narrowed to one step.
 
     `type` and `step` must both be checked: an llm_call/agent_step record and a
-    step/search_batch record are different shapes that share the `step` key.
+    step/search_topic record are different shapes that share the `step` key.
     """
     return [
         r
@@ -143,10 +143,10 @@ def _truncation_by_step(records: list[dict]) -> list[dict]:
 
 
 def _topic_rows(records: list[dict]) -> list[dict]:
-    """Per-topic-batch median duration and failure count, slowest first."""
+    """Per-topic median duration and failure count, slowest first."""
     durations = defaultdict(list)
     failures: Counter = Counter()
-    for r in _steps(records, "search_batch"):
+    for r in _steps(records, "search_topic"):
         topics = r.get("topics")
         if not topics:
             continue
@@ -325,10 +325,10 @@ def _tool_rows(records: list[dict]) -> list[dict]:
 
 
 def _dropped_labels(records: list[dict]) -> dict:
-    """How often store_result was handed a label that was not one of its batch topics.
+    """How often store_result was handed a label that was not one of its topic entry's labels.
 
     The agent invents topic labels — spelling variants, phrases lifted out of the
-    prompt's own wording, and topics recalled from earlier batches. store_result now
+    prompt's own wording, and topics recalled from earlier topic entries. store_result now
     resolves or discards them, which fixes the data but would hide the behaviour if
     the discards were not counted. Surfacing the rate keeps a silent repair visible.
     """
@@ -407,7 +407,7 @@ def summarize(records: list[dict]) -> dict:
     deleted = sum(r.get("articles_deleted") or 0 for r in _steps(records, "judge_articles"))
     # Batch-level failures: the model's tool-call syntax was rejected before any tool
     # ran. Distinct from tool_call failures, where a tool ran and raised.
-    failures = [r for r in _steps(records, "search_batch") if r.get("success") is False]
+    failures = [r for r in _steps(records, "search_topic") if r.get("success") is False]
     tool_rows = _tool_rows(records)
     dropped = _dropped_labels(records)
     cohorts = _cohorts(records)
@@ -556,8 +556,8 @@ def svg_topic_chart(rows: list[dict]) -> str:
     f_max = max((r["failures"] for r in rows), default=1) or 1
 
     parts = [f'<svg viewBox="0 0 {w} {h}" role="img" class="chart">']
-    parts.append("<title>Median seconds per topic batch, slowest first, with "
-                 "failed searches per batch alongside</title>")
+    parts.append("<title>Median seconds per topic, slowest first, with "
+                 "failed searches per topic alongside</title>")
     parts.append(f'<text class="panel-head" x="{label_w}" y="18">median seconds per search</text>')
     parts.append(f'<text class="panel-head" x="{fail_x}" y="18">failed runs</text>')
 
@@ -817,10 +817,10 @@ def render_html(summary: dict) -> str:
              f'agent steps truncated — {k["current_label"]}, {k["current_runs"]} '
              f'{"run" if k["current_runs"] == 1 else "runs"}',
              alert=k["current_trunc_pct"] > 1),
-        # "failed batches", not "failed searches": these count batches the model's
-        # tool-call syntax killed before any search ran. Mislabelling them as searches
-        # is what seeded the conclusion that the search backend was at fault.
-        _kpi(str(k["failures"]), "failed batches", alert=bool(k["failures"])),
+        # "failed topics", not "failed searches": these count topic runs the model's
+        # tool-call syntax killed, often before any search ran. Mislabelling them as
+        # searches is what seeded the conclusion that the search backend was at fault.
+        _kpi(str(k["failures"]), "failed topics", alert=bool(k["failures"])),
         _kpi(
             f'{k["tool_error_pct"]:.1f}%',
             f'tool calls failed — {k["tool_calls"]:,} calls',
@@ -894,7 +894,7 @@ def render_html(summary: dict) -> str:
         top_label, top_count = classes[0]
         rest = sum(c for _, c in classes[1:])
         failure_caption = (
-            f'{top_count:,} of {k["failures"]:,} batch failures are '
+            f'{top_count:,} of {k["failures"]:,} topic failures are '
             f'<code>{_esc(top_label)}</code>'
             + (
                 f', and {rest:,} are not — across {len(classes) - 1} other '
@@ -905,7 +905,7 @@ def render_html(summary: dict) -> str:
             )
         )
     else:
-        failure_caption = "No batch failures recorded."
+        failure_caption = "No topic failures recorded."
 
     dropped = summary["dropped_labels"]
     dropped_figure = ""
@@ -914,7 +914,7 @@ def render_html(summary: dict) -> str:
             dropped_caption = (
                 f'{dropped["with_dropped"]:,} of {dropped["calls"]:,} store_result '
                 f'calls ({dropped["with_dropped_pct"]:.1f}%) named a label that was not '
-                f'one of the batch\'s topics — {dropped["mentions"]:,} mentions across '
+                f'one of the entry\'s labels — {dropped["mentions"]:,} mentions across '
                 f'{dropped["distinct"]} distinct labels. '
                 f'{dropped["rejected"]:,} calls ({dropped["rejected_pct"]:.1f}%) had no '
                 f'valid label left and stored nothing.'
@@ -922,7 +922,7 @@ def render_html(summary: dict) -> str:
         else:
             dropped_caption = (
                 f'None of the {dropped["calls"]:,} validated store_result calls named '
-                f'a label outside its batch. Counted rather than assumed — the agent '
+                f'a label outside its topic entry. Counted rather than assumed — the agent '
                 f'used to invent labels, and a silent repair would look identical.'
             )
         if dropped["unvalidated"]:
@@ -941,7 +941,7 @@ def render_html(summary: dict) -> str:
   <figcaption>
     <div class="t">Labels the agent invented</div>
     <div class="d">{dropped_caption} <code>store_result</code> resolves spelling
-      variants back onto the batch\'s topics and discards the rest, so these never
+      variants back onto the entry\'s labels and discards the rest, so these never
       reach the database — but the discard is counted here, because a repair that
       leaves no trace looks exactly like a model that never misbehaved.</div>
   </figcaption>
@@ -992,7 +992,7 @@ def render_html(summary: dict) -> str:
 <style>{STYLE}</style></head>
 <body><div class="wrap">
 <h1>News agent metrics</h1>
-<p class="sub">{k["runs"]} runs · {k["llm_calls"]:,} LLM calls · {len(topics)} topic batches
+<p class="sub">{k["runs"]} runs · {k["llm_calls"]:,} LLM calls · {len(topics)} topics
 · {k["judged"]} articles judged, {k["deleted"]} pruned</p>
 
 <div class="kpis">{kpis}</div>
@@ -1021,13 +1021,13 @@ def render_html(summary: dict) -> str:
 <figure>
   <figcaption>
     <div class="t">Search is where the time goes</div>
-    <div class="d">Median seconds per topic batch, slowest first —
+    <div class="d">Median seconds per topic, slowest first —
       {k["search_share_pct"]:.1f}% of all wall time is spent here.
-      {summary["topics_with_failures"]} of {len(topics)} batches failed at least once.</div>
+      {summary["topics_with_failures"]} of {len(topics)} topics failed at least once.</div>
   </figcaption>
   <div class="scroll">{svg_topic_chart(topics)}</div>
   {_details("Show data table", _table(
-      ["topic batch", "median s", "runs", "failures"],
+      ["topic", "median s", "runs", "failures"],
       [[r["topic"], f'{r["median_s"]:.1f}', r["runs"], r["failures"]] for r in topics],
       {1, 2, 3}))}
 </figure>
@@ -1051,7 +1051,7 @@ def render_html(summary: dict) -> str:
 
 <figure>
   <figcaption>
-    <div class="t">How the batches failed</div>
+    <div class="t">How the topic searches failed</div>
     <div class="d">{failure_caption}</div>
   </figcaption>
   <ul class="legend" style="display:block">{err_rows}</ul>
