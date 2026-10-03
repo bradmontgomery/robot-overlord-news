@@ -88,6 +88,10 @@ SUMMARY_MODEL_KWARGS = {
 # status code), so the inputs are the only recoverable evidence — dumping them is what
 # makes a failure replayable. Kept out of the metrics file because a failing prompt runs
 # to ~4k tokens; the JSONL records only the path.
+# Hard cap on search calls per topic group. A narrow topic whose articles are all already
+# stored makes the model reword the query and search again, forever; only the recursion
+# limit stopped it (~100 s wasted, GraphRecursionError). The prompt asks for fewer.
+MAX_SEARCHES_PER_TOPIC = 3
 FAILURE_DIR = os.getenv("NEWS_FAILURE_DIR", "news_failures")
 FAILURE_KEEP = int(os.getenv("NEWS_FAILURE_KEEP", "50"))
 DEFAULT_TOPICS = (
@@ -179,6 +183,8 @@ Rules for the `topic` field — keep topics tight so they stay easy to group:
   labels (from the same group or different ones), set topic to a comma-separated list of those
   labels (e.g. "anthropic, claude code"). Otherwise use the single matching label.
 
+Search at most 2-3 times. If a search only returns articles you already stored, or
+store_result reports them as duplicates, stop: do NOT reword the query and search again.
 After you have searched and stored results for the group, stop.
 """
 
@@ -585,7 +591,7 @@ def store_result(
     )
     if stored:
         return f"Stored: {title}"
-    return f"Skipped (duplicate URL): {title}"
+    return f"Skipped (duplicate URL, already stored): {title}"
 
 
 def _instrument_tool(underlying):
@@ -673,11 +679,19 @@ def _handle_tool_error(e: Exception) -> str:
 
 
 def should_continue(state: MessagesState) -> Literal["tools", "__end__"]:
-    """Route to tools if the last message has tool calls, otherwise end."""
-    last = state["messages"][-1]
-    if getattr(last, "tool_calls", None):
-        return "tools"
-    return END
+    """Route to tools if the last message has tool calls, otherwise end.
+
+    Also ends once the model has asked for more than MAX_SEARCHES_PER_TOPIC searches.
+    """
+    messages = state["messages"]
+    if not getattr(messages[-1], "tool_calls", None):
+        return END
+    searches = sum(
+        call["name"] != "store_result"
+        for m in messages
+        for call in getattr(m, "tool_calls", None) or []
+    )
+    return END if searches > MAX_SEARCHES_PER_TOPIC else "tools"
 
 
 def build_graph(run_id: str | None = None):

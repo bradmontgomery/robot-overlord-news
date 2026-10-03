@@ -503,6 +503,33 @@ def test_should_continue_empty_tool_calls():
     assert result == END
 
 
+def _search_call(i):
+    return {"name": "duckduckgo_results_json", "args": {}, "id": str(i), "type": "tool_call"}
+
+
+def test_should_continue_allows_searches_up_to_cap():
+    from news.agent import MAX_SEARCHES_PER_TOPIC, should_continue
+
+    msgs = [AIMessage(content="", tool_calls=[_search_call(i)]) for i in range(MAX_SEARCHES_PER_TOPIC)]
+    assert should_continue({"messages": msgs}) == "tools"
+
+
+def test_should_continue_ends_when_search_cap_exceeded():
+    from langgraph.graph import END
+    from news.agent import MAX_SEARCHES_PER_TOPIC, should_continue
+
+    msgs = [AIMessage(content="", tool_calls=[_search_call(i)]) for i in range(MAX_SEARCHES_PER_TOPIC + 1)]
+    assert should_continue({"messages": msgs}) == END
+
+
+def test_should_continue_store_calls_do_not_count_toward_cap():
+    from news.agent import MAX_SEARCHES_PER_TOPIC, should_continue
+
+    store = {"name": "store_result", "args": {}, "id": "s", "type": "tool_call"}
+    msgs = [AIMessage(content="", tool_calls=[store]) for _ in range(MAX_SEARCHES_PER_TOPIC + 5)]
+    assert should_continue({"messages": msgs}) == "tools"
+
+
 # ---------------------------------------------------------------------------
 # build_graph
 # ---------------------------------------------------------------------------

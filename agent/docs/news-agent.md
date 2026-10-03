@@ -18,7 +18,7 @@ once per article. Results are written to a local SQLite database (`news_results.
   data (not a single string blob), making it easier for the model to call `store_result` once
   per item.
 - Today's date is injected into the system prompt so the model can reason about recency.
-- `recursion_limit=50` guards against infinite tool-call loops.
+- `MAX_SEARCHES_PER_TOPIC` (3) ends a topic's loop in `should_continue` once the model asks for more searches; `recursion_limit=50` is the last-resort backstop against infinite tool-call loops.
 - Each `DEFAULT_TOPICS` entry (a comma-separated group of related labels) is searched in its
   own independent run. With `qwen3.5:latest`, a run covering more than ~3 topics fills the
   context with search results and the model stops calling `store_result`; large combined
