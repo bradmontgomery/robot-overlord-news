@@ -4,12 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Robot Overlord News{{ if .FilterTopic }} — {{ .FilterTopic }}{{ else if .FilterDate }} — {{ formatDate .FilterDate }}{{ end }}{{ if .FilterQuery }} — search: {{ .FilterQuery }}{{ end }}</title>
-  <script>
-    (function () {
-      var t = localStorage.getItem("robotOverlordTheme");
-      if (t === "light") document.documentElement.setAttribute("data-theme", "light");
-    })();
-  </script>
+  <script src="/static/theme-init.js"></script>
   <link rel="alternate" type="application/rss+xml" title="Robot Overlord News" href="/rss">
   <link rel="stylesheet" href="/static/style.css">
 </head>

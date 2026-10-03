@@ -111,6 +111,9 @@ triggers the CI/CD pipeline defined in `.github/workflows/deploy.yml`, which:
 3. Rsyncs the binary to `/opt/news/` on the EC2 instance
 4. Restarts the `news` systemd service
 
+Security headers (CSP, HSTS, etc.) are set in Go (`securityHeaders` in `main.go`), so they ship with
+the binary and need no nginx change.
+
 ### Required GitHub Secrets
 
 Add these under **Settings → Secrets and variables → Actions** in the GitHub repo:

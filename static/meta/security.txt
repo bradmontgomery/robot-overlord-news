@@ -1,0 +1,4 @@
+Contact: https://github.com/bradmontgomery/robot-overlord-news/security/advisories/new
+Expires: 2027-09-30T00:00:00.000Z
+Preferred-Languages: en
+Canonical: https://robot-overlord.news/.well-known/security.txt
