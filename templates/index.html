@@ -36,8 +36,9 @@
       <span class="fetched-at" title="Article fetched on {{ formatTime .FetchedAt }}">{{ formatTime .FetchedAt }}</span>
     </div>
     <h3>
-      {{ if .URL }}
-      <a href="{{ .URL }}" target="_blank" rel="noopener noreferrer">{{ if .Title }}{{ .Title }}{{ else }}(no title){{ end }}</a>
+      {{ $a := . }}
+      {{ with safeURL .URL }}
+      <a href="{{ . }}" target="_blank" rel="noopener noreferrer">{{ if $a.Title }}{{ $a.Title }}{{ else }}(no title){{ end }}</a>
       {{ else }}
       <span>{{ if .Title }}{{ .Title }}{{ else }}(no title){{ end }}</span>
       {{ end }}

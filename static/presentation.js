@@ -150,8 +150,9 @@
 
     var a = articles[index];
     titleEl.textContent = a.Title || "(no title)";
-    if (a.URL) {
-      titleEl.href = a.URL;
+    var href = window.RobotOverlordFavorites.safeURL(a.URL);
+    if (href) {
+      titleEl.href = href;
     } else {
       titleEl.removeAttribute("href");
     }
