@@ -29,6 +29,17 @@
     }
   }
 
+  // Returns a normalized http(s) URL, or "" for anything else (javascript:,
+  // data:, relative, malformed). Callers render a plain-text title on "".
+  function safeURL(rawURL) {
+    try {
+      var u = new URL(rawURL);
+      return u.protocol === "http:" || u.protocol === "https:" ? u.href : "";
+    } catch (e) {
+      return "";
+    }
+  }
+
   function formatDate(s) {
     if (!s) return "";
     var d = new Date(s);
@@ -134,6 +145,7 @@
       .join("");
 
     var dom = domain(article.URL || "");
+    var href = safeURL(article.URL);
     var fetched = formatDate(article.FetchedAt);
     var published = article.PublishedOn ? formatDate(article.PublishedOn) : "";
 
@@ -146,8 +158,8 @@
       (fetched ? '<span class="fetched-at" title="Article fetched on ' + escapeHTML(fetched) + '">' + escapeHTML(fetched) + "</span>" : "") +
       "</div>" +
       "<h3>" +
-      (article.URL
-        ? '<a href="' + escapeAttr(article.URL) + '" target="_blank" rel="noopener noreferrer">' + escapeHTML(article.Title || "(no title)") + "</a>"
+      (href
+        ? '<a href="' + escapeAttr(href) + '" target="_blank" rel="noopener noreferrer">' + escapeHTML(article.Title || "(no title)") + "</a>"
         : escapeHTML(article.Title || "(no title)")) +
       "</h3>" +
       (dom ? '<span class="article-domain">' + escapeHTML(dom) + "</span>" : "") +
@@ -207,6 +219,7 @@
   }
 
   window.RobotOverlordFavorites = {
+    safeURL: safeURL,
     isFavorite: function (url) {
       return !!favorites[url];
     },

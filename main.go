@@ -512,6 +512,9 @@ func handleRSS(w http.ResponseWriter, r *http.Request) {
 
 	items := make([]rssItem, 0, len(articles))
 	for _, a := range articles {
+		if safeHTTPURL(a.URL) == "" {
+			continue
+		}
 		desc := a.Summary
 		if a.PublishedOn != "" {
 			// Original publication date belongs in the body, not pubDate --
@@ -702,6 +705,15 @@ func fqdn(rawURL string) string {
 		return ""
 	}
 	return strings.TrimPrefix(u.Hostname(), "www.")
+}
+
+// safeHTTPURL returns rawURL if it is an absolute http(s) URL, else "".
+func safeHTTPURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return ""
+	}
+	return rawURL
 }
 
 // lastNDates returns the last n calendar dates (today first, oldest last)
