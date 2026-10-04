@@ -30,6 +30,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from rich import print as rprint
 from rich.markdown import Markdown
+from typesafe_sdk import Noul, TypeSafeClient
 
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen3.5:latest")
 SUMMARY_MODEL_NAME = os.getenv("SUMMARY_MODEL", "ministral-3:8b")
@@ -49,23 +50,12 @@ AGENT_NUM_CTX = int(os.getenv("NEWS_NUM_CTX", "16384"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 DB_PATH = os.getenv("NEWS_DB_PATH", "news_results.db")
 METRICS_PATH = os.getenv("NEWS_METRICS_PATH", "news_metrics.jsonl")
-# Topics are searched in small batches. A single huge query crashes the news
-# backend ("Could not extract vqd"); just as important, once a batch fills the
-# context with many search results the local model stops following through on
-# the store_result step (empirically reliable at 2-3 topics, drops to zero
-# storing at 4+). Keep this small so every topic's articles actually get stored.
-BATCH_SIZE = 2
-# Articles judged per LLM call in judge_articles(). 10 articles' title+summary is
-# ~500-700 tokens, comfortably inside the model's default 4096-token context; cuts
-# judge_articles' call count ~10x versus one call per article.
-JUDGE_BATCH_SIZE = 10
-# Hard cap on judge output. The judge is not context-starved — its prompts peak at
-# ~1.2k tokens, well inside the 4096 default — but its output is bimodal: 41 tokens
-# for a normal verdict, or a runaway that burns every remaining token and stops at
-# the limit with empty .content, which fails open and keeps every article (see the
-# reasoning=False note in judge_articles). A bigger window would only let a runaway
-# burn more; capping it ends one in ~256 tokens instead of ~3000.
-JUDGE_NUM_PREDICT = 256
+# Relevance judge: a Noul decision model served by Ollama at /v1/systemone (see
+# judge_articles). TYPESAFE_BASE_URL / TYPESAFE_API_KEY are read by the SDK itself.
+JUDGE_MODEL = os.getenv("TYPESAFE_DEFAULT_MODEL", "nimble:latest")
+# A Noul answer is a probability (0 = no, 1 = yes). Articles scoring below this are
+# deleted; everything at or above it is kept.
+JUDGE_THRESHOLD = float(os.getenv("JUDGE_THRESHOLD", "0.5"))
 # Sampling parameters. Ollama's own defaults (temperature 0.8, top_k 40, top_p 0.9)
 # are tuned for open-ended chat; these three call sites want different things.
 # The ReAct loop needs the same tool call for the same state, not variety — but not
@@ -74,9 +64,6 @@ JUDGE_NUM_PREDICT = 256
 # out. Note this is low temperature, not determinism: reproducing a run exactly
 # would also require pinning `seed`.
 AGENT_TEMPERATURE = 0.2
-# The judge emits a handful of YES/NO tokens and nothing else, so any sampling
-# entropy is pure downside — see the runaway described at JUDGE_NUM_PREDICT.
-JUDGE_TEMPERATURE = 0.0
 # The summary is prose meant to be read, so it gets room to vary word choice.
 # top_k/top_p are set explicitly at Ollama's defaults: at 0.5 the tail is live
 # (unlike the greedy judge, where they would be inert), so the values that shape
@@ -89,11 +76,6 @@ SUMMARY_TOP_P = 0.9
 # structurally impossible for the logged config to drift from the config actually used,
 # which is what lets metrics_report.py cohort runs by config and trust the answer.
 AGENT_MODEL_KWARGS = {"num_ctx": AGENT_NUM_CTX, "temperature": AGENT_TEMPERATURE}
-JUDGE_MODEL_KWARGS = {
-    "num_predict": JUDGE_NUM_PREDICT,
-    "temperature": JUDGE_TEMPERATURE,
-    "reasoning": False,
-}
 # num_ctx is per-call for the summary (see summarize_day), so it is merged in there
 # rather than fixed here.
 SUMMARY_MODEL_KWARGS = {
@@ -106,98 +88,79 @@ SUMMARY_MODEL_KWARGS = {
 # status code), so the inputs are the only recoverable evidence — dumping them is what
 # makes a failure replayable. Kept out of the metrics file because a failing prompt runs
 # to ~4k tokens; the JSONL records only the path.
+# Hard cap on search calls per topic group. A narrow topic whose articles are all already
+# stored makes the model reword the query and search again, forever; only the recursion
+# limit stopped it (~100 s wasted, GraphRecursionError). The prompt asks for fewer.
+MAX_SEARCHES_PER_TOPIC = 3
 FAILURE_DIR = os.getenv("NEWS_FAILURE_DIR", "news_failures")
 FAILURE_KEEP = int(os.getenv("NEWS_FAILURE_KEEP", "50"))
 DEFAULT_TOPICS = (
-    "anthropic",  # AI companies
-    "openai",
+    "anthropic, claude, claude code, haiku, opus, sonnet, fable, mythos",
+    "openai, chatgpt, luna, sol, astra, terra, gpt-image, codex",
     "ollama",
-    "google",
-    "xai",
-    "spacex",
-    "z.ai",
-    "nvidia",
-    "microsoft",
+    "google, gemini, deepmind, gemma, veo, nano banana, antigravity",
+    "spacex, xai, grok, cursor",
+    "z.ai, glm, zhipu",
+    "nvidia, blackwell, nemotron, ai",
+    "microsoft, foundry, copilot, phi models",
     "perplexity",
-    "moonshot",
-    "minimax",
-    "hugging face",
+    "moonshot, kimi, kimi code",
+    "minimax, minimax code, minimax design",
+    "hugging face, transformers, sentence transformers",
     "groq",
-    "claude",  # Models
-    "gemini",
-    "chatgpt",
-    "gpt-5",
-    "nova",
-    "phi",
-    "sora",
-    "veo",
+    "amazon, bedrock, nova, kiro, trainium",
     "midjourney",
-    "stable diffusion",
-    "grok",
-    "deepseek",
-    "meta llama",
-    "glm",
-    "kimi",
-    "qwen",
-    "minimax",
-    "lfm",
-    "gemma",
-    "nemotron",
-    "mistral",
-    "cohere",
-    "llama",
-    "astra",
-    "fable",
-    "mistral",
-    "muse spark",
-    "claude code",  # tools, harnesses
-    "codex",
-    "muse code",
-    "opencode",
-    "cursor",
-    "langchain",
-    "copilot",
-    "kiro",
+    "thinking machines, inkling, tinker",
+    "stability.ai, stable diffusion, stable audio, stable video",
+    "deepseek, deepseek harness",
+    "meta.ai, muse spark, muse glimmer, muse agent, llama, muse code",
+    "alibaba, qwen, qwen code",
+    "liquid.ai, lfm",
+    "mistral ai, mistral studio, mistral forge, mistral vibe",
+    "cohere ai, command, north, compass, cohere labs",
+    "jev, typesafe.ai, systemone",
+    "opencode, opencode agent, opencode coding harness",
+    "langchain, langgraph, langsmith, langsmith fleet, deepagents",
+    "ai21, jamba",
     "openclaw",
-    "cline",
-    "windsurf",
-    "replit",
-    "zed",
-    "local llm",  # broader topics
-    "vllm",
-    "llamacpp",
-    "sglang",
-    "mlx",
-    "transformers",
-    "mcp",
-    "model context protocol",
-    "a2a",
-    "coding agents",
-    "ai harness",
-    "artificial intelligence",
-    "llm",
-    "large language model",
-    "foundation model",
-    "ai safety",
-    "ai policy",
-    "reasoning models",
-    "open weights",
-    "agi",
-    "vibe coding",
-    "rag",
+    "cline, cline agent",
+    "agent harness, goose, goose harness",
+    "pi harness, pi agent harness, omp, oh my pi harness",
+    "pydantic ai, pydantic agent",
+    "hermes, hermes agent, nous research",
+    "amp, amp harness, ampcode",
+    "maf, microsoft agent framework, microsoft agent harness",
+    "devin ai, devin, windsurf",
+    "lovable, lovable ai",
+    "base44",
+    "bolt, bolt ai",
+    "v0, vercel, replit",
+    "zed, zed ai",
+    "local llm",
+    "vllm, llamacpp, sglang",
+    "apple silicon, mlx, apple intelligence",
+    "mcp, model context protocol, a2a",
+    "artificial intelligence, ai, superintelligence",
+    "llm, large language model, foundation model, open weights",
+    "ai safety, ai policy, ai alignment, superintelligence, agi",
+    "vibe coding, ai coding, ai harness, ai coding harness, coding agents",
+    "rag, retrieval augmented generation, embedding, vector search, vector database, reranker",
+    "irregular, ai security",
+    "safe.ai, center for ai safety, METR, MIRI, Center for Human-Compatible AI (CHAI), allen institute for ai safety",
 )
 
 _SYSTEM_PROMPT = """\
 You are an AI/ML technology news research agent. Today's date is {today}.
 
-The user gives you one or more topics — companies, products, models, or concepts from
-the AI industry. Treat each provided topic as a short, fixed label.
+The user gives you one topic group: a set of related labels — companies, products,
+models, or concepts from the AI industry — separated by commas. Each label is an
+individual topic.
 
-For each topic:
-1. Search for recent news using the search tool. Use a SHORT query — just the
-   topic label itself (optionally add the word "news"). Search ONE topic per
-   query: never combine multiple topics into a single search, and never add
-   site: filters or URLs to the query. Both return zero results.
+For the group:
+1. Search for *recent* news using the search tool. Use ONE SHORT query: join the
+   group's labels with " OR " (optionally add the word "news"). If the group has many
+   labels, use its 3-4 most distinctive ones. Never add site: filters or URLs to the
+   query. Both return zero results.
 2. For each article found, only store it if it is genuinely about AI/ML technology
    (a model, AI product/feature, AI research, AI tooling, or AI industry strategy).
    Company topics like "nvidia", "microsoft", "google", or "spacex" also generate
@@ -205,21 +168,24 @@ For each topic:
    moves, earnings, unrelated product launches, layoffs, legal rulings, rocket
    launches, gaming. Skip those even though the company name matches the topic.
    For each article that passes this check, call store_result ONCE with:
-   - topic: the topic label(s) this article belongs to (see rules below)
+   - topic: the label(s) this article belongs to (see rules below)
    - title: article headline
    - url: article URL
-   - summary: 1-2 sentence summary of the article
+   - summary: 1-3 sentence summary of the article
    - published_on: publication date if visible in results (ISO format YYYY-MM-DD), else omit
 
 Rules for the `topic` field — keep topics tight so they stay easy to group:
-- Reuse the SAME short label the user gave you. Do not expand the label or invent longer wording,
-  and do NOT turn the label into a descriptive phrase.
-- Labels are lowercase (e.g. "anthropic", "local llm", "ai coding").
-- Multiple labels on a news article are allowed: if one article is genuinely relevant to several of the
-  provided topics, set topic to a comma-separated list of those labels
-  (e.g. "anthropic, claude code"). Otherwise use the single matching label.
+- Use ONLY individual labels from the groups you were given — never a whole group line.
+  Do not expand a label or invent longer wording, and do NOT turn a label into a
+  descriptive phrase.
+- Labels are lowercase (e.g. "anthropic", "local llm", "claude code").
+- Multiple labels on a news article are allowed: if one article is genuinely relevant to several
+  labels (from the same group or different ones), set topic to a comma-separated list of those
+  labels (e.g. "anthropic, claude code"). Otherwise use the single matching label.
 
-After you have searched and stored results for ALL topics, stop.
+Search at most 2-3 times. If a search only returns articles you already stored, or
+store_result reports them as duplicates, stop: do NOT reword the query and search again.
+After you have searched and stored results for the group, stop.
 """
 
 _SUMMARIZE_SYSTEM_PROMPT = """\
@@ -236,36 +202,36 @@ or invent details not present in the articles.
 and no questions to the reader.
 """
 
-_JUDGE_SYSTEM_PROMPT = """\
-You are a relevance judge for an AI/ML technology news digest. You will be given a \
-numbered list of articles and a set of topics (companies, products, models, or \
-concepts from the AI industry). For EACH numbered article, decide YES only if it is \
-BOTH:
-  1. genuinely about artificial intelligence / machine learning technology
-     (a model, AI product/feature, AI research, AI tooling, or AI industry strategy), AND
-  2. relevant to at least one of the given topics.
+# One yes/no question asked of each article. The instructions carry the rule; the
+# criteria spell out what a yes and a no mean.
+JUDGE_QUESTION = Noul(
+    instructions=(
+        "Is this article genuinely about artificial intelligence / machine learning "
+        "technology AND relevant to at least one of the given topics?"
+    ),
+    criteria={
+        "true": (
+            "About a model, AI product/feature, AI research, AI tooling, an AI company, "
+            "or AI industry strategy, and relevant to a topic."
+        ),
+        "false": (
+            "No AI/ML angle in the title or summary. Many topics are company names "
+            '(e.g. "nvidia", "microsoft", "google", "spacex") that also generate '
+            "ordinary corporate, financial, or product news — stock moves, earnings, "
+            "unrelated launches, layoffs, legal rulings, rocket launches, gaming, "
+            "gossip. Those are false even though the company name matches."
+        ),
+    },
+)
 
-Many topics are company names (e.g. "nvidia", "microsoft", "google", "spacex") that \
-also generate large volumes of ordinary corporate, financial, or product news with no \
-AI angle — stock price moves, earnings, unrelated product launches, layoffs, legal/
-antitrust rulings, rocket launches, gaming, or general company gossip. Answer NO for \
-those even though the company name matches the topic. Only answer YES when the AI/ML \
-angle is actually present in the title or summary.
+SEARCH_PROMPT = """Search for *recent* news for this topic group (labels separated by
+commas): {topic_list}
 
-Respond with exactly one line per article, in this format and no other text:
-N: YES
-N: NO
+Use one short query made from the group's labels joined by " OR " (optionally with the
+word "news"). Do NOT add site: filters or URLs to the query; both return no results.
+Store each article under the individual label(s) it matches, not the whole group.
 
-where N is the article's number. Do not add explanations, headers, or commentary."""
-
-SEARCH_PROMPT = """Research recent news for these topics: {topic_list}.
-
-Search each topic separately, using a short keyword query — just the topic label
-itself (optionally with the word "news"). Do NOT combine multiple topics into a
-single query, and do NOT add site: filters or URLs to the query; both return no
-results.
-
-Cast a broad net and store every relevant, recent article you find.
+Cast a broad net and store every relevant, recent article you find. Today is {today}.
 """
 
 
@@ -275,13 +241,13 @@ def _write_metric(record: dict) -> None:
         f.write(json.dumps(record) + "\n")
 
 
-# Which run and which topic batch is currently executing. build_graph() is called once
-# per run but invoked once per batch, so batch_index cannot be closed over — and tools
+# Which run and which topic entry is currently executing. build_graph() is called once
+# per run but invoked once per topic entry, so topic_index cannot be closed over — and tools
 # receive only their own arguments, so it cannot be threaded through the graph state
 # either. A ContextVar reaches both the agent node and the tool wrappers with one
 # mechanism, and stays correct if the loop is ever made async.
-_BATCH_CONTEXT: contextvars.ContextVar[dict] = contextvars.ContextVar(
-    "news_batch_context", default={}
+_TOPIC_CONTEXT: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "news_topic_context", default={}
 )
 
 
@@ -293,12 +259,12 @@ def _log_tool_call(tool_name: str, elapsed_s: float, **extra) -> None:
     failures) is what supplies the denominator — an error count alone cannot say
     whether a failure rate is rising or falling.
     """
-    ctx = _BATCH_CONTEXT.get()
+    ctx = _TOPIC_CONTEXT.get()
     _write_metric(
         {
             "type": "tool_call",
             "run_id": ctx.get("run_id"),
-            "batch_index": ctx.get("batch_index"),
+            "topic_index": ctx.get("topic_index"),
             "tool": tool_name,
             "elapsed_s": round(elapsed_s, 3),
             **extra,
@@ -322,11 +288,11 @@ def _dump_failed_conversation(messages: list, tools: list | None = None) -> str 
 
     Never raises: a failure while recording a failure must not mask the original error.
     """
-    ctx = _BATCH_CONTEXT.get()
+    ctx = _TOPIC_CONTEXT.get()
     run_id = (ctx.get("run_id") or "adhoc").replace(":", "").replace("+", "")
-    # Nanoseconds, not milliseconds: consecutive failures in one batch land inside the
+    # Nanoseconds, not milliseconds: consecutive failures in one topic search land inside the
     # same millisecond and would overwrite each other.
-    name = f"{run_id}-batch{ctx.get('batch_index')}-{time.time_ns()}.json"
+    name = f"{run_id}-topic{ctx.get('topic_index')}-{time.time_ns()}.json"
     try:
         os.makedirs(FAILURE_DIR, exist_ok=True)
         path = os.path.join(FAILURE_DIR, name)
@@ -353,7 +319,7 @@ def _dump_failed_conversation(messages: list, tools: list | None = None) -> str 
 
 
 def _prune_failure_dumps() -> None:
-    """Keep only the newest FAILURE_KEEP dumps; ~12% of batches fail, so this grows."""
+    """Keep only the newest FAILURE_KEEP dumps; ~12% of topic searches fail, so this grows."""
     entries = sorted(
         (e for e in os.scandir(FAILURE_DIR) if e.is_file()),
         key=lambda e: e.stat().st_mtime,
@@ -504,15 +470,26 @@ def _resolve_topic(label: str, allowed: list[str]) -> str | None:
     return None
 
 
+def _split_labels(groups: list[str]) -> list[str]:
+    """Flatten comma-separated topic groups into unique, lowercased individual labels."""
+    labels: list[str] = []
+    for group in groups:
+        for part in group.split(","):
+            label = part.strip().lower()
+            if label and label not in labels:
+                labels.append(label)
+    return labels
+
+
 def _normalize_topic(topic: str, allowed: list[str] | None = None) -> tuple[str, list]:
     """Return ``(normalized_topic, dropped_labels)`` for a comma-separated *topic*.
 
     Labels are lowercased and trimmed, then — when *allowed* is supplied — resolved
-    back onto the batch's own topics. Anything that will not resolve is dropped and
+    back onto the topic entry's own labels. Anything that will not resolve is dropped and
     returned, because the agent invents labels in three ways the prompt cannot prevent:
     spelling variants, phrases lifted out of the prompt's own wording ("ai industry
-    strategy"), and topics carried over from earlier batches in the conversation.
-    Restricting to the batch catches all three at the boundary.
+    strategy"), and topics carried over from earlier topic entries in the conversation.
+    Restricting to the entry's labels catches all three at the boundary.
 
     With no *allowed* set (an ad-hoc call outside a run) nothing is dropped.
     """
@@ -539,7 +516,7 @@ def store_result(
 
     Args:
         topic: topic label(s) this article belongs to — reuse a label from the topics
-            you were given for this batch; for an article spanning several of those
+            you were given for this topic group; for an article spanning several of those
             topics, a comma-separated list (e.g. "anthropic, claude code") is fine
         title: article headline
         url: article URL
@@ -547,10 +524,10 @@ def store_result(
         published_on: publication date in YYYY-MM-DD format if known, else omit
     """
     start = time.perf_counter()
-    # Validate against this batch's own topics, not the whole configured list: a run
-    # only ever shows the model two topics at a time, so a label from another batch is
-    # recalled from earlier in the conversation, not chosen from what was asked.
-    allowed = _BATCH_CONTEXT.get().get("topics")
+    # Validate against this entry's own labels, not the whole configured list: the model
+    # only ever sees one entry at a time, so any other label is invented or recalled,
+    # not chosen from what was asked.
+    allowed = _TOPIC_CONTEXT.get().get("topics")
     normalized, dropped = _normalize_topic(topic, allowed)
     if not normalized:
         # Nothing usable survived. Refuse the write and name the valid labels rather
@@ -565,7 +542,7 @@ def store_result(
         )
         valid = ", ".join(allowed or [])
         return (
-            f"Not stored: {topic!r} is not one of this batch's topics. "
+            f"Not stored: {topic!r} is not one of this topic group's labels. "
             f"Use one of: {valid}."
         )
     fetched_at = datetime.now(timezone.utc).isoformat()
@@ -614,7 +591,7 @@ def store_result(
     )
     if stored:
         return f"Stored: {title}"
-    return f"Skipped (duplicate URL): {title}"
+    return f"Skipped (duplicate URL, already stored): {title}"
 
 
 def _instrument_tool(underlying):
@@ -689,8 +666,8 @@ def _handle_tool_error(e: Exception) -> str:
     _write_metric(
         {
             "type": "tool_error",
-            "run_id": _BATCH_CONTEXT.get().get("run_id"),
-            "batch_index": _BATCH_CONTEXT.get().get("batch_index"),
+            "run_id": _TOPIC_CONTEXT.get().get("run_id"),
+            "topic_index": _TOPIC_CONTEXT.get().get("topic_index"),
             "error": str(e),
             "error_type": type(e).__name__,
             "handled_by": "ToolNode",
@@ -702,11 +679,19 @@ def _handle_tool_error(e: Exception) -> str:
 
 
 def should_continue(state: MessagesState) -> Literal["tools", "__end__"]:
-    """Route to tools if the last message has tool calls, otherwise end."""
-    last = state["messages"][-1]
-    if getattr(last, "tool_calls", None):
-        return "tools"
-    return END
+    """Route to tools if the last message has tool calls, otherwise end.
+
+    Also ends once the model has asked for more than MAX_SEARCHES_PER_TOPIC searches.
+    """
+    messages = state["messages"]
+    if not getattr(messages[-1], "tool_calls", None):
+        return END
+    searches = sum(
+        call["name"] != "store_result"
+        for m in messages
+        for call in getattr(m, "tool_calls", None) or []
+    )
+    return END if searches > MAX_SEARCHES_PER_TOPIC else "tools"
 
 
 def build_graph(run_id: str | None = None):
@@ -738,7 +723,7 @@ def build_graph(run_id: str | None = None):
                 MODEL_NAME,
                 None,
                 time.perf_counter() - start,
-                batch_index=_BATCH_CONTEXT.get().get("batch_index"),
+                topic_index=_TOPIC_CONTEXT.get().get("topic_index"),
                 success=False,
                 error=str(e),
                 error_type=type(e).__name__,
@@ -746,7 +731,7 @@ def build_graph(run_id: str | None = None):
                 dump_path=_dump_failed_conversation(messages, tools),
                 **AGENT_MODEL_KWARGS,
             )
-            # Re-raise: run() still logs the search_batch failure, so the batch-level
+            # Re-raise: run() still logs the search_topic failure, so the topic-level
             # and call-level records stay reconcilable.
             raise
         _log_llm_call(
@@ -755,7 +740,7 @@ def build_graph(run_id: str | None = None):
             MODEL_NAME,
             response,
             time.perf_counter() - start,
-            batch_index=_BATCH_CONTEXT.get().get("batch_index"),
+            topic_index=_TOPIC_CONTEXT.get().get("topic_index"),
             tool_call_count=len(getattr(response, "tool_calls", None) or []),
             success=True,
             **AGENT_MODEL_KWARGS,
@@ -771,28 +756,13 @@ def build_graph(run_id: str | None = None):
     return graph.compile()
 
 
-_JUDGE_LINE_RE = re.compile(r"(\d+)\s*[:.)]\s*(YES|NO)", re.IGNORECASE)
-
-
-def _parse_judge_verdicts(response_text: str) -> dict[int, str]:
-    """Parse a judge response into {article_number: "YES"|"NO"}.
-
-    If an article number appears more than once (e.g. a reasoning model restates
-    it before its final answer), the LAST occurrence wins.
-    """
-    verdicts: dict[int, str] = {}
-    for number, verdict in _JUDGE_LINE_RE.findall(response_text):
-        verdicts[int(number)] = verdict.upper()
-    return verdicts
-
-
 def judge_articles(topics: list[str], run_start: str) -> int:
     """Delete articles fetched since run_start that are irrelevant to topics.
 
-    Articles are judged in batches of JUDGE_BATCH_SIZE per LLM call. If a batch's
-    response can't be parsed for a given article, or the LLM call itself fails,
-    that article is kept (fail-open) rather than deleted, so a malformed local-model
-    response never silently destroys data.
+    Each article is one Noul question to the judge model: it answers with a probability
+    that the article is relevant, and rows scoring below JUDGE_THRESHOLD are deleted.
+    If a call fails, that article is kept (fail-open) rather than deleted, so an
+    unreachable or misbehaving model never silently destroys data.
 
     Prints how many articles it judged and how many it kept. Both numbers are needed
     to read a run: the judge deletes rows that were already counted as "found", so
@@ -810,62 +780,51 @@ def judge_articles(topics: list[str], run_start: str) -> int:
         return 0
 
     topic_str = ", ".join(topics)
-    # reasoning=False: qwen3.5 is a reasoning model and its <think> traces reliably
-    # blow past the response length limit on a 10-article batch, causing done_reason
-    # "length" with empty .content — which fails open and keeps every article,
-    # including the false positives this judge exists to catch. The judge only needs
-    # short YES/NO tokens, so reasoning adds cost without adding judgment quality.
-    model = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL, **JUDGE_MODEL_KWARGS)
     to_delete: list[int] = []
-    for i in range(0, len(rows), JUDGE_BATCH_SIZE):
-        batch = rows[i : i + JUDGE_BATCH_SIZE]
-        articles = "\n\n".join(
-            f"{n}. Article title: {title}\nArticle summary: {summary}"
-            for n, (_, title, summary) in enumerate(batch, start=1)
-        )
-        batch_index = i // JUDGE_BATCH_SIZE
-        call_start = time.perf_counter()
-        try:
-            response = model.invoke(
-                [
-                    SystemMessage(_JUDGE_SYSTEM_PROMPT),
-                    HumanMessage(f"Topics: {topic_str}\n\n{articles}"),
-                ]
+    with TypeSafeClient(timeout=120) as client:
+        for row_id, title, summary in rows:
+            call_start = time.perf_counter()
+            try:
+                result = client.system_one(
+                    state={"title": title, "summary": summary, "topics": topic_str},
+                    questions={"is_relevant": JUDGE_QUESTION},
+                    model=JUDGE_MODEL,
+                )
+                noul = result.answers["is_relevant"].noul
+            except Exception as e:
+                _write_metric(
+                    {
+                        "type": "llm_call",
+                        "run_id": run_start,
+                        "step": "judge_decision",
+                        "model": JUDGE_MODEL,
+                        "elapsed_s": round(time.perf_counter() - call_start, 3),
+                        "success": False,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                    }
+                )
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                rprint(
+                    f"[dim][{now}][/dim] [yellow]Judge call failed (keeping article "
+                    f"unfiltered): {e}[/yellow]"
+                )
+                continue
+            _write_metric(
+                {
+                    "type": "llm_call",
+                    "run_id": run_start,
+                    "step": "judge_decision",
+                    "model": JUDGE_MODEL,
+                    "elapsed_s": round(time.perf_counter() - call_start, 3),
+                    "input_tokens": result.usage.input_tokens,
+                    "output_tokens": result.usage.output_tokens,
+                    "noul": noul,
+                    "threshold": JUDGE_THRESHOLD,
+                    "success": True,
+                }
             )
-        except Exception as e:
-            _log_llm_call(
-                run_start,
-                "judge_batch",
-                MODEL_NAME,
-                None,
-                time.perf_counter() - call_start,
-                batch_index=batch_index,
-                batch_size=len(batch),
-                success=False,
-                error=str(e),
-                error_type=type(e).__name__,
-                **JUDGE_MODEL_KWARGS,
-            )
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            rprint(
-                f"[dim][{now}][/dim] [yellow]Judge call failed (keeping batch "
-                f"unfiltered): {e}[/yellow]"
-            )
-            continue
-        _log_llm_call(
-            run_start,
-            "judge_batch",
-            MODEL_NAME,
-            response,
-            time.perf_counter() - call_start,
-            batch_index=batch_index,
-            batch_size=len(batch),
-            success=True,
-            **JUDGE_MODEL_KWARGS,
-        )
-        verdicts = _parse_judge_verdicts(response.content)
-        for n, (row_id, _title, _summary) in enumerate(batch, start=1):
-            if verdicts.get(n) == "NO":
+            if noul < JUDGE_THRESHOLD:
                 to_delete.append(row_id)
 
     if to_delete:
@@ -1043,24 +1002,27 @@ def run(topics: list[str]) -> tuple[int, str | None]:
     run_start = datetime.now(timezone.utc).isoformat()
     today = run_start[:10]
     app = build_graph(run_id=run_start)
-    # Search topics in small batches: each invoke gets a fresh recursion budget,
-    # and a failed batch is logged without abandoning the remaining topics.
-    for i in range(0, len(topics), BATCH_SIZE):
-        batch = topics[i : i + BATCH_SIZE]
-        topic_list = ", ".join(batch)
-        batch_start = time.perf_counter()
-        # Stamp every agent step and tool call in this batch with the batch it belongs
-        # to. A run spans ~64 batches; without this, a failed search_batch could not be
-        # traced back to the LLM calls and tool calls that produced it except by
-        # guessing from timestamp order.
-        _BATCH_CONTEXT.set(
-            {"run_id": run_start, "batch_index": i // BATCH_SIZE, "topics": batch}
+    # Search one topic entry per invoke: each gets a fresh recursion budget, and a
+    # failed search is logged without abandoning the remaining topics.
+    for i, topic_list in enumerate(topics):
+        search_start = time.perf_counter()
+        # Stamp every agent step and tool call with the topic entry it belongs to, so a
+        # failed search_topic can be traced back to the LLM calls and tool calls that
+        # produced it.
+        _TOPIC_CONTEXT.set(
+            {
+                "run_id": run_start,
+                "topic_index": i,
+                "topics": _split_labels([topic_list]),
+            }
         )
         try:
             app.invoke(
                 {
                     "messages": [
-                        HumanMessage(SEARCH_PROMPT.format(topic_list=topic_list))
+                        HumanMessage(
+                            SEARCH_PROMPT.format(topic_list=topic_list, today=today)
+                        )
                     ]
                 },
                 config={"recursion_limit": 50},
@@ -1068,9 +1030,9 @@ def run(topics: list[str]) -> tuple[int, str | None]:
         except Exception as e:
             _log_step(
                 run_start,
-                "search_batch",
-                time.perf_counter() - batch_start,
-                batch_index=i // BATCH_SIZE,
+                "search_topic",
+                time.perf_counter() - search_start,
+                topic_index=i,
                 topics=topic_list,
                 success=False,
                 error=str(e),
@@ -1082,15 +1044,15 @@ def run(topics: list[str]) -> tuple[int, str | None]:
             )
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             rprint(
-                f"[dim][{now}][/dim] [red]News research failed for batch "
+                f"[dim][{now}][/dim] [red]News research failed for "
                 f"{topic_list}: {e}[/red]"
             )
             continue
         _log_step(
             run_start,
-            "search_batch",
-            time.perf_counter() - batch_start,
-            batch_index=i // BATCH_SIZE,
+            "search_topic",
+            time.perf_counter() - search_start,
+            topic_index=i,
             topics=topic_list,
             success=True,
             model=MODEL_NAME,

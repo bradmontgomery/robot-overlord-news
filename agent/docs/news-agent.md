@@ -18,13 +18,13 @@ once per article. Results are written to a local SQLite database (`news_results.
   data (not a single string blob), making it easier for the model to call `store_result` once
   per item.
 - Today's date is injected into the system prompt so the model can reason about recency.
-- `recursion_limit=50` guards against infinite tool-call loops.
-- Topics are searched in small batches (`BATCH_SIZE = 2`). With `qwen3.5:latest`,
-  a batch larger than ~3 topics fills the context with search results and the
-  model stops calling `store_result` (drops to zero stored at 4+); large combined
-  queries also crash the news backend. Each batch is an independent run, so a
-  flaky batch (e.g. intermittent malformed tool-call XML) is logged and skipped
-  rather than aborting the whole run. See the [README](../README.md#topic-batching-and-model-reliability-batch_size) for the full rationale.
+- `MAX_SEARCHES_PER_TOPIC` (3) ends a topic's loop in `should_continue` once the model asks for more searches; `recursion_limit=50` is the last-resort backstop against infinite tool-call loops.
+- Each `DEFAULT_TOPICS` entry (a comma-separated group of related labels) is searched in its
+  own independent run. With `qwen3.5:latest`, a run covering more than ~3 topics fills the
+  context with search results and the model stops calling `store_result`; large combined
+  queries also crash the news backend. A flaky run (e.g. intermittent malformed tool-call
+  XML) is logged and skipped rather than aborting the whole job. See the
+  [README](../README.md#one-topic-entry-per-agent-run) for the full rationale.
 - `store_result` uses a module-level `DB_PATH` (set from `NEWS_DB_PATH` env var) so it's
   patchable in tests without monkey-patching sqlite3 itself.
 - `should_continue` is a module-level function (not a closure inside `build_graph`) so it can
