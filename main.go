@@ -148,6 +148,7 @@ func main() {
 		},
 		"topicColor": topicColor,
 		"domain":     fqdn,
+		"safeURL":    safeHTTPURL,
 		"formatDate": func(dateStr string) string {
 			t, err := time.Parse("2006-01-02", dateStr)
 			if err != nil {
