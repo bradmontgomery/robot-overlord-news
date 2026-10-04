@@ -224,10 +224,53 @@ func main() {
 	mux.HandleFunc("/rss", handleRSS)
 	mux.HandleFunc("/api/present", handlePresent)
 	mux.Handle("/static/", http.FileServer(http.FS(content)))
+	for path, file := range metaFiles {
+		mux.HandleFunc(path, serveMeta(file))
+	}
 
 	addr := ":8080"
 	log.Printf("listening on http://localhost%s  db=%s", addr, dbPath)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	log.Fatal(http.ListenAndServe(addr, securityHeaders(mux)))
+}
+
+// metaFiles maps root-level well-known URLs to their embedded source files.
+var metaFiles = map[string]string{
+	"/robots.txt":               "static/meta/robots.txt",
+	"/humans.txt":               "static/meta/humans.txt",
+	"/ai.txt":                   "static/meta/ai.txt",
+	"/llms.txt":                 "static/meta/llms.txt",
+	"/.well-known/security.txt": "static/meta/security.txt",
+}
+
+func serveMeta(file string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		b, err := content.ReadFile(file)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.Write(b)
+	}
+}
+
+const csp = "default-src 'none'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; " +
+	"img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", csp)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+		if r.Header.Get("X-Forwarded-Proto") == "https" {
+			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {

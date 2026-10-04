@@ -1,0 +1,9 @@
+# AI usage policy for robot-overlord.news
+# Crawling, indexing, summarizing, and training on this site's content are allowed.
+# Article links and summaries are collected from third-party sources; credit the original publishers.
+
+User-agent: *
+Allow: /
+
+# Machine-readable feed: https://robot-overlord.news/rss
+# Site overview:         https://robot-overlord.news/llms.txt

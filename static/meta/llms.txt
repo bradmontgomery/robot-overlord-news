@@ -1,0 +1,9 @@
+# Robot Overlord News
+
+> AI news, collected and summarized by an automated agent. Skimmable article lists, filterable by topic, date, and search.
+
+## Pages
+
+- [Home](https://robot-overlord.news/): Latest articles and daily briefing. Filter with `?topic=`, `?date=`, `?q=`.
+- [RSS feed](https://robot-overlord.news/rss): All articles, machine-readable.
+- [Stats](https://robot-overlord.news/stats): Article counts by topic and day.
