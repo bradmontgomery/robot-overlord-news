@@ -350,6 +350,32 @@ def _dropped_labels(records: list[dict]) -> dict:
     }
 
 
+def _stale_articles(records: list[dict]) -> dict:
+    """How many judged articles were deleted for being published too long ago.
+
+    Only `judge_articles` records carrying `articles_stale` ran the date check.
+    Earlier runs never looked at publication dates, so they are left out of the rate
+    rather than counted as zero — zero would claim they were checked and clean.
+    """
+    checked = [r for r in _steps(records, "judge_articles") if "articles_stale" in r]
+    judged = sum(r.get("articles_judged") or 0 for r in checked)
+    stale = sum(r.get("articles_stale") or 0 for r in checked)
+    both = sum(r.get("articles_stale_and_off_topic") or 0 for r in checked)
+    excluded = [r for r in records if r.get("type") == "article_excluded"]
+    return {
+        "runs": len(checked),
+        "judged": judged,
+        "stale": stale,
+        "stale_and_off_topic": both,
+        "total": stale + both,
+        "total_pct": _pct(stale + both, judged),
+        # The cutoff currently in force; the last checked run is the newest.
+        "max_age_days": checked[-1].get("max_article_age_days") if checked else None,
+        # Newest first, capped so the page stays a summary rather than a dump.
+        "recent": excluded[::-1][:25],
+    }
+
+
 def _error_classes(failures: list[dict]) -> list[tuple]:
     """Group failures into classes, commonest first.
 
@@ -397,6 +423,7 @@ def summarize(records: list[dict]) -> dict:
     failures = [r for r in _steps(records, "search_topic") if r.get("success") is False]
     tool_rows = _tool_rows(records)
     dropped = _dropped_labels(records)
+    stale = _stale_articles(records)
     cohorts = _cohorts(records)
     # Headline truncation is the *current* config's rate, not the all-time average.
     # Pooling them would let a fixed pile of old failures drag a working fix down
@@ -426,6 +453,9 @@ def summarize(records: list[dict]) -> dict:
             "dropped_validated": dropped["calls"],
             "judged": judged,
             "deleted": deleted,
+            "stale": stale["total"],
+            "stale_pct": stale["total_pct"],
+            "stale_checked_runs": stale["runs"],
             "new_articles": sum(r["new_articles"] for r in runs),
         },
         "cohorts": cohorts,
@@ -445,6 +475,7 @@ def summarize(records: list[dict]) -> dict:
         "error_classes": _error_classes(failures),
         "tools": tool_rows,
         "dropped_labels": dropped,
+        "stale_articles": stale,
         "topics_with_failures": sum(1 for r in topics if r["failures"]),
     }
 
@@ -822,6 +853,15 @@ def render_html(summary: dict) -> str:
             ),
             alert=k["dropped_pct"] > 1,
         ),
+        # "—" before any run has checked dates, for the same reason as above.
+        _kpi(
+            f'{k["stale_pct"]:.1f}%' if k["stale_checked_runs"] else "—",
+            (
+                f'judged articles excluded as stale — {k["stale"]:,} articles'
+                if k["stale_checked_runs"]
+                else "articles checked for staleness"
+            ),
+        ),
         _kpi(f'{k["new_articles"]}', "new articles stored"),
     ])
 
@@ -950,6 +990,42 @@ def render_html(summary: dict) -> str:
             'are found totals, not what remained stored.'
         )
 
+    stale = summary["stale_articles"]
+    stale_figure = ""
+    if stale["runs"]:
+        skipped = len(runs) - stale["runs"]
+        skipped_note = (
+            f' {skipped} earlier {"run predates" if skipped == 1 else "runs predate"} '
+            f'the check and {"is" if skipped == 1 else "are"} left out — they never '
+            f'looked at publication dates, so counting them as zero would report a '
+            f'clean rate over unexamined articles.'
+            if skipped > 0
+            else ""
+        )
+        stale_table = _table(
+            ["published", "age (days)", "reason", "title"],
+            [
+                [r.get("published_on"), f'{r.get("age_days"):,}',
+                 (r.get("reason") or "").replace("_", " "), r.get("title")]
+                for r in stale["recent"]
+            ],
+            {1},
+        ) if stale["recent"] else ""
+        stale_figure = f"""
+<figure>
+  <figcaption>
+    <div class="t">Old articles excluded</div>
+    <div class="d">Articles published more than {stale["max_age_days"]} days before
+      their run are deleted after judging. {stale["total"]:,} of {stale["judged"]:,}
+      judged articles ({stale["total_pct"]:.1f}%) across {stale["runs"]}
+      {"run" if stale["runs"] == 1 else "runs"} were excluded as stale —
+      {stale["stale_and_off_topic"]:,} of them were off-topic as well. This is a date
+      comparison on <code>published_on</code>, not a model call; an article with no
+      usable date is kept.{skipped_note}</div>
+  </figcaption>
+  <div class="scroll">{stale_table}</div>
+</figure>"""
+
     tools = summary["tools"]
     tool_figure = ""
     if tools:
@@ -978,7 +1054,7 @@ def render_html(summary: dict) -> str:
 <body><div class="wrap">
 <h1>News agent metrics</h1>
 <p class="sub">{k["runs"]} runs · {k["llm_calls"]:,} LLM calls · {len(topics)} topics
-· {k["judged"]} articles judged, {k["deleted"]} pruned</p>
+· {k["judged"]} articles judged, {k["deleted"]} pruned ({k["stale"]} stale)</p>
 
 <div class="kpis">{kpis}</div>
 {ceiling_note}
@@ -1033,6 +1109,7 @@ def render_html(summary: dict) -> str:
 
 {tool_figure}
 {dropped_figure}
+{stale_figure}
 
 <figure>
   <figcaption>

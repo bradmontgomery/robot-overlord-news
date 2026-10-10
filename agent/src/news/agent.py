@@ -19,7 +19,7 @@ import os
 import re
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage, messages_to_dict
@@ -56,6 +56,11 @@ JUDGE_MODEL = os.getenv("TYPESAFE_DEFAULT_MODEL", "nimble:latest")
 # A Noul answer is a probability (0 = no, 1 = yes). Articles scoring below this are
 # deleted; everything at or above it is kept.
 JUDGE_THRESHOLD = float(os.getenv("JUDGE_THRESHOLD", "0.5"))
+# Articles published more than this many days before the run are deleted as stale.
+# Search results routinely surface year-old stories, and the relevance judge cannot
+# catch them: it sees only the title and summary. This is a plain date comparison on
+# published_on, not a model call — an article with no usable date is kept.
+MAX_ARTICLE_AGE_DAYS = int(os.getenv("NEWS_MAX_ARTICLE_AGE_DAYS", "90"))
 # Sampling parameters. Ollama's own defaults (temperature 0.8, top_k 40, top_p 0.9)
 # are tuned for open-ended chat; these three call sites want different things.
 # The ReAct loop needs the same tool call for the same state, not variety — but not
@@ -756,13 +761,32 @@ def build_graph(run_id: str | None = None):
     return graph.compile()
 
 
+def _article_age_days(published_on: str | None, today: date) -> int | None:
+    """Days between *published_on* and *today*, or None if the date is unusable.
+
+    Only the first ten characters are parsed, which covers every shape the agent
+    actually stores: "2026-07-10", full ISO timestamps, "...Z", even "2026-07-10/".
+    Anything else ("2026-XX-XX", "Opinion 3 days ago", a bare "2025-12") is unknown.
+    """
+    try:
+        return (today - date.fromisoformat((published_on or "")[:10])).days
+    except ValueError:
+        return None
+
+
 def judge_articles(topics: list[str], run_start: str) -> int:
-    """Delete articles fetched since run_start that are irrelevant to topics.
+    """Delete articles fetched since run_start that are irrelevant to topics or stale.
 
     Each article is one Noul question to the judge model: it answers with a probability
-    that the article is relevant, and rows scoring below JUDGE_THRESHOLD are deleted.
-    If a call fails, that article is kept (fail-open) rather than deleted, so an
+    that the article is relevant, and rows scoring below JUDGE_THRESHOLD are off-topic.
+    If a call fails, that article is not treated as off-topic (fail-open), so an
     unreachable or misbehaving model never silently destroys data.
+
+    Separately, an article published more than MAX_ARTICLE_AGE_DAYS before the run is
+    stale. That check is a date comparison in code; an article with no usable
+    published_on is never stale. Each stale article is printed and logged as an
+    `article_excluded` metric. An article can fail both checks, which is counted as
+    its own bucket so neither single-reason count is inflated.
 
     Prints how many articles it judged and how many it kept. Both numbers are needed
     to read a run: the judge deletes rows that were already counted as "found", so
@@ -773,16 +797,22 @@ def judge_articles(topics: list[str], run_start: str) -> int:
     judge_start = time.perf_counter()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT id, title, summary FROM news_results WHERE fetched_at >= ?",
+            "SELECT id, title, summary, url, published_on FROM news_results"
+            " WHERE fetched_at >= ?",
             (run_start,),
         ).fetchall()
     if not rows:
         return 0
 
+    # Measured from the run's own date rather than the wall clock, so a run that
+    # crosses midnight judges every article against the same cutoff.
+    run_day = date.fromisoformat(run_start[:10])
     topic_str = ", ".join(topics)
     to_delete: list[int] = []
+    counts = {"off_topic": 0, "stale": 0, "stale_and_off_topic": 0}
     with TypeSafeClient(timeout=120) as client:
-        for row_id, title, summary in rows:
+        for row_id, title, summary, url, published_on in rows:
+            off_topic = False
             call_start = time.perf_counter()
             try:
                 result = client.system_one(
@@ -809,23 +839,50 @@ def judge_articles(topics: list[str], run_start: str) -> int:
                     f"[dim][{now}][/dim] [yellow]Judge call failed (keeping article "
                     f"unfiltered): {e}[/yellow]"
                 )
+            else:
+                _write_metric(
+                    {
+                        "type": "llm_call",
+                        "run_id": run_start,
+                        "step": "judge_decision",
+                        "model": JUDGE_MODEL,
+                        "elapsed_s": round(time.perf_counter() - call_start, 3),
+                        "input_tokens": result.usage.input_tokens,
+                        "output_tokens": result.usage.output_tokens,
+                        "noul": noul,
+                        "threshold": JUDGE_THRESHOLD,
+                        "success": True,
+                    }
+                )
+                off_topic = noul < JUDGE_THRESHOLD
+
+            age_days = _article_age_days(published_on, run_day)
+            stale = age_days is not None and age_days > MAX_ARTICLE_AGE_DAYS
+            if stale:
+                reason = "stale_and_off_topic" if off_topic else "stale"
+                _write_metric(
+                    {
+                        "type": "article_excluded",
+                        "run_id": run_start,
+                        "reason": reason,
+                        "title": title,
+                        "url": url,
+                        "published_on": published_on,
+                        "age_days": age_days,
+                        "max_age_days": MAX_ARTICLE_AGE_DAYS,
+                    }
+                )
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                rprint(
+                    f"[dim][{now}][/dim] [yellow]Excluded stale article (published "
+                    f"{published_on}, {age_days} days old): {title}[/yellow]"
+                )
+            elif off_topic:
+                reason = "off_topic"
+            else:
                 continue
-            _write_metric(
-                {
-                    "type": "llm_call",
-                    "run_id": run_start,
-                    "step": "judge_decision",
-                    "model": JUDGE_MODEL,
-                    "elapsed_s": round(time.perf_counter() - call_start, 3),
-                    "input_tokens": result.usage.input_tokens,
-                    "output_tokens": result.usage.output_tokens,
-                    "noul": noul,
-                    "threshold": JUDGE_THRESHOLD,
-                    "success": True,
-                }
-            )
-            if noul < JUDGE_THRESHOLD:
-                to_delete.append(row_id)
+            counts[reason] += 1
+            to_delete.append(row_id)
 
     if to_delete:
         placeholders = ",".join("?" * len(to_delete))
@@ -839,17 +896,24 @@ def judge_articles(topics: list[str], run_start: str) -> int:
     rprint(
         f"[dim][{now}][/dim] Judged {len(rows)} {noun}: "
         f"[bold green]{kept} kept[/bold green], "
-        f"[yellow]{len(to_delete)} removed as off-topic[/yellow]"
+        f"[yellow]{counts['off_topic']} off-topic, {counts['stale']} stale, "
+        f"{counts['stale_and_off_topic']} stale & off-topic[/yellow]"
     )
     _log_step(
         run_start,
         "judge_articles",
         time.perf_counter() - judge_start,
         articles_judged=len(rows),
+        # The total across every reason, so it stays comparable with records written
+        # before the stale check existed. The breakdown below sums to it.
         articles_deleted=len(to_delete),
         # Derivable from the two above, but logged explicitly so the kept count never
         # has to be recomputed differently by each reader of the metrics.
         articles_kept=kept,
+        articles_off_topic=counts["off_topic"],
+        articles_stale=counts["stale"],
+        articles_stale_and_off_topic=counts["stale_and_off_topic"],
+        max_article_age_days=MAX_ARTICLE_AGE_DAYS,
     )
     return len(to_delete)
 

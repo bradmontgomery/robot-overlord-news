@@ -1,6 +1,6 @@
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1955,7 +1955,7 @@ def test_judge_articles_reports_found_and_kept(tmp_path):
     output = mock_print.call_args[0][0]
     assert "Judged 3 articles" in output
     assert "2 kept" in output
-    assert "1 removed as off-topic" in output
+    assert "1 off-topic, 0 stale, 0 stale & off-topic" in output
     assert deleted == 1
 
 
@@ -1992,6 +1992,158 @@ def test_judge_articles_reports_a_single_article_in_the_singular(tmp_path):
 
     assert "Judged 1 article:" in mock_print.call_args[0][0]
 
+
+# ---------------------------------------------------------------------------
+# stale articles — published more than MAX_ARTICLE_AGE_DAYS before the run
+# ---------------------------------------------------------------------------
+
+STALE_RUN = "2026-10-10T10:00:00+00:00"
+
+
+def _insert_dated(db_file, run_start, *articles):
+    """Insert (title, published_on) pairs fetched at run_start."""
+    with sqlite3.connect(db_file) as conn:
+        conn.executemany(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at, published_on)"
+            " VALUES (?,?,?,?,?,?)",
+            [
+                ("AI", t, f"http://x.com/{i}", f"About {t}.", run_start, pub)
+                for i, (t, pub) in enumerate(articles)
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "published_on, expected",
+    [
+        ("2026-10-01", 9),
+        ("2024-10-10", 730),
+        ("2026-07-09T15:41:12+00:00", 93),
+        ("2026-07-23T03:13:19Z", 79),
+        ("2026-07-10/", 92),
+        (None, None),
+        ("", None),
+        ("2026-XX-XX", None),
+        ("2025-12", None),
+        ("Opinion 3 days ago", None),
+    ],
+)
+def test_article_age_days(published_on, expected):
+    from news import agent as news_agent
+
+    assert news_agent._article_age_days(published_on, date(2026, 10, 10)) == expected
+
+
+def test_judge_articles_removes_stale_and_keeps_recent_or_undated(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    _insert_dated(
+        db_file,
+        STALE_RUN,
+        ("Recent", "2026-10-01"),
+        ("Boundary", "2026-07-12"),  # exactly 90 days: not stale
+        ("Old", "2024-10-10"),
+        ("Undated", None),
+    )
+    patcher, _ = _judge_client(0.9, 0.9, 0.9, 0.9)
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "MAX_ARTICLE_AGE_DAYS", 90), patcher:
+        removed = news_agent.judge_articles(["AI"], STALE_RUN)
+
+    assert removed == 1
+    assert _titles(db_file) == ["Recent", "Boundary", "Undated"]
+
+
+def test_judge_articles_counts_each_exclusion_reason(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    _insert_dated(
+        db_file,
+        STALE_RUN,
+        ("Kept", "2026-10-01"),
+        ("Off topic", "2026-10-01"),
+        ("Stale", "2025-01-01"),
+        ("Both", "2025-01-01"),
+    )
+    patcher, _ = _judge_client(0.9, 0.1, 0.9, 0.1)
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "MAX_ARTICLE_AGE_DAYS", 90), patcher, \
+         patch("news.agent.rprint") as mock_print:
+        removed = news_agent.judge_articles(["AI"], STALE_RUN)
+
+    assert removed == 3
+    assert _titles(db_file) == ["Kept"]
+    assert "1 off-topic, 1 stale, 1 stale & off-topic" in mock_print.call_args[0][0]
+    records = _read_metrics(news_agent.METRICS_PATH)
+    (step,) = [r for r in records if r.get("step") == "judge_articles"]
+    assert step["articles_deleted"] == 3
+    assert step["articles_off_topic"] == 1
+    assert step["articles_stale"] == 1
+    assert step["articles_stale_and_off_topic"] == 1
+    assert step["max_article_age_days"] == 90
+    excluded = [r for r in records if r["type"] == "article_excluded"]
+    assert [(r["title"], r["reason"]) for r in excluded] == [
+        ("Stale", "stale"),
+        ("Both", "stale_and_off_topic"),
+    ]
+
+
+def test_judge_articles_logs_and_prints_each_stale_exclusion(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    _insert_dated(db_file, STALE_RUN, ("Old News", "2024-10-10"))
+    patcher, _ = _judge_client(0.9)
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "MAX_ARTICLE_AGE_DAYS", 90), patcher, \
+         patch("news.agent.rprint") as mock_print:
+        news_agent.judge_articles(["AI"], STALE_RUN)
+
+    printed = [str(c.args[0]) for c in mock_print.call_args_list]
+    assert any(
+        "Excluded stale article (published 2024-10-10, 730 days old): Old News" in p
+        for p in printed
+    )
+    (record,) = [
+        r for r in _read_metrics(news_agent.METRICS_PATH)
+        if r["type"] == "article_excluded"
+    ]
+    assert record == {
+        "type": "article_excluded",
+        "run_id": STALE_RUN,
+        "reason": "stale",
+        "title": "Old News",
+        "url": "http://x.com/0",
+        "published_on": "2024-10-10",
+        "age_days": 730,
+        "max_age_days": 90,
+        "logged_at": record["logged_at"],
+    }
+
+
+def test_judge_articles_removes_stale_even_when_the_judge_call_fails(tmp_path):
+    """The judge fails open, but the date check needs no model and still applies."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    _insert_dated(db_file, STALE_RUN, ("Old", "2024-10-10"), ("New", "2026-10-01"))
+    patcher, _ = _judge_client(RuntimeError("down"), RuntimeError("down"))
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "MAX_ARTICLE_AGE_DAYS", 90), patcher:
+        removed = news_agent.judge_articles(["AI"], STALE_RUN)
+
+    assert removed == 1
+    assert _titles(db_file) == ["New"]
 
 # ---------------------------------------------------------------------------
 # yield accounting — new_articles must reflect what survived judging
