@@ -685,3 +685,98 @@ def test_yield_chart_flags_an_all_legacy_file():
     page = mr.render_html(mr.summarize(records))
 
     assert "these are found totals, not what remained stored" in page
+
+
+# ---------------------------------------------------------------------------
+# stale articles — deleted for being published before the age cutoff
+# ---------------------------------------------------------------------------
+
+
+def _excluded(title, reason="stale", age=400):
+    return {
+        "type": "article_excluded",
+        "run_id": "2026-10-10T10:00:00+00:00",
+        "reason": reason,
+        "title": title,
+        "url": "http://x.com/a",
+        "published_on": "2025-09-05",
+        "age_days": age,
+        "max_age_days": 90,
+    }
+
+
+def _stale_records():
+    return [
+        # A legacy run that never checked dates.
+        {**_step("judge_articles", articles_judged=50, articles_deleted=10),
+         "run_id": "r1"},
+        {**_step("run", new_articles=40), "run_id": "r1"},
+        {**_step("judge_articles", articles_judged=20, articles_deleted=6,
+                 articles_off_topic=3, articles_stale=2,
+                 articles_stale_and_off_topic=1, max_article_age_days=90),
+         "run_id": "r2"},
+        {**_step("run", new_articles=14), "run_id": "r2"},
+        _excluded("Old <one>"),
+        _excluded("Old two"),
+        _excluded("Old and off topic", reason="stale_and_off_topic"),
+    ]
+
+
+def test_stale_rate_counts_only_runs_that_checked_dates():
+    s = mr.summarize(_stale_records())["stale_articles"]
+
+    assert s["runs"] == 1
+    assert s["judged"] == 20  # the legacy run's 50 are not in the denominator
+    assert s["stale"] == 2
+    assert s["stale_and_off_topic"] == 1
+    assert s["total"] == 3
+    assert s["total_pct"] == pytest.approx(15.0)
+    assert s["max_age_days"] == 90
+    assert [r["title"] for r in s["recent"]] == [
+        "Old and off topic", "Old two", "Old <one>",
+    ]
+
+
+def test_stale_figure_and_kpi_reach_the_page():
+    page = mr.render_html(mr.summarize(_stale_records()))
+
+    assert "Old articles excluded" in page
+    assert "more than 90 days" in page
+    assert "1 earlier run predates the check" in page
+    assert "Old &lt;one&gt;" in page
+    assert "stale and off topic" in page
+    assert "15.0%" in page
+    assert "pruned (3 stale)" in page
+
+
+def test_stale_figure_absent_before_any_run_checked_dates(records):
+    summary = mr.summarize(records)
+    page = mr.render_html(summary)
+
+    assert summary["stale_articles"]["runs"] == 0
+    assert summary["stale_articles"]["max_age_days"] is None
+    assert "Old articles excluded" not in page
+    assert "articles checked for staleness" in page
+
+
+def test_stale_figure_without_skipped_runs_or_exclusions():
+    records = [
+        _step("judge_articles", articles_judged=5, articles_deleted=0,
+              articles_off_topic=0, articles_stale=0,
+              articles_stale_and_off_topic=0, max_article_age_days=90),
+        _step("run", new_articles=5),
+    ]
+    page = mr.render_html(mr.summarize(records))
+
+    assert "Old articles excluded" in page
+    assert "predate" not in page
+    assert "<th>title</th>" not in page
+
+
+def test_stale_caption_pluralizes_skipped_runs():
+    records = _stale_records() + [
+        {**_step("run", new_articles=1), "run_id": "r0"},
+    ]
+    page = mr.render_html(mr.summarize(records))
+
+    assert "2 earlier runs predate the check and are left out" in page
