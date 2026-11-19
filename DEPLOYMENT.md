@@ -1,7 +1,8 @@
 # Deployment Guide
 
-Single EC2 instance running the Go web app + the news-fetching agent side by side,
-sharing a SQLite database at `/opt/news/data/news.db`.
+A single EC2 instance runs the Go web app (`web/`) and serves a SQLite database at
+`/opt/news/data/news.db`. The news agent (`agent/`) runs on a separate GPU box and the
+database is synced to EC2.
 
 ## Architecture
 
@@ -9,8 +10,8 @@ sharing a SQLite database at `/opt/news/data/news.db`.
 Internet → Elastic IP → Nginx (:80/:443) → news_site binary (:8080)
                                            ↕ reads
                                         /opt/news/data/news.db
-                                           ↑ writes
-                                        news-fetching agent (cron / systemd)
+                                           ↑ rsync (scripts/sync-db.sh)
+                                        GPU box: agent/ (cron) → local news_data.db
 ```
 
 ## Prerequisites
@@ -132,19 +133,14 @@ If you need to deploy outside of CI (e.g., for a hotfix without a PR):
 make deploy DEPLOY_HOST=robot-overlord.news
 ```
 
-## Deploying the News-Fetching Agent
+## The News Agent
 
-The agent that populates the database runs on the same EC2 instance. Deploy it however
-makes sense for that project (likely a Python venv + cron job or its own systemd service).
+The agent (`agent/`) needs about 11 GB of GPU for its local Ollama models, so it **does not run on the
+EC2 instance** (a t3.micro). It runs on a GPU box via cron and writes to a local
+`news_data.db`. `scripts/sync-db.sh` (or the `robot-overlord-news-deploy-db` skill) then
+copies that file to `/opt/news/data/news.db` and restarts the web service.
 
-The agent should write to `/opt/news/data/news.db`. The Go web app opens this file
-read-only with WAL mode, so concurrent reads during a write are safe.
-
-Example cron entry to run the agent hourly (edit with `crontab -e` as the `ec2-user`):
-
-```cron
-0 * * * * /home/ec2-user/langchain-agent/run.sh >> /var/log/news-agent.log 2>&1
-```
+See `agent/README.md` for setup. The schema both sides depend on is `schema.sql`.
 
 ## Useful Commands
 

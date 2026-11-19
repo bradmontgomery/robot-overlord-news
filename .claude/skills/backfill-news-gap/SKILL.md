@@ -7,7 +7,7 @@ description: Backfill missing days in the news agent's SQLite database (news_dat
 
 ## Why this is needed
 
-`src/news/agent.py` stores each article's `fetched_at` (when the agent ran) separately
+`agent/src/news/agent.py` stores each article's `fetched_at` (when the agent ran) separately
 from `published_on` (when the article was actually published). If the agent doesn't run
 on a given day — cron didn't fire, the box was down, whatever — no rows get `fetched_at`
 on that date, and it looks like a gap.
@@ -34,8 +34,9 @@ the wrong rows corrupts history and there's no clean way to detect that after th
 
 ## Procedure
 
-1. **Confirm the DB path.** Use `$NEWS_DB_PATH` if set, otherwise `news_data.db` in the
-   repo root. (Note: `CLAUDE.md` documents the env var's default as `news_results.db`,
+1. **Confirm the DB path.** Use `$NEWS_DB_PATH` if set, otherwise `news_data.db` in
+   `agent/`. Until the GPU box's cron is pointed at this repo, the live file may still be in
+   the old `langchain_simple_demo` checkout; if both exist, ask which one. (Note: `agent/CLAUDE.md` documents the env var's default as `news_results.db`,
    but the actual file used in this repo has always been `news_data.db` — trust what's on
    disk over the doc.)
 
@@ -89,7 +90,7 @@ the wrong rows corrupts history and there's no clean way to detect that after th
    a date and upserts into `news_summaries`:
 
    ```bash
-   uv run python -m src.news.agent --summarize --day YYYY-MM-DD
+   cd agent && PYTHONPATH=src uv run python src/news/agent.py --summarize --day YYYY-MM-DD
    ```
 
    Run this once per missing date.
