@@ -1,0 +1,37 @@
+# Copy to .envrc and fill in your values. Never commit .envrc.
+# Usage: cp .envrc.example .envrc && direnv allow  (or: source .envrc)
+
+# --- LangSmith tracing ---
+# Tracing is fully automatic for LangGraph when these vars are set.
+# No code changes needed — just set these and all runs appear in LangSmith.
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY=your_key_here
+export LANGSMITH_PROJECT=news-agent   # groups runs in the UI
+
+# --- Web search (optional) ---
+# If set, the news agent uses Tavily (better quality) instead of DuckDuckGo.
+# Get a free key at https://tavily.com
+# export TAVILY_API_KEY=your_key_here
+
+# --- News relevance judge (Noul decision model served by Ollama, needs Ollama 0.35+) ---
+# Run `ollama pull nimble` first. One request per article; deletes articles scoring below the threshold.
+# export TYPESAFE_BASE_URL=http://localhost:11434
+# export TYPESAFE_API_KEY=ollama
+# export TYPESAFE_DEFAULT_MODEL=nimble:latest
+# export JUDGE_THRESHOLD=0.5
+# Delete articles published more than this many days before the run (date check, no model).
+# export NEWS_MAX_ARTICLE_AGE_DAYS=90
+
+# --- Ollama (optional) ---
+# Only needed if your Ollama server isn't at the default localhost:11434
+# export OLLAMA_HOST=http://localhost:11434
+# Change the model (default: gemma4:latest). Try qwen2.5:latest if tool calls misbehave.
+# export OLLAMA_MODEL=gemma4:latest
+# Override the model used only for daily summarization (default: ministral-3:8b).
+# export SUMMARY_MODEL=ministral-3:8b
+# Context window for the summary model (default: 49152; ministral-3:8b holds 48k on a 16 GB GPU).
+# export SUMMARY_NUM_CTX=49152
+
+# --- Storage ---
+# Point this at the same file the web app reads via NEWS_DB.
+# export NEWS_DB_PATH=news_data.db

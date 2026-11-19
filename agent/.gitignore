@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+news_metrics.jsonl
+news_metrics_report.html
+news_failures/
