@@ -1,5 +1,5 @@
 # Binary output
-news_site
+web/news_site
 
 # Go build cache
 *.test

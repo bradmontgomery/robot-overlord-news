@@ -19,8 +19,8 @@ cd /home/brad/projects/robot-overlord-news && make deploy
 ```
 
 This single command:
-- Builds the Go binary (`go build`)
-- rsyncs the binary, `templates/`, and `static/` to `/opt/news/` on the server
+- Builds the Go binary in `web/` (root Makefile delegates to `web/Makefile`)
+- rsyncs the binary (templates and static assets are embedded) to `/opt/news/` on the server
 - Restarts the `news` systemd service
 - Prints service status
 

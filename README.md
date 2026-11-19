@@ -33,7 +33,7 @@ binary, so deployment is a single file with no runtime dependencies.
 ## Setup
 
 ```bash
-go build -o news_site .
+cd web && go build -o news_site .
 NEWS_DB=/path/to/news_data.db ./news_site
 ```
 
