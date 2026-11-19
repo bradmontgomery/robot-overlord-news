@@ -1,0 +1,2197 @@
+import os
+import sqlite3
+from datetime import date, datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
+
+
+@pytest.fixture(autouse=True)
+def _isolate_metrics_path(tmp_path, monkeypatch):
+    """Redirect every test's metrics writes to a scratch file, never the repo root."""
+    from news import agent as news_agent
+
+    monkeypatch.setattr(news_agent, "METRICS_PATH", str(tmp_path / "metrics.jsonl"))
+    monkeypatch.setattr(news_agent, "FAILURE_DIR", str(tmp_path / "failures"))
+    # The topic context is a ContextVar shared across the whole process; without this
+    # a run() test leaks its run_id into every test that follows.
+    token = news_agent._TOPIC_CONTEXT.set({})
+    yield
+    news_agent._TOPIC_CONTEXT.reset(token)
+
+
+def _read_metrics(path) -> list[dict]:
+    import json
+
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+# ---------------------------------------------------------------------------
+# metrics helpers
+# ---------------------------------------------------------------------------
+
+
+def test_llm_perf_fields_extracts_usage_and_timing():
+    from news.agent import _llm_perf_fields
+
+    response = AIMessage(
+        content="hi",
+        usage_metadata={"input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
+        response_metadata={
+            "load_duration": 1_000_000,
+            "prompt_eval_duration": 2_000_000_000,
+            "eval_duration": 5_000_000_000,
+            "total_duration": 8_000_000,
+            "done_reason": "stop",
+        },
+    )
+    fields = _llm_perf_fields(response)
+    assert fields["input_tokens"] == 100
+    assert fields["output_tokens"] == 50
+    assert fields["total_tokens"] == 150
+    assert fields["load_duration_ns"] == 1_000_000
+    assert fields["eval_duration_ns"] == 5_000_000_000
+    assert fields["done_reason"] == "stop"
+    assert fields["tokens_per_sec"] == 10.0  # 50 tokens / 5s
+
+
+def test_llm_perf_fields_handles_missing_usage_metadata():
+    from news.agent import _llm_perf_fields
+
+    response = AIMessage(content="hi")  # usage_metadata=None, response_metadata={}
+    fields = _llm_perf_fields(response)
+    assert fields["input_tokens"] is None
+    assert fields["tokens_per_sec"] is None
+    assert fields["done_reason"] is None
+
+
+def test_llm_perf_fields_handles_bare_mock_response():
+    from news.agent import _llm_perf_fields
+
+    fields = _llm_perf_fields(MagicMock())
+    assert fields == {
+        "input_tokens": None, "output_tokens": None, "total_tokens": None,
+        "load_duration_ns": None, "prompt_eval_duration_ns": None,
+        "eval_duration_ns": None, "total_duration_ns": None,
+        "tokens_per_sec": None, "done_reason": None,
+    }
+
+
+def test_llm_perf_fields_handles_none_response():
+    from news.agent import _llm_perf_fields
+
+    fields = _llm_perf_fields(None)
+    assert fields["input_tokens"] is None
+
+
+# ---------------------------------------------------------------------------
+# init_db
+# ---------------------------------------------------------------------------
+
+
+def test_init_db_creates_table(tmp_path):
+    from news.agent import init_db
+
+    db_file = str(tmp_path / "test.db")
+    init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='news_results'"
+        ).fetchall()
+    assert tables == [("news_results",)]
+
+
+def test_init_db_idempotent(tmp_path):
+    from news.agent import init_db
+
+    db_file = str(tmp_path / "test.db")
+    init_db(db_file)
+    init_db(db_file)  # second call must not raise
+
+
+def test_init_db_deduplicates_existing_rows(tmp_path):
+    from news.agent import init_db
+
+    db_file = str(tmp_path / "test.db")
+    # Simulate a pre-existing DB without the unique index (plain inserts, duplicates allowed)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("""
+            CREATE TABLE news_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL, title TEXT, url TEXT, summary TEXT, fetched_at TEXT NOT NULL
+            )
+        """)
+        conn.executemany(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            [
+                ("AI", "Article", "http://dup.com", "s", "2026-01-01T00:00:00"),
+                ("AI", "Article", "http://dup.com", "s", "2026-01-02T00:00:00"),  # duplicate
+                ("AI", "Unique", "http://unique.com", "s", "2026-01-01T00:00:00"),
+            ],
+        )
+    init_db(db_file)  # must not raise
+    with sqlite3.connect(db_file) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM news_results").fetchone()[0]
+    assert count == 2  # duplicate removed, unique row kept
+
+
+def test_init_db_creates_unique_index(tmp_path):
+    from news.agent import init_db
+
+    db_file = str(tmp_path / "test.db")
+    init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        indexes = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_news_url'"
+        ).fetchall()
+    assert indexes == [("idx_news_url",)]
+
+
+def test_init_db_adds_published_on_to_existing_db(tmp_path):
+    from news.agent import init_db
+
+    db_file = str(tmp_path / "test.db")
+    # Simulate a DB without published_on (old schema)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("""
+            CREATE TABLE news_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL, title TEXT, url TEXT, summary TEXT, fetched_at TEXT NOT NULL
+            )
+        """)
+    init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(news_results)").fetchall()]
+    assert "published_on" in cols
+
+
+def test_init_db_adds_model_name_to_existing_news_results(tmp_path):
+    from news.agent import init_db
+
+    db_file = str(tmp_path / "test.db")
+    # Simulate a DB without model_name (old schema)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("""
+            CREATE TABLE news_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL, title TEXT, url TEXT, summary TEXT, fetched_at TEXT NOT NULL
+            )
+        """)
+    init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(news_results)").fetchall()]
+    assert "model_name" in cols
+
+
+def test_init_db_adds_model_name_to_existing_news_summaries(tmp_path):
+    from news.agent import init_db
+
+    db_file = str(tmp_path / "test.db")
+    # Simulate a DB with news_summaries but without model_name (old schema)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("""
+            CREATE TABLE news_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL UNIQUE, summary TEXT NOT NULL, created_at TEXT NOT NULL
+            )
+        """)
+    init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(news_summaries)").fetchall()]
+    assert "model_name" in cols
+
+
+def test_init_db_creates_news_summaries_table(tmp_path):
+    from news.agent import init_db
+
+    db_file = str(tmp_path / "test.db")
+    init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='news_summaries'"
+        ).fetchall()
+    assert tables == [("news_summaries",)]
+
+
+# ---------------------------------------------------------------------------
+# store_result tool
+# ---------------------------------------------------------------------------
+
+
+def test_store_result_inserts_row(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "test.db")
+    news_agent.init_db(db_file)
+    with patch.object(news_agent, "DB_PATH", db_file):
+        result = news_agent.store_result.invoke(
+            {"topic": "AI", "title": "Test Article", "url": "http://example.com", "summary": "Short summary."}
+        )
+    assert "Test Article" in result
+    with sqlite3.connect(db_file) as conn:
+        rows = conn.execute("SELECT topic, title, url, summary FROM news_results").fetchall()
+    assert rows == [("ai", "Test Article", "http://example.com", "Short summary.")]
+
+
+def test_store_result_stores_published_on(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "test.db")
+    news_agent.init_db(db_file)
+    with patch.object(news_agent, "DB_PATH", db_file):
+        news_agent.store_result.invoke(
+            {"topic": "AI", "title": "Dated Article", "url": "http://dated.com",
+             "summary": "s", "published_on": "2026-06-16"}
+        )
+    with sqlite3.connect(db_file) as conn:
+        pub = conn.execute("SELECT published_on FROM news_results").fetchone()[0]
+    assert pub == "2026-06-16"
+
+
+def test_store_result_published_on_none_when_omitted(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "test.db")
+    news_agent.init_db(db_file)
+    with patch.object(news_agent, "DB_PATH", db_file):
+        news_agent.store_result.invoke(
+            {"topic": "AI", "title": "No Date", "url": "http://nodate.com", "summary": "s"}
+        )
+    with sqlite3.connect(db_file) as conn:
+        pub = conn.execute("SELECT published_on FROM news_results").fetchone()[0]
+    assert pub is None
+
+
+def test_store_result_stores_model_name(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "test.db")
+    news_agent.init_db(db_file)
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "MODEL_NAME", "test-model:latest"):
+        news_agent.store_result.invoke(
+            {"topic": "AI", "title": "T", "url": "http://example.com", "summary": "s"}
+        )
+    with sqlite3.connect(db_file) as conn:
+        model_name = conn.execute("SELECT model_name FROM news_results").fetchone()[0]
+    assert model_name == "test-model:latest"
+
+
+def test_store_result_deduplicates_by_url(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "test.db")
+    news_agent.init_db(db_file)
+    with patch.object(news_agent, "DB_PATH", db_file):
+        news_agent.store_result.invoke(
+            {"topic": "AI", "title": "Article", "url": "http://example.com", "summary": "s"}
+        )
+        result = news_agent.store_result.invoke(
+            {"topic": "AI", "title": "Article", "url": "http://example.com", "summary": "s"}
+        )
+    assert "Skipped" in result
+    with sqlite3.connect(db_file) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM news_results").fetchone()[0]
+    assert count == 1
+
+
+def test_store_result_allows_different_urls(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "test.db")
+    news_agent.init_db(db_file)
+    with patch.object(news_agent, "DB_PATH", db_file):
+        news_agent.store_result.invoke(
+            {"topic": "AI", "title": "Article A", "url": "http://a.com", "summary": "s"}
+        )
+        news_agent.store_result.invoke(
+            {"topic": "AI", "title": "Article B", "url": "http://b.com", "summary": "s"}
+        )
+    with sqlite3.connect(db_file) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM news_results").fetchone()[0]
+    assert count == 2
+
+
+def test_store_result_sets_fetched_at(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "test.db")
+    news_agent.init_db(db_file)
+    with patch.object(news_agent, "DB_PATH", db_file):
+        news_agent.store_result.invoke(
+            {"topic": "t", "title": "T", "url": "u", "summary": "s"}
+        )
+    with sqlite3.connect(db_file) as conn:
+        fetched_at = conn.execute("SELECT fetched_at FROM news_results").fetchone()[0]
+    assert fetched_at  # non-empty ISO string
+
+
+def test_store_result_lowercases_topic(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "test.db")
+    news_agent.init_db(db_file)
+    with patch.object(news_agent, "DB_PATH", db_file):
+        news_agent.store_result.invoke(
+            {"topic": "Nvidia", "title": "T", "url": "http://example.com", "summary": "s"}
+        )
+    with sqlite3.connect(db_file) as conn:
+        topic = conn.execute("SELECT topic FROM news_results").fetchone()[0]
+    assert topic == "nvidia"
+
+
+def test_store_result_normalizes_multi_topic(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "test.db")
+    news_agent.init_db(db_file)
+    with patch.object(news_agent, "DB_PATH", db_file):
+        news_agent.store_result.invoke(
+            {"topic": "Anthropic,  Claude Code", "title": "T", "url": "http://example.com", "summary": "s"}
+        )
+    with sqlite3.connect(db_file) as conn:
+        topic = conn.execute("SELECT topic FROM news_results").fetchone()[0]
+    assert topic == "anthropic, claude code"
+
+
+# ---------------------------------------------------------------------------
+# _make_search_tool
+# ---------------------------------------------------------------------------
+
+
+def _fake_underlying_tool(result=None, error=None):
+    """A stand-in for a community search tool, with a real name/description/schema.
+
+    `_instrument_tool` copies args_schema onto a StructuredTool, which rejects a
+    MagicMock — so the double has to carry a genuine pydantic schema.
+    """
+    from pydantic import BaseModel
+
+    class _Args(BaseModel):
+        query: str
+
+    underlying = MagicMock()
+    underlying.name = "duckduckgo_results_json"
+    underlying.description = "Search the web for news."
+    underlying.args_schema = _Args
+    if error is not None:
+        underlying.invoke.side_effect = error
+    else:
+        underlying.invoke.return_value = result
+    return underlying
+
+
+def test_make_search_tool_duckduckgo():
+    """The wrapper must be transparent: same name, description and schema."""
+    from langchain_community.tools import DuckDuckGoSearchResults
+
+    from news.agent import _make_search_tool
+
+    env = {k: v for k, v in os.environ.items() if k != "TAVILY_API_KEY"}
+    with patch.dict(os.environ, env, clear=True):
+        tool = _make_search_tool()
+
+    reference = DuckDuckGoSearchResults(
+        backend="news", output_format="list", max_results=5
+    )
+    # The schema bound to the model must be byte-identical to the unwrapped tool's —
+    # renaming it could change tool-call reliability and confound the failure rate
+    # this instrumentation exists to measure.
+    assert tool.name == reference.name
+    assert tool.description == reference.description
+    assert tool.args_schema is reference.args_schema
+
+
+def test_instrumented_tool_logs_result_count(tmp_path):
+    """A successful call records how many results came back — including zero."""
+    from news import agent as news_agent
+
+    tool = news_agent._instrument_tool(_fake_underlying_tool(result=[]))
+    tool.invoke({"query": "anthropic"})
+
+    calls = [
+        r for r in _read_metrics(news_agent.METRICS_PATH) if r.get("type") == "tool_call"
+    ]
+    assert calls and calls[-1]["success"] is True
+    # Zero results is not an error, and was previously indistinguishable from a tool
+    # that was never called at all.
+    assert calls[-1]["result_count"] == 0
+    assert calls[-1]["query"] == "anthropic"
+
+
+def test_instrumented_tool_logs_failure_and_reraises(tmp_path):
+    """Tool exceptions are recorded, then re-raised so ToolNode still recovers."""
+    from news import agent as news_agent
+
+    tool = news_agent._instrument_tool(
+        _fake_underlying_tool(error=RuntimeError("no results"))
+    )
+    with pytest.raises(Exception):
+        tool.invoke({"query": "openai"})
+
+    calls = [
+        r for r in _read_metrics(news_agent.METRICS_PATH) if r.get("type") == "tool_call"
+    ]
+    assert calls[-1]["success"] is False
+    assert calls[-1]["error_type"] == "RuntimeError"
+
+
+def test_make_search_tool_tavily():
+    from news.agent import _make_search_tool
+
+    mock_cls = MagicMock()
+    mock_instance = _fake_underlying_tool(result=[])
+    mock_instance.name = "tavily_search_results_json"
+    mock_cls.return_value = mock_instance
+    with patch.dict(os.environ, {"TAVILY_API_KEY": "test-key"}), \
+         patch("langchain_community.tools.tavily_search.TavilySearchResults", mock_cls):
+        tool = _make_search_tool()
+    mock_cls.assert_called_once_with(max_results=5)
+    assert tool.name == "tavily_search_results_json"
+
+
+# ---------------------------------------------------------------------------
+# _handle_tool_error
+# ---------------------------------------------------------------------------
+
+
+def test_handle_tool_error_logs_and_returns_message():
+    from news import agent as news_agent
+
+    with patch("news.agent.rprint") as mock_print:
+        result = news_agent._handle_tool_error(Exception("No results found."))
+
+    assert "No results found." in result
+    assert result  # non-empty message keeps the ReAct loop going
+    mock_print.assert_called_once()
+    logged = mock_print.call_args[0][0]
+    assert "No results found." in logged
+
+
+# ---------------------------------------------------------------------------
+# should_continue
+# ---------------------------------------------------------------------------
+
+
+def test_should_continue_with_tool_calls():
+    from langgraph.graph import END
+    from news.agent import should_continue
+
+    msg = AIMessage(content="", tool_calls=[{"name": "store_result", "args": {}, "id": "1", "type": "tool_call"}])
+    result = should_continue({"messages": [msg]})
+    assert result == "tools"
+
+
+def test_should_continue_without_tool_calls():
+    from langgraph.graph import END
+    from news.agent import should_continue
+
+    msg = AIMessage(content="Done.")
+    result = should_continue({"messages": [msg]})
+    assert result == END
+
+
+def test_should_continue_empty_tool_calls():
+    from langgraph.graph import END
+    from news.agent import should_continue
+
+    msg = AIMessage(content="Done.", tool_calls=[])
+    result = should_continue({"messages": [msg]})
+    assert result == END
+
+
+def _search_call(i):
+    return {"name": "duckduckgo_results_json", "args": {}, "id": str(i), "type": "tool_call"}
+
+
+def test_should_continue_allows_searches_up_to_cap():
+    from news.agent import MAX_SEARCHES_PER_TOPIC, should_continue
+
+    msgs = [AIMessage(content="", tool_calls=[_search_call(i)]) for i in range(MAX_SEARCHES_PER_TOPIC)]
+    assert should_continue({"messages": msgs}) == "tools"
+
+
+def test_should_continue_ends_when_search_cap_exceeded():
+    from langgraph.graph import END
+    from news.agent import MAX_SEARCHES_PER_TOPIC, should_continue
+
+    msgs = [AIMessage(content="", tool_calls=[_search_call(i)]) for i in range(MAX_SEARCHES_PER_TOPIC + 1)]
+    assert should_continue({"messages": msgs}) == END
+
+
+def test_should_continue_store_calls_do_not_count_toward_cap():
+    from news.agent import MAX_SEARCHES_PER_TOPIC, should_continue
+
+    store = {"name": "store_result", "args": {}, "id": "s", "type": "tool_call"}
+    msgs = [AIMessage(content="", tool_calls=[store]) for _ in range(MAX_SEARCHES_PER_TOPIC + 5)]
+    assert should_continue({"messages": msgs}) == "tools"
+
+
+# ---------------------------------------------------------------------------
+# build_graph
+# ---------------------------------------------------------------------------
+
+
+def test_build_graph_duckduckgo():
+    from news.agent import build_graph
+
+    mock_model = MagicMock()
+    mock_model.bind_tools.return_value = mock_model
+    with patch("news.agent.ChatOllama", return_value=mock_model), \
+         patch("news.agent.ToolNode"), \
+         patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "TAVILY_API_KEY"}, clear=True):
+        graph = build_graph()
+    assert graph is not None
+
+
+def test_build_graph_tavily():
+    from news.agent import build_graph
+
+    mock_model = MagicMock()
+    mock_model.bind_tools.return_value = mock_model
+    mock_tavily_cls = MagicMock()
+    mock_tavily_cls.return_value = _fake_underlying_tool(result=[])
+    with patch("news.agent.ChatOllama", return_value=mock_model), \
+         patch("news.agent.ToolNode"), \
+         patch.dict(os.environ, {"TAVILY_API_KEY": "test-key"}), \
+         patch("langchain_community.tools.tavily_search.TavilySearchResults", mock_tavily_cls):
+        graph = build_graph()
+    assert graph is not None
+
+
+def test_build_graph_agent_node_invokes_model():
+    """Verify agent_node prepends system message and calls model.invoke."""
+    from news import agent as news_agent
+    from news.agent import build_graph
+
+    mock_response = AIMessage(content="done")
+    mock_model = MagicMock()
+    mock_model.bind_tools.return_value = mock_model
+    mock_model.invoke.return_value = mock_response
+
+    with patch("news.agent.ChatOllama", return_value=mock_model), \
+         patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "TAVILY_API_KEY"}, clear=True):
+        graph = build_graph(run_id="run-123")
+
+    # Invoke the graph — model returns AIMessage with no tool_calls so it terminates
+    result = graph.invoke({"messages": [HumanMessage("test")]})
+    mock_model.invoke.assert_called_once()
+    call_args = mock_model.invoke.call_args[0][0]
+    # First message must be the system prompt
+    from langchain_core.messages import SystemMessage
+    assert isinstance(call_args[0], SystemMessage)
+    assert "news research agent" in call_args[0].content
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    llm_calls = [r for r in records if r["type"] == "llm_call" and r["step"] == "agent_step"]
+    assert len(llm_calls) == 1
+    assert llm_calls[0]["run_id"] == "run-123"
+    assert llm_calls[0]["tool_call_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# run()
+# ---------------------------------------------------------------------------
+
+
+def test_run_returns_zero_when_no_articles_stored(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "run_test.db")
+
+    mock_app = MagicMock()
+    mock_app.invoke.return_value = {}
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles"), \
+         patch("news.agent.summarize_day"):
+        count, _ = news_agent.run(["topic1"])
+
+    mock_app.invoke.assert_called_once()
+    assert count == 0
+
+
+def test_run_returns_count_of_new_articles(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "run_rows.db")
+    news_agent.init_db(db_file)
+
+    def fake_invoke(messages, config=None):
+        # Simulate the agent storing a row during the run (current timestamp)
+        from datetime import datetime, timezone
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(db_file) as conn:
+            conn.execute(
+                "INSERT INTO news_results (topic, title, url, summary, fetched_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                ("AI", "Headline", "http://x.com", "Summary.", fetched_at),
+            )
+        return {}
+
+    mock_app = MagicMock()
+    mock_app.invoke.side_effect = fake_invoke
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles"), \
+         patch("news.agent.summarize_day"):
+        count, _ = news_agent.run(["AI"])
+
+    assert count == 1
+
+
+def test_run_searches_one_topic_entry_per_invoke(tmp_path):
+    """Each topic entry gets its own invoke; entries are never combined."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "batch.db")
+    mock_app = MagicMock()
+    mock_app.invoke.return_value = {}
+    topics = [f"topic{i}" for i in range(20)]
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles") as mock_judge, \
+         patch("news.agent.summarize_day") as mock_summarize:
+        news_agent.run(topics)
+
+    assert mock_app.invoke.call_count == 20
+    first_prompt = mock_app.invoke.call_args_list[0].args[0]["messages"][0].content
+    assert "topic0" in first_prompt
+    assert "topic1" not in first_prompt  # other entries are not in the same prompt
+    # judge + summarize still run once over the whole topic set
+    mock_judge.assert_called_once()
+    assert mock_judge.call_args[0][0] == topics
+    mock_summarize.assert_called_once()
+
+
+def test_run_logs_run_and_search_topic_metrics(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "metrics_run.db")
+    mock_app = MagicMock()
+    mock_app.invoke.return_value = {}
+    topics = [f"topic{i}" for i in range(20)]
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles"), \
+         patch("news.agent.summarize_day"):
+        news_agent.run(topics)
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    run_records = [r for r in records if r["type"] == "step" and r["step"] == "run"]
+    assert len(run_records) == 1
+    assert run_records[0]["topics"] == 20
+
+    search_records = [r for r in records if r["type"] == "step" and r["step"] == "search_topic"]
+    assert len(search_records) == 20
+    assert [r["topic_index"] for r in search_records] == list(range(20))
+    assert all(r["success"] for r in search_records)
+    assert {r["run_id"] for r in run_records + search_records} == {run_records[0]["run_id"]}
+
+
+def test_run_logs_failed_search_topic_metrics(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "metrics_run_fail.db")
+    mock_app = MagicMock()
+    mock_app.invoke.side_effect = RuntimeError("boom")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles"), \
+         patch("news.agent.summarize_day"):
+        news_agent.run(["topic1"])
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    search_records = [r for r in records if r["type"] == "step" and r["step"] == "search_topic"]
+    assert len(search_records) == 1
+    assert search_records[0]["success"] is False
+    assert "boom" in search_records[0]["error"]
+
+
+def test_run_continues_after_search_failure(tmp_path):
+    """A failed search is logged but the remaining topics still run."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "batch_fail.db")
+    mock_app = MagicMock()
+    mock_app.invoke.side_effect = [RuntimeError("boom"), {}, {}]
+    topics = [f"topic{i}" for i in range(3)]
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles"), \
+         patch("news.agent.summarize_day"), \
+         patch("news.agent.rprint") as mock_print:
+        count, _ = news_agent.run(topics)
+
+    assert mock_app.invoke.call_count == 3  # all topics attempted despite failure
+    assert count == 0
+    assert any("boom" in str(c.args[0]) for c in mock_print.call_args_list)
+
+
+def test_run_survives_invoke_failure(tmp_path):
+    """A failed app.invoke is logged and does not crash run(); judge+summarize still run."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "run_fail.db")
+    mock_app = MagicMock()
+    mock_app.invoke.side_effect = RuntimeError("graph blew up")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles") as mock_judge, \
+         patch("news.agent.summarize_day") as mock_summarize, \
+         patch("news.agent.rprint") as mock_print:
+        count, _ = news_agent.run(["AI"])
+
+    assert count == 0
+    mock_judge.assert_called_once()
+    mock_summarize.assert_called_once()
+    # the failure was logged
+    assert any("graph blew up" in str(c.args[0]) for c in mock_print.call_args_list)
+
+
+def test_run_calls_summarize_day(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "run_summarize.db")
+    mock_app = MagicMock()
+    mock_app.invoke.return_value = {}
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles"), \
+         patch("news.agent.summarize_day") as mock_summarize:
+        news_agent.run(["AI"])
+
+    mock_summarize.assert_called_once()
+    date_arg = mock_summarize.call_args[0][0]
+    assert len(date_arg) == 10  # YYYY-MM-DD
+
+
+def test_run_calls_judge_articles(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "run_judge.db")
+    mock_app = MagicMock()
+    mock_app.invoke.return_value = {}
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles") as mock_judge, \
+         patch("news.agent.summarize_day"):
+        news_agent.run(["AI", "climate"])
+
+    mock_judge.assert_called_once()
+    topics_arg, run_start_arg = mock_judge.call_args[0]
+    assert topics_arg == ["AI", "climate"]
+    assert len(run_start_arg) > 10  # ISO timestamp
+
+
+# ---------------------------------------------------------------------------
+# run_cli()
+# ---------------------------------------------------------------------------
+
+
+def test_run_cli_calls_print_summary():
+    from news import agent as news_agent
+
+    with patch("news.agent.run", return_value=(3, "briefing")), \
+         patch("news.agent._print_summary") as mock_summary, \
+         patch("news.agent._print_briefing") as mock_briefing, \
+         patch("news.agent.rprint"), \
+         patch("sys.argv", ["news_agent", "AI"]), \
+         patch.dict(os.environ, {"NEWS_INTERVAL": "0"}):
+        news_agent.run_cli()
+
+    mock_summary.assert_called_once_with(3, ["AI"])
+    mock_briefing.assert_called_once_with("briefing")
+
+
+def test_run_cli_no_results():
+    from news import agent as news_agent
+
+    with patch("news.agent.run", return_value=(0, None)), \
+         patch("news.agent._print_summary") as mock_summary, \
+         patch("news.agent._print_briefing"), \
+         patch("news.agent.rprint"), \
+         patch("sys.argv", ["news_agent", "AI"]), \
+         patch.dict(os.environ, {"NEWS_INTERVAL": "0"}):
+        news_agent.run_cli()
+
+    mock_summary.assert_called_once_with(0, ["AI"])
+
+
+def test_print_summary_new_articles():
+    from news import agent as news_agent
+
+    with patch("news.agent.rprint") as mock_print:
+        news_agent._print_summary(3, ["AI", "climate"])
+
+    mock_print.assert_called_once()
+    output = mock_print.call_args[0][0]
+    assert "3 new articles stored" in output
+    assert "AI, climate" in output
+
+
+def test_print_summary_singular():
+    from news import agent as news_agent
+
+    with patch("news.agent.rprint") as mock_print:
+        news_agent._print_summary(1, ["AI"])
+
+    output = mock_print.call_args[0][0]
+    assert "1 new article stored" in output
+    assert "articles" not in output
+
+
+def test_print_summary_no_results():
+    from news import agent as news_agent
+
+    with patch("news.agent.rprint") as mock_print:
+        news_agent._print_summary(0, ["AI"])
+
+    output = mock_print.call_args[0][0]
+    assert "No new articles" in output
+
+
+def test_print_briefing_renders():
+    from news import agent as news_agent
+    from rich.markdown import Markdown
+
+    with patch("news.agent.rprint") as mock_print:
+        news_agent._print_briefing("# Headlines\n\n- one\n- two")
+
+    # header line + the rendered Markdown
+    assert mock_print.call_count == 2
+    rendered = mock_print.call_args_list[1].args[0]
+    assert isinstance(rendered, Markdown)
+
+
+def test_print_briefing_none():
+    from news import agent as news_agent
+
+    with patch("news.agent.rprint") as mock_print:
+        news_agent._print_briefing(None)
+
+    mock_print.assert_not_called()
+
+
+def test_run_returns_summary(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "run_returns_summary.db")
+    mock_app = MagicMock()
+    mock_app.invoke.return_value = {}
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.build_graph", return_value=mock_app), \
+         patch("news.agent.judge_articles"), \
+         patch("news.agent.summarize_day", return_value="briefing text"):
+        count, summary = news_agent.run(["AI"])
+
+    assert count == 0
+    assert summary == "briefing text"
+
+
+def test_run_cli_default_topics():
+    from news import agent as news_agent
+
+    with patch("news.agent.run", return_value=(0, None)) as mock_run, \
+         patch("news.agent._print_summary"), \
+         patch("news.agent.rprint"), \
+         patch("sys.argv", ["news_agent"]), \
+         patch.dict(os.environ, {"NEWS_INTERVAL": "0"}):
+        news_agent.run_cli()
+
+    mock_run.assert_called_once_with(list(news_agent.DEFAULT_TOPICS))
+
+
+def test_run_cli_polls_on_interval():
+    from news import agent as news_agent
+
+    # sleep returns None on first call, then raises to exit the loop
+    with patch("news.agent.run", return_value=(0, None)) as mock_run, \
+         patch("news.agent._print_summary"), \
+         patch("news.agent.rprint"), \
+         patch("news.agent.time.sleep", side_effect=[None, KeyboardInterrupt]) as mock_sleep, \
+         patch("sys.argv", ["news_agent", "AI"]), \
+         patch.dict(os.environ, {"NEWS_INTERVAL": "60"}):
+        try:
+            news_agent.run_cli()
+        except KeyboardInterrupt:
+            pass
+
+    assert mock_run.call_count == 2
+    mock_sleep.assert_called_with(60)
+
+
+def test_run_cli_interval_zero_runs_once():
+    from news import agent as news_agent
+
+    with patch("news.agent.run", return_value=(0, None)) as mock_run, \
+         patch("news.agent._print_summary"), \
+         patch("news.agent.rprint"), \
+         patch("news.agent.time.sleep") as mock_sleep, \
+         patch("sys.argv", ["news_agent", "AI"]), \
+         patch.dict(os.environ, {"NEWS_INTERVAL": "0"}):
+        news_agent.run_cli()
+
+    mock_run.assert_called_once()
+    mock_sleep.assert_not_called()
+
+
+def test_run_cli_interval_unset_runs_once():
+    from news import agent as news_agent
+
+    env = {k: v for k, v in os.environ.items() if k != "NEWS_INTERVAL"}
+    with patch("news.agent.run", return_value=(0, None)) as mock_run, \
+         patch("news.agent._print_summary"), \
+         patch("news.agent.rprint"), \
+         patch("news.agent.time.sleep") as mock_sleep, \
+         patch("sys.argv", ["news_agent"]), \
+         patch.dict(os.environ, env, clear=True):
+        news_agent.run_cli()
+
+    mock_run.assert_called_once()
+    mock_sleep.assert_not_called()
+
+
+def test_run_cli_summarize_explicit_day():
+    from news import agent as news_agent
+
+    with patch("news.agent.summarize_day", return_value="The summary") as mock_sum, \
+         patch("news.agent.init_db") as mock_init, \
+         patch("news.agent.run") as mock_run, \
+         patch("news.agent.rprint") as mock_print, \
+         patch("sys.argv", ["news_agent", "--summarize", "--day", "2026-06-21"]):
+        news_agent.run_cli()
+
+    mock_sum.assert_called_once_with("2026-06-21", model=None, num_ctx=None)
+    mock_init.assert_called_once()
+    mock_run.assert_not_called()
+    mock_print.assert_called_once_with("The summary")
+
+
+def test_run_cli_summarize_passes_model_and_num_ctx():
+    from news import agent as news_agent
+
+    with patch("news.agent.summarize_day", return_value="s") as mock_sum, \
+         patch("news.agent.init_db"), \
+         patch("news.agent.rprint"), \
+         patch("sys.argv", ["news_agent", "--summarize", "--day", "2026-06-21",
+                            "--model", "qwen3.5:latest", "--num-ctx", "4096"]):
+        news_agent.run_cli()
+
+    mock_sum.assert_called_once_with("2026-06-21", model="qwen3.5:latest", num_ctx=4096)
+
+
+def test_run_cli_summarize_defaults_to_today_utc():
+    from news import agent as news_agent
+
+    expected = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with patch("news.agent.summarize_day", return_value="x") as mock_sum, \
+         patch("news.agent.init_db"), \
+         patch("news.agent.rprint"), \
+         patch("sys.argv", ["news_agent", "--summarize"]):
+        news_agent.run_cli()
+
+    mock_sum.assert_called_once_with(expected, model=None, num_ctx=None)
+
+
+def test_run_cli_summarize_no_articles():
+    from news import agent as news_agent
+
+    with patch("news.agent.summarize_day", return_value=None), \
+         patch("news.agent.init_db"), \
+         patch("news.agent.rprint") as mock_print, \
+         patch("sys.argv", ["news_agent", "--summarize", "--day", "2026-06-21"]):
+        news_agent.run_cli()
+
+    output = mock_print.call_args[0][0]
+    assert "No articles stored for 2026-06-21" in output
+
+
+def test_run_cli_summarize_unpadded_day():
+    from news import agent as news_agent
+
+    with patch("news.agent.summarize_day") as mock_sum, \
+         patch("news.agent.init_db") as mock_init, \
+         patch("sys.argv", ["news_agent", "--summarize", "--day", "2026-6-21"]):
+        with pytest.raises(SystemExit):
+            news_agent.run_cli()
+
+    mock_sum.assert_not_called()
+    mock_init.assert_not_called()
+
+
+def test_run_cli_summarize_unparseable_day():
+    from news import agent as news_agent
+
+    with patch("news.agent.summarize_day") as mock_sum, \
+         patch("news.agent.init_db") as mock_init, \
+         patch("sys.argv", ["news_agent", "--summarize", "--day", "notadate"]):
+        with pytest.raises(SystemExit):
+            news_agent.run_cli()
+
+    mock_sum.assert_not_called()
+    mock_init.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# summarize_day()
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_day_returns_none_when_no_articles(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+
+    with patch.object(news_agent, "DB_PATH", db_file):
+        result = news_agent.summarize_day("2026-06-16")
+
+    assert result is None
+
+
+def test_summarize_day_stores_summary(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "Headline", "http://h.com", "Short summary.", "2026-06-16T10:00:00+00:00"),
+        )
+
+    mock_model = MagicMock()
+    mock_model.invoke.return_value = MagicMock(content="Today AI dominated the news.")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model):
+        result = news_agent.summarize_day("2026-06-16", run_id="run-abc")
+
+    assert result == "Today AI dominated the news."
+    with sqlite3.connect(db_file) as conn:
+        row = conn.execute(
+            "SELECT date, summary, model_name FROM news_summaries WHERE date='2026-06-16'"
+        ).fetchone()
+    assert row == ("2026-06-16", "Today AI dominated the news.", news_agent.SUMMARY_MODEL_NAME)
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    llm_calls = [r for r in records if r["type"] == "llm_call" and r["step"] == "summarize_primary"]
+    assert len(llm_calls) == 1
+    assert llm_calls[0]["run_id"] == "run-abc"
+    assert llm_calls[0]["success"] is True
+
+    steps = [r for r in records if r["type"] == "step" and r["step"] == "summarize_day"]
+    assert len(steps) == 1
+    assert steps[0]["success"] is True
+    assert steps[0]["used_model"] == news_agent.SUMMARY_MODEL_NAME
+
+
+def test_summarize_day_upserts_on_rerun(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "Article", "http://a.com", "Summary.", "2026-06-16T10:00:00+00:00"),
+        )
+
+    mock_model = MagicMock()
+    mock_model.invoke.side_effect = [
+        MagicMock(content="First summary."),
+        MagicMock(content="Updated summary."),
+    ]
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model):
+        news_agent.summarize_day("2026-06-16")
+        news_agent.summarize_day("2026-06-16")
+
+    with sqlite3.connect(db_file) as conn:
+        rows = conn.execute("SELECT summary FROM news_summaries WHERE date='2026-06-16'").fetchall()
+    assert len(rows) == 1  # only one row due to UNIQUE constraint
+    assert rows[0][0] == "Updated summary."
+
+
+def test_summarize_day_passes_articles_to_model(tmp_path):
+    from news import agent as news_agent
+    from langchain_core.messages import HumanMessage as HM
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "Big Story", "http://b.com", "Details here.", "2026-06-16T12:00:00+00:00"),
+        )
+
+    mock_model = MagicMock()
+    mock_model.invoke.return_value = MagicMock(content="Summary text.")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model):
+        news_agent.summarize_day("2026-06-16")
+
+    call_messages = mock_model.invoke.call_args[0][0]
+    human_msg = call_messages[1]
+    assert "Big Story" in human_msg.content
+    assert "Details here." in human_msg.content
+
+
+def test_summarize_day_scopes_to_fetched_at_date(tmp_path):
+    """Only articles whose fetched_at falls on the target date are summarized."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.executemany(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            [
+                ("AI", "Today Story", "http://today.com", "Happened today.",
+                 "2026-06-16T12:00:00+00:00"),
+                ("AI", "Yesterday Story", "http://yest.com", "Happened yesterday.",
+                 "2026-06-15T23:59:00+00:00"),
+                ("AI", "Tomorrow Story", "http://tom.com", "Happens tomorrow.",
+                 "2026-06-17T00:01:00+00:00"),
+            ],
+        )
+
+    mock_model = MagicMock()
+    mock_model.invoke.return_value = MagicMock(content="Summary text.")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model):
+        news_agent.summarize_day("2026-06-16")
+
+    human_msg = mock_model.invoke.call_args[0][0][1]
+    assert "Today Story" in human_msg.content
+    # Adjacent days must be excluded by the fetched_at filter.
+    assert "Yesterday Story" not in human_msg.content
+    assert "Tomorrow Story" not in human_msg.content
+
+
+def test_summarize_day_uses_default_num_ctx(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "Story", "http://s.com", "Summary.", "2026-06-16T10:00:00+00:00"),
+        )
+
+    mock_model = MagicMock()
+    mock_model.invoke.return_value = MagicMock(content="Summary text.")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model) as mock_chat:
+        news_agent.summarize_day("2026-06-16")
+
+    _, kwargs = mock_chat.call_args
+    assert kwargs["model"] == news_agent.SUMMARY_MODEL_NAME
+    assert kwargs["num_ctx"] == news_agent.SUMMARY_NUM_CTX
+    # Prose gets room to vary; top_k/top_p are pinned rather than left to the server.
+    assert kwargs["temperature"] == news_agent.SUMMARY_TEMPERATURE
+    assert kwargs["top_k"] == news_agent.SUMMARY_TOP_K
+    assert kwargs["top_p"] == news_agent.SUMMARY_TOP_P
+
+
+def test_summarize_day_model_and_num_ctx_override(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "Story", "http://s.com", "Summary.", "2026-06-16T10:00:00+00:00"),
+        )
+
+    mock_model = MagicMock()
+    mock_model.invoke.return_value = MagicMock(content="Summary text.")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch("news.agent.ChatOllama", return_value=mock_model) as mock_chat:
+        news_agent.summarize_day("2026-06-16", model="qwen3.5:latest", num_ctx=8192)
+
+    _, kwargs = mock_chat.call_args
+    assert kwargs["model"] == "qwen3.5:latest"
+    assert kwargs["num_ctx"] == 8192
+
+
+def test_summarize_day_falls_back_to_model_name(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "Story", "http://s.com", "Summary.", "2026-06-16T10:00:00+00:00"),
+        )
+
+    failing_model = MagicMock()
+    failing_model.invoke.side_effect = Exception("model not found")
+    working_model = MagicMock()
+    working_model.invoke.return_value = MagicMock(content="Fallback summary.")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "SUMMARY_MODEL_NAME", "missing-model"), \
+         patch.object(news_agent, "MODEL_NAME", "fallback-model"), \
+         patch("news.agent.ChatOllama", side_effect=[failing_model, working_model]):
+        result = news_agent.summarize_day("2026-06-16")
+
+    assert result == "Fallback summary."
+    with sqlite3.connect(db_file) as conn:
+        model_name = conn.execute(
+            "SELECT model_name FROM news_summaries WHERE date='2026-06-16'"
+        ).fetchone()[0]
+    assert model_name == "fallback-model"
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    primary_calls = [r for r in records if r["type"] == "llm_call" and r["step"] == "summarize_primary"]
+    fallback_calls = [r for r in records if r["type"] == "llm_call" and r["step"] == "summarize_fallback"]
+    assert len(primary_calls) == 1
+    assert primary_calls[0]["success"] is False
+    assert len(fallback_calls) == 1
+    assert fallback_calls[0]["success"] is True
+    assert fallback_calls[0]["model"] == "fallback-model"
+
+
+def test_summarize_day_empty_primary_falls_back(tmp_path):
+    """An empty/whitespace primary response triggers the MODEL_NAME fallback + a warning."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "Story", "http://s.com", "Summary.", "2026-06-16T10:00:00+00:00"),
+        )
+
+    empty_model = MagicMock()
+    empty_model.invoke.return_value = MagicMock(content="   \n")  # whitespace only
+    working_model = MagicMock()
+    working_model.invoke.return_value = MagicMock(content="Fallback summary.")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "SUMMARY_MODEL_NAME", "primary-model"), \
+         patch.object(news_agent, "MODEL_NAME", "fallback-model"), \
+         patch("news.agent.ChatOllama", side_effect=[empty_model, working_model]), \
+         patch("news.agent.rprint") as mock_print:
+        result = news_agent.summarize_day("2026-06-16")
+
+    assert result == "Fallback summary."
+    assert any("falling back" in str(c.args[0]) for c in mock_print.call_args_list)
+    # the blank is never persisted — the stored row is the fallback text
+    with sqlite3.connect(db_file) as conn:
+        stored = conn.execute(
+            "SELECT summary FROM news_summaries WHERE date='2026-06-16'"
+        ).fetchone()[0]
+    assert stored == "Fallback summary."
+
+
+def test_summarize_day_returns_none_when_all_models_empty(tmp_path):
+    """If primary and fallback both return empty, store nothing and return None."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "Story", "http://s.com", "Summary.", "2026-06-16T10:00:00+00:00"),
+        )
+
+    empty_model = MagicMock()
+    empty_model.invoke.return_value = MagicMock(content="")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "SUMMARY_MODEL_NAME", "primary-model"), \
+         patch.object(news_agent, "MODEL_NAME", "fallback-model"), \
+         patch("news.agent.ChatOllama", return_value=empty_model), \
+         patch("news.agent.rprint") as mock_print:
+        result = news_agent.summarize_day("2026-06-16")
+
+    assert result is None
+    with sqlite3.connect(db_file) as conn:
+        rows = conn.execute(
+            "SELECT * FROM news_summaries WHERE date='2026-06-16'"
+        ).fetchall()
+    assert rows == []  # nothing persisted
+    assert any("no summary stored" in str(c.args[0]) for c in mock_print.call_args_list)
+
+
+def test_summarize_day_raises_when_only_model_fails(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "sum.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            ("AI", "Story", "http://s2.com", "Summary.", "2026-06-16T10:00:00+00:00"),
+        )
+
+    failing_model = MagicMock()
+    failing_model.invoke.side_effect = Exception("model not found")
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "SUMMARY_MODEL_NAME", "only-model"), \
+         patch.object(news_agent, "MODEL_NAME", "only-model"), \
+         patch("news.agent.ChatOllama", return_value=failing_model):
+        with pytest.raises(Exception, match="model not found"):
+            news_agent.summarize_day("2026-06-16")
+
+
+# ---------------------------------------------------------------------------
+# judge_articles()
+# ---------------------------------------------------------------------------
+
+
+def _noul_result(noul):
+    """A stand-in for typesafe_sdk's SystemOneResponse for one is_relevant question."""
+    return SimpleNamespace(
+        answers={"is_relevant": SimpleNamespace(noul=noul)},
+        usage=SimpleNamespace(input_tokens=120, output_tokens=1),
+    )
+
+
+def _judge_client(*outcomes):
+    """Patch TypeSafeClient; each outcome is a noul float or an Exception to raise."""
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.system_one.side_effect = [
+        o if isinstance(o, Exception) else _noul_result(o) for o in outcomes
+    ]
+    return patch("news.agent.TypeSafeClient", return_value=client), client
+
+
+def _insert_articles(db_file, run_start, *titles):
+    with sqlite3.connect(db_file) as conn:
+        conn.executemany(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at) VALUES (?,?,?,?,?)",
+            [("AI", t, f"http://x.com/{i}", f"About {t}.", run_start) for i, t in enumerate(titles)],
+        )
+
+
+def _titles(db_file):
+    with sqlite3.connect(db_file) as conn:
+        return [r[0] for r in conn.execute("SELECT title FROM news_results ORDER BY id")]
+
+
+def test_judge_articles_no_rows_returns_zero(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+
+    with patch.object(news_agent, "DB_PATH", db_file):
+        result = news_agent.judge_articles(["AI"], "2026-06-16T00:00:00+00:00")
+
+    assert result == 0
+
+
+def test_judge_articles_keeps_relevant_and_removes_irrelevant(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    run_start = "2026-06-16T10:00:00+00:00"
+    _insert_articles(db_file, run_start, "Good Article", "Bad Article")
+    patcher, client = _judge_client(0.97, 0.03)
+
+    with patch.object(news_agent, "DB_PATH", db_file), patcher:
+        removed = news_agent.judge_articles(["AI"], run_start)
+
+    assert removed == 1
+    assert client.system_one.call_count == 2  # one request per article
+    assert _titles(db_file) == ["Good Article"]
+
+
+def test_judge_articles_asks_one_noul_question_with_the_article_as_state(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    run_start = "2026-06-16T10:00:00+00:00"
+    _insert_articles(db_file, run_start, "AI Breakthrough")
+    patcher, client = _judge_client(0.9)
+
+    with patch.object(news_agent, "DB_PATH", db_file), patcher:
+        news_agent.judge_articles(["anthropic", "claude code"], run_start)
+
+    _, kwargs = client.system_one.call_args
+    assert kwargs["state"] == {
+        "title": "AI Breakthrough",
+        "summary": "About AI Breakthrough.",
+        "topics": "anthropic, claude code",
+    }
+    assert kwargs["questions"] == {"is_relevant": news_agent.JUDGE_QUESTION}
+    assert kwargs["model"] == news_agent.JUDGE_MODEL
+
+
+def test_judge_threshold_is_inclusive_of_the_boundary(tmp_path):
+    """Only a score strictly below the threshold deletes; at the threshold it is kept."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    run_start = "2026-06-16T10:00:00+00:00"
+    _insert_articles(db_file, run_start, "At", "Below")
+    patcher, _ = _judge_client(0.5, 0.4999)
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "JUDGE_THRESHOLD", 0.5), patcher:
+        removed = news_agent.judge_articles(["AI"], run_start)
+
+    assert removed == 1
+    assert _titles(db_file) == ["At"]
+
+
+def test_judge_articles_fail_open_on_call_error(tmp_path):
+    """A failed call keeps that article; the others are still judged."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    run_start = "2026-06-16T10:00:00+00:00"
+    _insert_articles(db_file, run_start, "Unreachable", "Bad Article")
+    patcher, _ = _judge_client(RuntimeError("ollama unreachable"), 0.01)
+
+    with patch.object(news_agent, "DB_PATH", db_file), patcher, \
+         patch("news.agent.rprint") as mock_print:
+        removed = news_agent.judge_articles(["AI"], run_start)
+
+    assert removed == 1
+    assert _titles(db_file) == ["Unreachable"]
+    assert any("ollama unreachable" in str(c.args[0]) for c in mock_print.call_args_list)
+
+
+def test_judge_articles_logs_decision_and_step_metrics(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    run_start = "2026-06-16T10:00:00+00:00"
+    _insert_articles(db_file, run_start, "AI Breakthrough")
+    patcher, _ = _judge_client(0.88)
+
+    with patch.object(news_agent, "DB_PATH", db_file), patcher:
+        news_agent.judge_articles(["AI"], run_start)
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    calls = [r for r in records if r["type"] == "llm_call" and r["step"] == "judge_decision"]
+    assert len(calls) == 1
+    assert calls[0]["run_id"] == run_start
+    assert calls[0]["success"] is True
+    assert calls[0]["noul"] == 0.88
+    assert calls[0]["threshold"] == news_agent.JUDGE_THRESHOLD
+    assert calls[0]["model"] == news_agent.JUDGE_MODEL
+    assert calls[0]["input_tokens"] == 120 and calls[0]["output_tokens"] == 1
+    steps = [r for r in records if r["type"] == "step" and r["step"] == "judge_articles"]
+    assert len(steps) == 1
+    assert steps[0]["articles_judged"] == 1
+    assert steps[0]["articles_deleted"] == 0
+
+
+def test_judge_articles_logs_failed_decision_metrics(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    run_start = "2026-06-16T10:00:00+00:00"
+    _insert_articles(db_file, run_start, "AI Breakthrough")
+    patcher, _ = _judge_client(RuntimeError("boom"))
+
+    with patch.object(news_agent, "DB_PATH", db_file), patcher:
+        news_agent.judge_articles(["AI"], run_start)
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    calls = [r for r in records if r["type"] == "llm_call" and r["step"] == "judge_decision"]
+    assert len(calls) == 1
+    assert calls[0]["success"] is False
+    assert "boom" in calls[0]["error"]
+    assert calls[0]["error_type"] == "RuntimeError"
+
+
+# ---------------------------------------------------------------------------
+# context sizing — see AGENT_NUM_CTX
+# ---------------------------------------------------------------------------
+
+
+def test_build_graph_sets_the_agent_context_window():
+    """The ReAct loop must not fall back to Ollama's 4096-token default."""
+    from news import agent as news_agent
+
+    mock_model = MagicMock()
+    with patch("news.agent.ChatOllama", return_value=mock_model) as mock_chat:
+        news_agent.build_graph()
+
+    _, kwargs = mock_chat.call_args
+    assert kwargs["num_ctx"] == news_agent.AGENT_NUM_CTX
+    assert news_agent.AGENT_NUM_CTX > 4096
+    # Low, not greedy: stable tool selection with enough slack to escape a bad loop.
+    assert kwargs["temperature"] == news_agent.AGENT_TEMPERATURE
+    assert 0 < news_agent.AGENT_TEMPERATURE < 1
+
+
+def test_agent_step_metrics_record_the_context_window(tmp_path):
+    """num_ctx is logged so the metrics show which window a run actually used."""
+    from news import agent as news_agent
+
+    response = AIMessage(content="done", usage_metadata={
+        "input_tokens": 10, "output_tokens": 5, "total_tokens": 15})
+    mock_bound = MagicMock()
+    mock_bound.invoke.return_value = response
+    mock_model = MagicMock()
+    mock_model.bind_tools.return_value = mock_bound
+
+    with patch("news.agent.ChatOllama", return_value=mock_model):
+        graph = news_agent.build_graph(run_id="run-ctx")
+        graph.invoke({"messages": [HumanMessage(content="hi")]})
+
+    records = _read_metrics(news_agent.METRICS_PATH)
+    steps = [r for r in records if r.get("step") == "agent_step"]
+    assert steps and steps[0]["num_ctx"] == news_agent.AGENT_NUM_CTX
+
+
+# ---------------------------------------------------------------------------
+# failure instrumentation — agent-step errors, conversation dumps, config stamping
+# ---------------------------------------------------------------------------
+
+
+def _failing_graph(error):
+    """A ChatOllama double whose bound model always raises *error* on invoke."""
+    mock_bound = MagicMock()
+    mock_bound.invoke.side_effect = error
+    mock_model = MagicMock()
+    mock_model.bind_tools.return_value = mock_bound
+    return mock_model
+
+
+def test_agent_step_failure_is_logged_and_reraised():
+    """A call that raises used to vanish from the data entirely."""
+    from news import agent as news_agent
+
+    mock_model = _failing_graph(RuntimeError("XML syntax error on line 17"))
+    with patch("news.agent.ChatOllama", return_value=mock_model):
+        graph = news_agent.build_graph(run_id="run-fail")
+        with pytest.raises(Exception):
+            graph.invoke({"messages": [HumanMessage(content="hi")]})
+
+    steps = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("step") == "agent_step"
+    ]
+    assert steps and steps[-1]["success"] is False
+    assert steps[-1]["error_type"] == "RuntimeError"
+    assert steps[-1]["message_count"] == 2  # system + human
+    # The config is stamped on the failure too, so a failure can be attributed to the
+    # settings that produced it.
+    assert steps[-1]["temperature"] == news_agent.AGENT_TEMPERATURE
+    assert steps[-1]["num_ctx"] == news_agent.AGENT_NUM_CTX
+
+
+def test_agent_step_failure_dumps_a_replayable_conversation():
+    """The dump must round-trip back into a model call, not just be readable."""
+    import json
+
+    from langchain_core.messages import messages_from_dict
+
+    from news import agent as news_agent
+
+    mock_model = _failing_graph(RuntimeError("boom"))
+    with patch("news.agent.ChatOllama", return_value=mock_model):
+        graph = news_agent.build_graph(run_id="run-dump")
+        with pytest.raises(Exception):
+            graph.invoke({"messages": [HumanMessage(content="research anthropic")]})
+
+    steps = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("step") == "agent_step"
+    ]
+    with open(steps[-1]["dump_path"]) as fh:
+        dump = json.load(fh)
+    assert dump["model"] == news_agent.MODEL_NAME
+    assert dump["model_kwargs"] == news_agent.AGENT_MODEL_KWARGS
+    # Ollama discards the malformed completion, so the inputs are the only evidence —
+    # they have to be replayable.
+    restored = messages_from_dict(dump["messages"])
+    assert restored[-1].content == "research anthropic"
+    # The tool schemas are load-bearing, not decoration: the XML errors come from
+    # Ollama parsing a tool call, so a replay without bind_tools cannot reproduce them.
+    assert {t["function"]["name"] for t in dump["tools"]} >= {"store_result"}
+
+
+def test_failure_dumps_are_pruned_to_the_newest_few(monkeypatch):
+    """~12% of topic searches fail, so the dump directory needs a ceiling."""
+    from news import agent as news_agent
+
+    monkeypatch.setattr(news_agent, "FAILURE_KEEP", 2)
+    for i in range(4):
+        news_agent._dump_failed_conversation([HumanMessage(content=f"msg {i}")])
+
+    assert len(os.listdir(news_agent.FAILURE_DIR)) == 2
+
+
+def test_dump_failure_never_masks_the_original_error(monkeypatch):
+    """A problem while recording a failure must not replace the failure itself."""
+    from news import agent as news_agent
+
+    monkeypatch.setattr(news_agent.os, "makedirs", MagicMock(side_effect=OSError("ro")))
+    assert news_agent._dump_failed_conversation([HumanMessage(content="x")]) is None
+
+
+def test_handle_tool_error_writes_a_crosscheck_record():
+    """ToolNode's handler cannot see the tool name, so this is a backstop only."""
+    from news import agent as news_agent
+
+    news_agent._handle_tool_error(ValueError("no results"))
+
+    errors = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("type") == "tool_error"
+    ]
+    assert errors and errors[-1]["error_type"] == "ValueError"
+    assert errors[-1]["handled_by"] == "ToolNode"
+
+
+def test_store_result_logs_stored_and_duplicate_outcomes(tmp_path):
+    """"No new articles" and "the agent stopped storing" are different failures."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "store.db")
+    news_agent.init_db(db_file)
+    args = {
+        "topic": "Anthropic",
+        "title": "T",
+        "url": "http://a.com",
+        "summary": "S",
+    }
+    with patch.object(news_agent, "DB_PATH", db_file):
+        news_agent.store_result.invoke(args)
+        news_agent.store_result.invoke(args)
+
+    calls = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("type") == "tool_call" and r["tool"] == "store_result"
+    ]
+    assert [c["outcome"] for c in calls] == ["stored", "duplicate"]
+    assert calls[0]["topic"] == "anthropic"
+
+
+def test_topic_context_stamps_agent_steps(monkeypatch):
+    """A run spans ~50 topic searches; without topic_index a failure cannot be traced back."""
+    from news import agent as news_agent
+
+    response = AIMessage(content="done", usage_metadata={
+        "input_tokens": 10, "output_tokens": 5, "total_tokens": 15})
+    mock_bound = MagicMock()
+    mock_bound.invoke.return_value = response
+    mock_model = MagicMock()
+    mock_model.bind_tools.return_value = mock_bound
+
+    news_agent._TOPIC_CONTEXT.set({"run_id": "run-ctx", "topic_index": 7})
+    try:
+        with patch("news.agent.ChatOllama", return_value=mock_model):
+            graph = news_agent.build_graph(run_id="run-ctx")
+            graph.invoke({"messages": [HumanMessage(content="hi")]})
+    finally:
+        news_agent._TOPIC_CONTEXT.set({})
+
+    steps = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("step") == "agent_step"
+    ]
+    assert steps[-1]["topic_index"] == 7
+    assert steps[-1]["success"] is True
+
+
+def test_store_result_logs_a_database_failure(tmp_path):
+    """A DB error must land in the tool_call records, not only in the crosscheck."""
+    from news import agent as news_agent
+
+    with patch.object(news_agent, "DB_PATH", str(tmp_path / "missing" / "no.db")):
+        with pytest.raises(Exception):
+            news_agent.store_result.invoke(
+                {"topic": "a", "title": "T", "url": "u", "summary": "S"}
+            )
+
+    calls = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("type") == "tool_call" and r["tool"] == "store_result"
+    ]
+    assert calls[-1]["success"] is False
+    assert calls[-1]["error_type"]
+
+
+def test_pruning_failure_does_not_discard_a_good_dump(monkeypatch):
+    """The dump was written; a pruning error must not lose its path."""
+    from news import agent as news_agent
+
+    monkeypatch.setattr(
+        news_agent, "_prune_failure_dumps", MagicMock(side_effect=OSError("race"))
+    )
+    path = news_agent._dump_failed_conversation([HumanMessage(content="x")])
+
+    assert path is not None and os.path.exists(path)
+
+
+# ---------------------------------------------------------------------------
+# topic validation — the DB grew 776 distinct labels from a list of 74
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_folds_spelling_variants():
+    from news.agent import _canonical
+
+    assert _canonical("Z.AI") == _canonical("zai")
+    assert _canonical("hugging face") == _canonical("HuggingFace")
+    assert _canonical("vibe-coding") == _canonical("vibe coding")
+
+
+@pytest.mark.parametrize("label,expected", [
+    ("Anthropic", "anthropic"),          # case only
+    ("z.ai", "z.ai"),                    # exact
+    ("zai", "z.ai"),                     # punctuation dropped
+    ("coding agent", "coding agents"),   # plural
+    ("llms", "llm"),                     # plural the other way
+    ("space x", "spacex"),               # spacing
+    ("mistral ai", "mistral"),           # company + industry suffix
+    ("ai coding", None),                 # invented
+    ("ai", None),                        # too generic to be a topic
+    ("", None),
+])
+def test_resolve_topic(label, expected):
+    from news.agent import _resolve_topic
+
+    allowed = ["anthropic", "z.ai", "coding agents", "llm", "spacex", "mistral"]
+    assert _resolve_topic(label, allowed) == expected
+
+
+def test_normalize_topic_drops_invented_labels_and_keeps_the_rest():
+    from news.agent import _normalize_topic
+
+    normalized, dropped = _normalize_topic(
+        "Anthropic, ai coding, claude code", ["anthropic", "claude code"]
+    )
+
+    assert normalized == "anthropic, claude code"
+    assert dropped == ["ai coding"]
+
+
+def test_normalize_topic_deduplicates_after_resolving():
+    """"zai" and "z.ai" in one call must not produce the same label twice."""
+    from news.agent import _normalize_topic
+
+    normalized, _ = _normalize_topic("zai, z.ai", ["z.ai"])
+
+    assert normalized == "z.ai"
+
+
+def test_normalize_topic_is_permissive_without_an_entry():
+    """An ad-hoc call outside a run has no allowed set and must not drop anything."""
+    from news.agent import _normalize_topic
+
+    assert _normalize_topic("Anything Goes, Here") == ("anything goes, here", [])
+
+
+def test_split_labels_flattens_groups_lowercased_and_deduplicated():
+    """Each comma-separated label in a group is its own topic, always lowercase."""
+    from news.agent import _split_labels
+
+    groups = ["anthropic, Claude Code, ", "ai safety, METR", "claude code"]
+
+    assert _split_labels(groups) == ["anthropic", "claude code", "ai safety", "metr"]
+
+
+def _store(news_agent, db_file, topic, url="http://a.com"):
+    with patch.object(news_agent, "DB_PATH", db_file):
+        return news_agent.store_result.invoke(
+            {"topic": topic, "title": "T", "url": url, "summary": "S"}
+        )
+
+
+def test_store_result_rejects_a_label_outside_the_topic_entry(tmp_path):
+    """A label from another topic entry is recalled from the conversation, not chosen."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "topics.db")
+    news_agent.init_db(db_file)
+    news_agent._TOPIC_CONTEXT.set(
+        {"run_id": "r", "topic_index": 0, "topics": ["anthropic", "openai"]}
+    )
+
+    reply = _store(news_agent, db_file, "ollama, local llm")
+
+    assert "Not stored" in reply and "anthropic, openai" in reply
+    with sqlite3.connect(db_file) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM news_results").fetchone()[0] == 0
+    calls = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("type") == "tool_call"
+    ]
+    assert calls[-1]["outcome"] == "rejected"
+    assert calls[-1]["dropped"] == ["ollama", "local llm"]
+
+
+def test_store_result_keeps_valid_labels_and_records_the_dropped_one(tmp_path):
+    """A mixed call stores the article; only the invented label is discarded."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "topics.db")
+    news_agent.init_db(db_file)
+    news_agent._TOPIC_CONTEXT.set(
+        {"run_id": "r", "topic_index": 0, "topics": ["anthropic", "claude code"]}
+    )
+
+    reply = _store(news_agent, db_file, "Anthropic, ai industry strategy")
+
+    assert reply.startswith("Stored")
+    with sqlite3.connect(db_file) as conn:
+        assert conn.execute("SELECT topic FROM news_results").fetchone()[0] == "anthropic"
+    calls = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("type") == "tool_call"
+    ]
+    # Logged even on a successful store, so the invention rate stays measurable
+    # instead of being silently repaired.
+    assert calls[-1]["dropped"] == ["ai industry strategy"]
+
+
+def test_store_result_resolves_a_spelling_variant_to_the_entry_label(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "topics.db")
+    news_agent.init_db(db_file)
+    news_agent._TOPIC_CONTEXT.set({"run_id": "r", "topic_index": 0, "topics": ["z.ai"]})
+
+    assert _store(news_agent, db_file, "zai").startswith("Stored")
+    with sqlite3.connect(db_file) as conn:
+        assert conn.execute("SELECT topic FROM news_results").fetchone()[0] == "z.ai"
+
+
+def test_run_puts_the_entry_labels_in_the_context(tmp_path):
+    """store_result can only validate if run() tells it what was asked for."""
+    from news import agent as news_agent
+
+    seen = []
+
+    def _capture(*a, **k):
+        seen.append(news_agent._TOPIC_CONTEXT.get()["topics"])
+        return {"messages": []}
+
+    mock_app = MagicMock()
+    mock_app.invoke.side_effect = _capture
+    with patch.object(news_agent, "DB_PATH", str(tmp_path / "run.db")), \
+         patch.object(news_agent, "build_graph", return_value=mock_app), \
+         patch.object(news_agent, "judge_articles", return_value=0), \
+         patch.object(news_agent, "summarize_day", return_value=None):
+        news_agent.run(["anthropic, Claude Code", "openai"])
+
+    assert seen == [["anthropic", "claude code"], ["openai"]]
+
+
+# ---------------------------------------------------------------------------
+# judge_articles reporting — found vs kept
+# ---------------------------------------------------------------------------
+
+
+def _judge_db(tmp_path, n, run_start):
+    """A DB holding *n* articles fetched at run_start."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge_report.db")
+    news_agent.init_db(db_file)
+    with sqlite3.connect(db_file) as conn:
+        for i in range(n):
+            conn.execute(
+                "INSERT INTO news_results (topic, title, url, summary, fetched_at)"
+                " VALUES (?,?,?,?,?)",
+                ("ai", f"Title {i}", f"http://a.com/{i}", "S", run_start),
+            )
+    return db_file
+
+
+def test_judge_articles_reports_found_and_kept(tmp_path):
+    """The found count alone overstates what ends up stored."""
+    from news import agent as news_agent
+
+    run_start = "2026-08-27T10:00:00+00:00"
+    db_file = _judge_db(tmp_path, 3, run_start)
+    patcher, _ = _judge_client(0.9, 0.1, 0.9)
+
+    with patch.object(news_agent, "DB_PATH", db_file), patcher, \
+         patch("news.agent.rprint") as mock_print:
+        deleted = news_agent.judge_articles(["ai"], run_start)
+
+    output = mock_print.call_args[0][0]
+    assert "Judged 3 articles" in output
+    assert "2 kept" in output
+    assert "1 off-topic, 0 stale, 0 stale & off-topic" in output
+    assert deleted == 1
+
+
+def test_judge_articles_logs_the_kept_count(tmp_path):
+    from news import agent as news_agent
+
+    run_start = "2026-08-27T10:00:00+00:00"
+    db_file = _judge_db(tmp_path, 2, run_start)
+    patcher, _ = _judge_client(0.9, 0.1)
+
+    with patch.object(news_agent, "DB_PATH", db_file), patcher:
+        news_agent.judge_articles(["ai"], run_start)
+
+    steps = [
+        r
+        for r in _read_metrics(news_agent.METRICS_PATH)
+        if r.get("step") == "judge_articles"
+    ]
+    assert steps[-1]["articles_judged"] == 2
+    assert steps[-1]["articles_deleted"] == 1
+    assert steps[-1]["articles_kept"] == 1
+
+
+def test_judge_articles_reports_a_single_article_in_the_singular(tmp_path):
+    from news import agent as news_agent
+
+    run_start = "2026-08-27T10:00:00+00:00"
+    db_file = _judge_db(tmp_path, 1, run_start)
+    patcher, _ = _judge_client(0.9)
+
+    with patch.object(news_agent, "DB_PATH", db_file), patcher, \
+         patch("news.agent.rprint") as mock_print:
+        news_agent.judge_articles(["ai"], run_start)
+
+    assert "Judged 1 article:" in mock_print.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# stale articles — published more than MAX_ARTICLE_AGE_DAYS before the run
+# ---------------------------------------------------------------------------
+
+STALE_RUN = "2026-10-10T10:00:00+00:00"
+
+
+def _insert_dated(db_file, run_start, *articles):
+    """Insert (title, published_on) pairs fetched at run_start."""
+    with sqlite3.connect(db_file) as conn:
+        conn.executemany(
+            "INSERT INTO news_results (topic, title, url, summary, fetched_at, published_on)"
+            " VALUES (?,?,?,?,?,?)",
+            [
+                ("AI", t, f"http://x.com/{i}", f"About {t}.", run_start, pub)
+                for i, (t, pub) in enumerate(articles)
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "published_on, expected",
+    [
+        ("2026-10-01", 9),
+        ("2024-10-10", 730),
+        ("2026-07-09T15:41:12+00:00", 93),
+        ("2026-07-23T03:13:19Z", 79),
+        ("2026-07-10/", 92),
+        (None, None),
+        ("", None),
+        ("2026-XX-XX", None),
+        ("2025-12", None),
+        ("Opinion 3 days ago", None),
+    ],
+)
+def test_article_age_days(published_on, expected):
+    from news import agent as news_agent
+
+    assert news_agent._article_age_days(published_on, date(2026, 10, 10)) == expected
+
+
+def test_judge_articles_removes_stale_and_keeps_recent_or_undated(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    _insert_dated(
+        db_file,
+        STALE_RUN,
+        ("Recent", "2026-10-01"),
+        ("Boundary", "2026-07-12"),  # exactly 90 days: not stale
+        ("Old", "2024-10-10"),
+        ("Undated", None),
+    )
+    patcher, _ = _judge_client(0.9, 0.9, 0.9, 0.9)
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "MAX_ARTICLE_AGE_DAYS", 90), patcher:
+        removed = news_agent.judge_articles(["AI"], STALE_RUN)
+
+    assert removed == 1
+    assert _titles(db_file) == ["Recent", "Boundary", "Undated"]
+
+
+def test_judge_articles_counts_each_exclusion_reason(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    _insert_dated(
+        db_file,
+        STALE_RUN,
+        ("Kept", "2026-10-01"),
+        ("Off topic", "2026-10-01"),
+        ("Stale", "2025-01-01"),
+        ("Both", "2025-01-01"),
+    )
+    patcher, _ = _judge_client(0.9, 0.1, 0.9, 0.1)
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "MAX_ARTICLE_AGE_DAYS", 90), patcher, \
+         patch("news.agent.rprint") as mock_print:
+        removed = news_agent.judge_articles(["AI"], STALE_RUN)
+
+    assert removed == 3
+    assert _titles(db_file) == ["Kept"]
+    assert "1 off-topic, 1 stale, 1 stale & off-topic" in mock_print.call_args[0][0]
+    records = _read_metrics(news_agent.METRICS_PATH)
+    (step,) = [r for r in records if r.get("step") == "judge_articles"]
+    assert step["articles_deleted"] == 3
+    assert step["articles_off_topic"] == 1
+    assert step["articles_stale"] == 1
+    assert step["articles_stale_and_off_topic"] == 1
+    assert step["max_article_age_days"] == 90
+    excluded = [r for r in records if r["type"] == "article_excluded"]
+    assert [(r["title"], r["reason"]) for r in excluded] == [
+        ("Stale", "stale"),
+        ("Both", "stale_and_off_topic"),
+    ]
+
+
+def test_judge_articles_logs_and_prints_each_stale_exclusion(tmp_path):
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    _insert_dated(db_file, STALE_RUN, ("Old News", "2024-10-10"))
+    patcher, _ = _judge_client(0.9)
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "MAX_ARTICLE_AGE_DAYS", 90), patcher, \
+         patch("news.agent.rprint") as mock_print:
+        news_agent.judge_articles(["AI"], STALE_RUN)
+
+    printed = [str(c.args[0]) for c in mock_print.call_args_list]
+    assert any(
+        "Excluded stale article (published 2024-10-10, 730 days old): Old News" in p
+        for p in printed
+    )
+    (record,) = [
+        r for r in _read_metrics(news_agent.METRICS_PATH)
+        if r["type"] == "article_excluded"
+    ]
+    assert record == {
+        "type": "article_excluded",
+        "run_id": STALE_RUN,
+        "reason": "stale",
+        "title": "Old News",
+        "url": "http://x.com/0",
+        "published_on": "2024-10-10",
+        "age_days": 730,
+        "max_age_days": 90,
+        "logged_at": record["logged_at"],
+    }
+
+
+def test_judge_articles_removes_stale_even_when_the_judge_call_fails(tmp_path):
+    """The judge fails open, but the date check needs no model and still applies."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "judge.db")
+    news_agent.init_db(db_file)
+    _insert_dated(db_file, STALE_RUN, ("Old", "2024-10-10"), ("New", "2026-10-01"))
+    patcher, _ = _judge_client(RuntimeError("down"), RuntimeError("down"))
+
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "MAX_ARTICLE_AGE_DAYS", 90), patcher:
+        removed = news_agent.judge_articles(["AI"], STALE_RUN)
+
+    assert removed == 1
+    assert _titles(db_file) == ["New"]
+
+# ---------------------------------------------------------------------------
+# yield accounting — new_articles must reflect what survived judging
+# ---------------------------------------------------------------------------
+
+
+def test_run_counts_articles_after_judging(tmp_path):
+    """The judge deletes rows the first count included; counting once overstated."""
+    from news import agent as news_agent
+
+    db_file = str(tmp_path / "yield.db")
+    news_agent.init_db(db_file)
+
+    def _fake_invoke(*a, **k):
+        """Stand in for the agent loop: store three articles for this run."""
+        with sqlite3.connect(db_file) as conn:
+            for i in range(3):
+                conn.execute(
+                    "INSERT INTO news_results (topic, title, url, summary, fetched_at)"
+                    " VALUES (?,?,?,?,?)",
+                    ("anthropic", f"T{i}", f"http://a.com/{i}", "S",
+                     datetime.now(timezone.utc).isoformat()),
+                )
+        return {"messages": []}
+
+    def _fake_judge(topics, run_start):
+        """Prune two of the three, the way the real judge does."""
+        with sqlite3.connect(db_file) as conn:
+            conn.execute(
+                "DELETE FROM news_results WHERE url IN ('http://a.com/1','http://a.com/2')"
+            )
+        return 2
+
+    mock_app = MagicMock()
+    mock_app.invoke.side_effect = _fake_invoke
+    with patch.object(news_agent, "DB_PATH", db_file), \
+         patch.object(news_agent, "build_graph", return_value=mock_app), \
+         patch.object(news_agent, "judge_articles", side_effect=_fake_judge), \
+         patch.object(news_agent, "summarize_day", return_value=None):
+        new_count, _ = news_agent.run(["anthropic"])
+
+    # 3 found, 2 pruned, 1 actually left in the database.
+    assert new_count == 1
+
+    run_records = [
+        r for r in _read_metrics(news_agent.METRICS_PATH) if r.get("step") == "run"
+    ]
+    assert run_records[-1]["new_articles"] == 1
+    # Both numbers are logged: articles_found also dates the record to after the fix.
+    assert run_records[-1]["articles_found"] == 3
+    assert run_records[-1]["articles_pruned"] == 2
