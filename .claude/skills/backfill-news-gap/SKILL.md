@@ -36,9 +36,7 @@ the wrong rows corrupts history and there's no clean way to detect that after th
 
 1. **Confirm the DB path.** Use `$NEWS_DB_PATH` if set, otherwise `news_data.db` in
    `agent/`. Until the GPU box's cron is pointed at this repo, the live file may still be in
-   the old `langchain_simple_demo` checkout; if both exist, ask which one. (Note: `agent/CLAUDE.md` documents the env var's default as `news_results.db`,
-   but the actual file used in this repo has always been `news_data.db` — trust what's on
-   disk over the doc.)
+   the old `langchain_simple_demo` checkout; if both exist, ask which one.
 
 2. **Verify the gap yourself — don't trust the user's date list blindly.** Run:
 

@@ -7,4 +7,4 @@ report:
 	PYTHONPATH=src uv run python src/news/metrics_report.py
 
 test:
-	uv run pytest --cov=src --cov-report=term-missing tests/
+	uv run pytest --cov=src --cov-report=term-missing --cov-fail-under=100 tests/

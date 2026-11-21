@@ -48,7 +48,7 @@ SUMMARY_NUM_CTX = int(os.getenv("SUMMARY_NUM_CTX", "49152"))
 # too large for the GPU and is spilling to CPU.
 AGENT_NUM_CTX = int(os.getenv("NEWS_NUM_CTX", "16384"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-DB_PATH = os.getenv("NEWS_DB_PATH", "news_results.db")
+DB_PATH = os.getenv("NEWS_DB_PATH", "news_data.db")
 METRICS_PATH = os.getenv("NEWS_METRICS_PATH", "news_metrics.jsonl")
 # Relevance judge: a Noul decision model served by Ollama at /v1/systemone (see
 # judge_articles). TYPESAFE_BASE_URL / TYPESAFE_API_KEY are read by the SDK itself.

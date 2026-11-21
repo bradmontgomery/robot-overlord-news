@@ -11,8 +11,13 @@ DOMAIN        ?= ""
 all: build
 
 # --- web ---
-build run clean test fmt vet tidy deploy:
+build run clean fmt vet tidy deploy:
 	$(MAKE) -C web $@
+
+# Both suites. web has no tests yet, so the agent suite is the one that matters.
+test:
+	$(MAKE) -C web test
+	$(MAKE) -C agent test
 
 # --- agent ---
 news report:

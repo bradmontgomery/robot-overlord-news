@@ -10,7 +10,7 @@ START → agent → [should_continue] → tools → agent (loop)
 ```
 
 For each topic you provide, the agent searches for recent news and calls `store_result`
-once per article. Results are written to a local SQLite database (`news_results.db` by default).
+once per article. Results are written to a local SQLite database (`news_data.db` by default).
 
 ## Key design choices
 
@@ -80,7 +80,7 @@ The loop runs → prints → sleeps → repeats until interrupted (`Ctrl-C`). Un
 
 | Variable | Default | Description |
 |---|---|---|
-| `NEWS_DB_PATH` | `news_results.db` | Path to the SQLite database for storing results. |
+| `NEWS_DB_PATH` | `news_data.db` | Path to the SQLite database for storing results. |
 | `NEWS_INTERVAL` | `0` | Polling interval in seconds. `0` (or unset) runs once and exits. |
 
 Search tool follows the same Tavily / DuckDuckGo logic as the other agents: set

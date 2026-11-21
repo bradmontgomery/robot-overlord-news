@@ -63,7 +63,7 @@ Copy `.envrc.example` to `.envrc` (git-ignored at the repo root). Never commit s
 | `LANGSMITH_API_KEY` | _(unset)_ | No | LangSmith API key. Required if tracing is enabled. |
 | `LANGSMITH_PROJECT` | _(unset)_ | No | LangSmith project name for grouping runs. |
 | `TAVILY_API_KEY` | _(unset)_ | No | If set, the news agent uses Tavily instead of DuckDuckGo. |
-| `NEWS_DB_PATH` | `news_results.db` | No | SQLite database path for the news research agent. |
+| `NEWS_DB_PATH` | `news_data.db` | No | SQLite database path for the news research agent. |
 | `NEWS_METRICS_PATH` | `news_metrics.jsonl` | No | JSONL file the news agent appends timing/token metrics to: one record per LLM call (`llm_call`), per pipeline step (`step`), and per tool invocation (`tool_call`). Every record carries the model config it ran under, so `make report` can cohort runs by config. Tool logging roughly doubles the growth rate; there is no rotation yet. |
 | `NEWS_FAILURE_DIR` | `news_failures` | No | Directory where a failed agent step dumps the conversation that produced it. Ollama discards the malformed completion server-side, so the inputs are the only recoverable evidence — dumps are written in `messages_to_dict` form and replay through `messages_from_dict`. |
 | `NEWS_FAILURE_KEEP` | `50` | No | How many failure dumps to retain. Older ones are pruned on each new dump. |

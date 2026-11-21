@@ -41,7 +41,8 @@ These are the review criteria. Changes that violate them get pushed back on, eve
 - **Schema owner: `agent/`.** `init_db()` in `agent/src/news/agent.py` creates and migrates it.
   `schema.sql` is the contract, and `agent/tests/test_schema_contract.py` fails if the two drift.
 - **Web is read-only.** It opens the DB with `mode=ro`, `PRAGMA query_only = ON`, and
-  `SetMaxOpenConns(1)` (web/main.go:76–86). Never put migrations, `CREATE TABLE`, or
+  `SetMaxOpenConns(1)` (`main()` in web/main.go). The DSN needs the `file:` prefix, or
+  modernc.org/sqlite silently ignores `mode=ro`. Never put migrations, `CREATE TABLE`, or
   INSERT/UPDATE in `web/`.
 - **Schema changes go in one PR** that updates `init_db()`, `schema.sql`, and the queries in
   `web/main.go` together. Deploy order matters: additive columns can ship agent-first. A removal
@@ -53,7 +54,7 @@ a `',' || topic || ','` LIKE trick rather than a join.
 
 ## Embedded Assets
 
-`//go:embed templates/* static/*` (web/main.go:23) is what makes the single-file deploy work.
+`//go:embed templates/* static/*` (top of web/main.go) is what makes the single-file deploy work.
 
 - **Editing a template or CSS file requires `make build`** — nothing hot-reloads. Restart the server
   after every frontend change.

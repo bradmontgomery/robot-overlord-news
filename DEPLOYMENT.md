@@ -104,13 +104,16 @@ curl https://robot-overlord.news
 
 ## Deploying Updates
 
-Deployment is automated via GitHub Actions. Any push to `main` (including a merged PR)
-triggers the CI/CD pipeline defined in `.github/workflows/deploy.yml`, which:
+Deployment is automated via GitHub Actions. A push to `main` (including a merged PR) that
+changes `web/**` or the workflow itself triggers `.github/workflows/web.yml`, which:
 
-1. Runs `go test ./...`
+1. Runs `go vet ./...` and `go test ./...`
 2. Builds the binary with `go build`
 3. Rsyncs the binary to `/opt/news/` on the EC2 instance
 4. Restarts the `news` systemd service
+
+Changes elsewhere (`infrastructure/`, `schema.sql`, `agent/`) do **not** deploy. nginx and
+systemd config changes must be applied to the host by hand.
 
 Security headers (CSP, HSTS, etc.) are set in Go (`securityHeaders` in `main.go`), so they ship with
 the binary and need no nginx change.

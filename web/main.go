@@ -113,11 +113,14 @@ var statsTmpl *template.Template
 func main() {
 	dbPath := os.Getenv("NEWS_DB")
 	if dbPath == "" {
-		dbPath = "../langchain_simple_demo/news_data.db"
+		dbPath = "../agent/news_data.db"
 	}
 
+	// The "file:" prefix is required: modernc.org/sqlite ignores mode=ro on a bare
+	// path and opens read-write, creating the file if it is missing. _pragma applies
+	// query_only to every pooled connection, not just the first.
 	var err error
-	db, err = sql.Open("sqlite", dbPath+"?_journal=WAL&mode=ro")
+	db, err = sql.Open("sqlite", "file:"+dbPath+"?mode=ro&_pragma=query_only(1)")
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
@@ -125,8 +128,9 @@ func main() {
 
 	db.SetMaxOpenConns(1)
 
-	if _, err = db.Exec("PRAGMA query_only = ON"); err != nil {
-		log.Printf("warn: query_only pragma: %v", err)
+	// sql.Open is lazy; fail at startup on a bad path instead of 500ing every request.
+	if err = db.Ping(); err != nil {
+		log.Fatalf("open db %s: %v", dbPath, err)
 	}
 
 	funcMap := template.FuncMap{

@@ -25,8 +25,8 @@ export LANGSMITH_PROJECT=news-agent   # groups runs in the UI
 # --- Ollama (optional) ---
 # Only needed if your Ollama server isn't at the default localhost:11434
 # export OLLAMA_HOST=http://localhost:11434
-# Change the model (default: gemma4:latest). Try qwen2.5:latest if tool calls misbehave.
-# export OLLAMA_MODEL=gemma4:latest
+# Change the model (default: qwen3.5:latest). Try qwen2.5:latest if tool calls misbehave.
+# export OLLAMA_MODEL=qwen3.5:latest
 # Override the model used only for daily summarization (default: ministral-3:8b).
 # export SUMMARY_MODEL=ministral-3:8b
 # Context window for the summary model (default: 49152; ministral-3:8b holds 48k on a 16 GB GPU).
