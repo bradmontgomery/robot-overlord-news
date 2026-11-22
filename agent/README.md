@@ -5,7 +5,7 @@ summary into the SQLite database served by the web app in `../web/`.
 
 ```bash
 uv sync
-cp .envrc.example .envrc   # then edit
+cp ../.envrc.example ../.envrc   # at the repo root; then edit
 make test                  # 100% coverage required
 make news                  # full run against local Ollama
 ```

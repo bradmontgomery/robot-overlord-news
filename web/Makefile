@@ -1,7 +1,7 @@
 BINARY      := news_site
 DEPLOY_USER ?= ec2-user
 DEPLOY_HOST ?= $(error Set DEPLOY_HOST=<host-or-ip>)
-SSH_KEY     ?= ~/.ssh/robot-overlord.pem
+SSH_KEY     ?= $(error Set SSH_KEY=<path-to-pem> in .envrc)
 
 .PHONY: all build run clean test fmt vet tidy deploy
 

@@ -27,15 +27,18 @@ If the file doesn't exist, report the error and stop.
 
 ### Step 3: Upload with rsync
 
+`SSH_KEY`, `DEPLOY_USER`, and `HOST_IP` come from the repo-root `.envrc` (loaded by direnv).
+If `HOST_IP` is empty, stop and tell the user to set it.
+
 ```bash
-rsync -avz --progress -e "ssh -i ~/.ssh/robot-overlord.pem" \
-  <local-path> ec2-user@${HOST_IP:-44.221.25.226}:/opt/news/data/news.db
+rsync -avz --progress -e "ssh -i $SSH_KEY" \
+  <local-path> "${DEPLOY_USER:-ec2-user}@$HOST_IP:/opt/news/data/news.db"
 ```
 
 ### Step 4: Restart the service and verify
 
 ```bash
-ssh -i ~/.ssh/robot-overlord.pem ec2-user@${HOST_IP:-44.221.25.226} \
+ssh -i "$SSH_KEY" "${DEPLOY_USER:-ec2-user}@$HOST_IP" \
   'sudo systemctl restart news && sudo systemctl status news --no-pager'
 ```
 

@@ -45,7 +45,7 @@ The web app only ever reads (`mode=ro`).
 
 ## Environment Variables
 
-Copy `.envrc.example` to `.envrc` (git-ignored at the repo root). Never commit secrets.
+Copy the repo-root `.envrc.example` to `.envrc` (git-ignored). Never commit secrets.
 
 | Variable | Default | Required | Description |
 |---|---|---|---|

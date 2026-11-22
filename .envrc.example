@@ -1,5 +1,19 @@
-# Copy to .envrc and fill in your values. Never commit .envrc.
-# Usage: cp .envrc.example .envrc && direnv allow  (or: source .envrc)
+# Copy to .envrc at the repo root and fill in your values. Never commit .envrc.
+# Usage: cp .envrc.example .envrc && direnv allow
+# Keep this file to plain `export` lines: scripts/sync-db.sh sources it from cron,
+# where direnv helpers (PATH_add, dotenv, layout) don't exist.
+
+# --- Deploy (web/Makefile, scripts/sync-db.sh, deploy skills) ---
+export DOMAIN=example.com
+export DEPLOY_HOST=example.com          # hostname or IP for make deploy
+export HOST_IP=203.0.113.10             # server's elastic IP; sync-db.sh prefers it
+export DEPLOY_USER=ec2-user
+export SSH_KEY="$HOME/.ssh/your-key.pem"  # use $HOME, not ~ (quoted ~ won't expand)
+export KEY_PAIR=your-key                # EC2 key pair name, for make infra-deploy
+
+# --- Web app ---
+# export NEWS_DB=agent/news_data.db     # default: ../agent/news_data.db (relative to web/)
+
 
 # --- LangSmith tracing ---
 # Tracing is fully automatic for LangGraph when these vars are set.

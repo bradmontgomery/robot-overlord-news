@@ -124,7 +124,7 @@ Add these under **Settings → Secrets and variables → Actions** in the GitHub
 
 | Secret | Value |
 |--------|-------|
-| `SSH_PRIVATE_KEY` | Full contents of `~/.ssh/robot-overlord.pem` |
+| `SSH_PRIVATE_KEY` | Full contents of the private key at `$SSH_KEY` |
 | `DEPLOY_HOST` | `robot-overlord.news` |
 | `DEPLOY_USER` | `ec2-user` |
 
