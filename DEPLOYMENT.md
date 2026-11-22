@@ -1,7 +1,8 @@
 # Deployment Guide
 
-Single EC2 instance running the Go web app + the news-fetching agent side by side,
-sharing a SQLite database at `/opt/news/data/news.db`.
+A single EC2 instance runs the Go web app (`web/`) and serves a SQLite database at
+`/opt/news/data/news.db`. The news agent (`agent/`) runs on a separate GPU box and the
+database is synced to EC2.
 
 ## Architecture
 
@@ -9,8 +10,8 @@ sharing a SQLite database at `/opt/news/data/news.db`.
 Internet → Elastic IP → Nginx (:80/:443) → news_site binary (:8080)
                                            ↕ reads
                                         /opt/news/data/news.db
-                                           ↑ writes
-                                        news-fetching agent (cron / systemd)
+                                           ↑ rsync (scripts/sync-db.sh)
+                                        GPU box: agent/ (cron) → local news_data.db
 ```
 
 ## Prerequisites
@@ -103,13 +104,16 @@ curl https://robot-overlord.news
 
 ## Deploying Updates
 
-Deployment is automated via GitHub Actions. Any push to `main` (including a merged PR)
-triggers the CI/CD pipeline defined in `.github/workflows/deploy.yml`, which:
+Deployment is automated via GitHub Actions. A push to `main` (including a merged PR) that
+changes `web/**` or the workflow itself triggers `.github/workflows/web.yml`, which:
 
-1. Runs `go test ./...`
+1. Runs `go vet ./...` and `go test ./...`
 2. Builds the binary with `go build`
 3. Rsyncs the binary to `/opt/news/` on the EC2 instance
 4. Restarts the `news` systemd service
+
+Changes elsewhere (`infrastructure/`, `schema.sql`, `agent/`) do **not** deploy. nginx and
+systemd config changes must be applied to the host by hand.
 
 Security headers (CSP, HSTS, etc.) are set in Go (`securityHeaders` in `main.go`), so they ship with
 the binary and need no nginx change.
@@ -120,7 +124,7 @@ Add these under **Settings → Secrets and variables → Actions** in the GitHub
 
 | Secret | Value |
 |--------|-------|
-| `SSH_PRIVATE_KEY` | Full contents of `~/.ssh/robot-overlord.pem` |
+| `SSH_PRIVATE_KEY` | Full contents of the private key at `$SSH_KEY` |
 | `DEPLOY_HOST` | `robot-overlord.news` |
 | `DEPLOY_USER` | `ec2-user` |
 
@@ -132,19 +136,14 @@ If you need to deploy outside of CI (e.g., for a hotfix without a PR):
 make deploy DEPLOY_HOST=robot-overlord.news
 ```
 
-## Deploying the News-Fetching Agent
+## The News Agent
 
-The agent that populates the database runs on the same EC2 instance. Deploy it however
-makes sense for that project (likely a Python venv + cron job or its own systemd service).
+The agent (`agent/`) needs about 11 GB of GPU for its local Ollama models, so it **does not run on the
+EC2 instance** (a t3.micro). It runs on a GPU box via cron and writes to a local
+`news_data.db`. `scripts/sync-db.sh` (or the `robot-overlord-news-deploy-db` skill) then
+copies that file to `/opt/news/data/news.db` and restarts the web service.
 
-The agent should write to `/opt/news/data/news.db`. The Go web app opens this file
-read-only with WAL mode, so concurrent reads during a write are safe.
-
-Example cron entry to run the agent hourly (edit with `crontab -e` as the `ec2-user`):
-
-```cron
-0 * * * * /home/ec2-user/langchain-agent/run.sh >> /var/log/news-agent.log 2>&1
-```
+See `agent/README.md` for setup. The schema both sides depend on is `schema.sql`.
 
 ## Useful Commands
 

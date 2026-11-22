@@ -1,45 +1,30 @@
-BINARY      := news_site
-MODULE      := $(shell go list -m)
-STACK_NAME  := robot-overlord-news
-DEPLOY_USER ?= ec2-user
-DEPLOY_HOST ?= $(error Set DEPLOY_HOST=<host-or-ip>)
-SSH_KEY     ?= ~/.ssh/robot-overlord.pem
+# Thin delegator. Each component owns its own Makefile:
+#   web/   — Go web app (make -C web <target>)
+#   agent/ — Python news agent (make -C agent <target>)
+STACK_NAME    := robot-overlord-news
 INSTANCE_TYPE ?= t3.micro
-SSH_CIDR    ?= $(shell curl -s https://checkip.amazonaws.com)/32
-DOMAIN      ?= ""
+SSH_CIDR      ?= $(shell curl -s https://checkip.amazonaws.com)/32
+DOMAIN        ?= ""
 
-.PHONY: all build run clean test fmt vet lint tidy deploy infra-deploy
+.PHONY: all build run clean test fmt vet tidy deploy infra-deploy news report agent-test
 
 all: build
 
-build:
-	go build -o $(BINARY) .
+# --- web ---
+build run clean fmt vet tidy deploy:
+	$(MAKE) -C web $@
 
-run: build
-	./$(BINARY)
-
+# Both suites. web has no tests yet, so the agent suite is the one that matters.
 test:
-	go test ./...
+	$(MAKE) -C web test
+	$(MAKE) -C agent test
 
-fmt:
-	gofmt -w .
+# --- agent ---
+news report:
+	$(MAKE) -C agent $@
 
-vet:
-	go vet ./...
-
-tidy:
-	go mod tidy
-
-clean:
-	rm -f $(BINARY)
-
-# Deploy app to EC2: build binary, sync files, restart service
-# Usage: make deploy DEPLOY_HOST=news.yourdomain.com
-deploy: build
-	rsync -avz --progress -e "ssh -i $(SSH_KEY)" \
-	  $(BINARY) \
-	  $(DEPLOY_USER)@$(DEPLOY_HOST):/opt/news/
-	ssh -i $(SSH_KEY) $(DEPLOY_USER)@$(DEPLOY_HOST) 'sudo systemctl restart news && sudo systemctl status news --no-pager'
+agent-test:
+	$(MAKE) -C agent test
 
 # Provision AWS infrastructure via CloudFormation
 # Usage: make infra-deploy KEY_PAIR=mykey SSH_CIDR=1.2.3.4/32 DOMAIN=news.example.com

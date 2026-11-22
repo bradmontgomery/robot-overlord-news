@@ -18,6 +18,7 @@ coverage.out
 # Environment / secrets
 .env
 .env.*
+.envrc
 
 # Editor artifacts
 .DS_Store

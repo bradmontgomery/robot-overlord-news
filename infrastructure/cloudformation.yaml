@@ -81,7 +81,7 @@ Resources:
 
           # Create service user and directory structure
           useradd -r -s /sbin/nologin news
-          mkdir -p /opt/news/data /opt/news/templates /opt/news/static
+          mkdir -p /opt/news/data
           chown -R news:news /opt/news
 
           # Install systemd service
@@ -110,12 +110,6 @@ Resources:
 
               gzip on;
               gzip_types text/html text/css application/javascript;
-
-              location /static/ {
-                  alias /opt/news/static/;
-                  expires 7d;
-                  add_header Cache-Control "public, immutable";
-              }
 
               location / {
                   proxy_pass http://localhost:8080;

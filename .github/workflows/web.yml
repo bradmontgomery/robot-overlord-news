@@ -1,18 +1,29 @@
-name: CI/CD
+name: web
 
 on:
   push:
     branches: [main]
+    paths: ['web/**', '.github/workflows/web.yml']
+  pull_request:
+    branches: [main]
+    paths: ['web/**', '.github/workflows/web.yml']
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version-file: web/go.mod
+          cache-dependency-path: web/go.sum
+
+      - name: Vet
+        run: go vet ./...
 
       - name: Test
         run: go test ./...
@@ -23,10 +34,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: news_site
-          path: news_site
+          path: web/news_site
 
   deploy:
     needs: build-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

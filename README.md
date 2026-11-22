@@ -33,7 +33,7 @@ binary, so deployment is a single file with no runtime dependencies.
 ## Setup
 
 ```bash
-go build -o news_site .
+cd web && go build -o news_site .
 NEWS_DB=/path/to/news_data.db ./news_site
 ```
 
@@ -45,35 +45,14 @@ Common tasks are in the `Makefile`: `make build`, `make run`, `make test`, `make
 
 | Variable | Default | Description |
 |---|---|---|
-| `NEWS_DB` | `../langchain_simple_demo/news_data.db` | Path to the SQLite database |
+| `NEWS_DB` | `../agent/news_data.db` | Path to the SQLite database |
 
 ## Database
 
-The database is **written by the separate news-fetching agent** and opened read-only here
-(`mode=ro` plus `PRAGMA query_only = ON`). Schema changes belong upstream, not in this repo.
-
-```sql
-CREATE TABLE news_results (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    topic        TEXT NOT NULL,
-    title        TEXT,
-    url          TEXT,
-    summary      TEXT,
-    fetched_at   TEXT NOT NULL,
-    published_on TEXT,
-    model_name   TEXT
-);
-
-CREATE UNIQUE INDEX idx_news_url ON news_results (url);
-
-CREATE TABLE news_summaries (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    date       TEXT NOT NULL UNIQUE,
-    summary    TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    model_name TEXT
-);
-```
+The database is **written by the news agent in `agent/`** and opened read-only here
+(`file:` DSN with `mode=ro` plus `PRAGMA query_only`). The schema contract is
+[`schema.sql`](schema.sql); schema changes go through `init_db()` in `agent/` together with
+`schema.sql` and the queries in `web/main.go`.
 
 `topic` holds a comma-separated list of topics, split into individual labels at render time.
 
